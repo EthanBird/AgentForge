@@ -1,0 +1,20 @@
+[package]
+name = "agentforge-control-plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "agentforge-control-plane"
+
+[dependencies]
+agentforge-application = { path = "../application" }
+agentforge-domain = { path = "../domain" }
+agentforge-protocol = { path = "../protocol" }
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
