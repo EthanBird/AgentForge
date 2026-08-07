@@ -1,0 +1,46 @@
+{
+  "schema_version": "agentforge/submission/1.0",
+  "submission_id": "sub-lease-fencing-salvage-0003",
+  "submission_kind": "salvage",
+  "terminal_outcome": "QUARANTINED",
+  "completed_stage": "salvage_registration",
+  "created_at": "2026-08-07T14:05:00Z",
+  "package_id": "wp-lease-fencing-001",
+  "package_revision": 3,
+  "package_hash": "sha256:e02271c1d96c4b82fa250eecaac34ea4a8542639b9d87d7cf4b26d11ac95b83f",
+  "attempt_id": "att-lease-fencing-03",
+  "lease": {
+    "lease_id": "lease-fencing-03",
+    "generation": 3,
+    "fencing_token_hash": "sha256:c6d337b3f795a0817012b8c4db5e89a2533af12114580ed707a3dbb9b65b9395",
+    "issued_at": "2026-08-07T06:00:00Z",
+    "expires_at": "2026-08-07T10:00:00Z"
+  },
+  "salvage": {
+    "artifact_uri": "artifact://salvage/att-lease-fencing-03/worktree.tar.zst",
+    "sha256": "sha256:693a26fb6d2fd27a28fb9d38f244ec02662f8abec73ca7d798b64918f9c9c6cd",
+    "size_bytes": 1832041,
+    "base_commit": "2a6d174ea95e04b31f6096d330e52a2dcbdd9f80",
+    "candidate_commit": "9fcd1cfa375156238fe88b6f38c43d9d2f0e9dc1",
+    "quarantine_reason": "generation_superseded"
+  },
+  "provenance": {
+    "agent_id": "agent-author-04",
+    "executor_id": "executor-rust-frontier-01",
+    "node_id": "worker-osaka-02",
+    "executor_fingerprint": "sha256:ebc5f6b635de76486eca8f49d76c6ac5c316030d5272643a17b1dbd16d8f43db",
+    "jcode_version": "0.9.2",
+    "toolchain_digest": "sha256:e24461bb9f87da290535772b0f6a1157c0b93dcf13baad4b382383c8ad44be6a",
+    "signature": {
+      "algorithm": "ed25519",
+      "key_id": "agentforge-fixture-submission-signer-v1",
+      "signer_role": "salvage_registrar",
+      "signed_digest": "sha256:2803509bc66979ca95a3541357fb1623b0598cadd7a5fc0b0d442ee044c0950d",
+      "value": "tNmCNuir2iXR067BcyQD0jPvoEw1gx3XnRkM9O8mdbvqV1Kzi2Au_fvmcAK8VBFpbv6EOV0kDA_uipEh4jogAQ"
+    }
+  },
+  "lineage": {
+    "parent_submission_id": null,
+    "supersedes": []
+  }
+}

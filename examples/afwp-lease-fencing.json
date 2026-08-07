@@ -1,0 +1,455 @@
+{
+  "schema_version": "afwp/1.0",
+  "package_id": "wp-lease-fencing-001",
+  "revision": 3,
+  "package_hash": "sha256:e02271c1d96c4b82fa250eecaac34ea4a8542639b9d87d7cf4b26d11ac95b83f",
+  "project_id": "agentforge",
+  "graph_version": 7,
+  "parent_id": "wp-epic-control-plane",
+  "kind": "implementation",
+  "title": "Implement transactional lease-generation fencing",
+  "metadata": {
+    "created_at": "2026-08-07T09:00:00Z",
+    "created_by": "boss-control-plane",
+    "labels": {
+      "component": "control-plane",
+      "risk": "critical"
+    }
+  },
+  "goal": {
+    "background": "A disconnected worker can recover after the same work package revision has been reassigned. Without a monotonically increasing fence, the stale worker can overwrite progress or register a candidate from an obsolete attempt.",
+    "objective": "Add transactionally allocated lease generations and reject every stale side-effecting Attempt operation without mutating authoritative state.",
+    "value": "At most one lease generation can affect acceptance and integration for a work package revision.",
+    "glossary": {
+      "generation": "A server-allocated monotonically increasing integer scoped to project_id, package_id and revision.",
+      "salvage": "Read-only material retained from an expired attempt; it cannot enter automatic acceptance or integration."
+    },
+    "assumptions": [
+      "PostgreSQL is the authoritative lease store.",
+      "Client wall-clock time is not trusted."
+    ]
+  },
+  "requirements": [
+    {
+      "id": "REQ-GEN-01",
+      "level": "must",
+      "source": "SYS-LEASE-04",
+      "text": "Each successful reassignment of the same project_id, package_id and revision shall allocate a generation strictly greater than every previously committed generation."
+    },
+    {
+      "id": "REQ-FENCE-02",
+      "level": "must",
+      "source": "SYS-LEASE-05",
+      "text": "Renew, checkpoint, artifact registration and Candidate registration operations shall atomically validate the active generation before applying their side effect.",
+      "error_semantics": "A lower, superseded or revoked generation returns HTTP 409 with code AF_LEASE_STALE. A still-current lease whose server-time expiry has passed returns HTTP 410 with code AF_LEASE_EXPIRED. Both leave all domain tables and the outbox unchanged."
+    },
+    {
+      "id": "REQ-IDEMP-03",
+      "level": "must",
+      "source": "SYS-IDEMPOTENCY-02",
+      "text": "Replaying an accepted request with the same idempotency key and payload shall return the original response without duplicating domain rows or outbox events."
+    },
+    {
+      "id": "REQ-SALVAGE-04",
+      "level": "must",
+      "source": "SYS-SALVAGE-01",
+      "text": "An expired attempt may register a content-addressed salvage bundle, but its submission shall be quarantined and shall not trigger verification or integration."
+    }
+  ],
+  "scope": {
+    "must_do": [
+      "Allocate and validate generation in PostgreSQL transactions.",
+      "Apply fencing to renew, checkpoint, artifact and Candidate registration command handlers.",
+      "Add concurrent reassignment, stale-write, replay and salvage tests."
+    ],
+    "should_do": [
+      "Keep the generation allocator isolated behind a repository interface for deterministic tests."
+    ],
+    "non_goals": [
+      "Change executor matching or bounty calculation.",
+      "Implement multi-region PostgreSQL consensus.",
+      "Allow workers to push directly to the protected integration branch."
+    ],
+    "allowed_paths": [
+      "crates/control-plane/src/lease/**",
+      "crates/control-plane/src/attempt/**",
+      "migrations/**lease_generation*",
+      "crates/control-plane/tests/lease_*"
+    ],
+    "forbidden_paths": [
+      "infra/production/**",
+      ".github/**",
+      "crates/matcher/**"
+    ],
+    "invariants": [
+      "Existing successful API response fields remain backward compatible.",
+      "Worker-provided timestamps never influence generation ordering.",
+      "A stale command produces no domain mutation and no outbox event.",
+      "The candidate, reviewed and reproduced Git heads are byte-identical."
+    ]
+  },
+  "snapshot": {
+    "repository": "ssh://git.lan/agentforge/agentforge.git",
+    "base_commit": "2a6d174ea95e04b31f6096d330e52a2dcbdd9f80",
+    "toolchain_locks": [
+      {
+        "path": "Cargo.lock",
+        "sha256": "sha256:277a185925fad859bbc5ee3c0d3ec9bb1142357fa44d28c23a01c3c04bc4ad37"
+      },
+      {
+        "path": "rust-toolchain.toml",
+        "sha256": "sha256:8e27313e158b714193d713590ad3124571ceefb0d42d37f8a53a179d0fdd92bc"
+      }
+    ],
+    "inputs": [
+      {
+        "artifact_id": "adr-lease-002",
+        "uri": "artifact://agentforge/adr/lease-fencing/2",
+        "sha256": "sha256:4ffbf4eaf35e7f5610303bd73d3927a2f6f99ab16e182479d007b6e73dd7ca92",
+        "media_type": "text/markdown"
+      }
+    ]
+  },
+  "dependencies": [
+    {
+      "package_id": "wp-attempt-persistence-002",
+      "revision": 1,
+      "edge": "provides_contract",
+      "condition": "integrated",
+      "artifact_ids": [
+        "attempt-store-api-v1"
+      ]
+    }
+  ],
+  "interfaces": [
+    {
+      "id": "attempt-command-errors-v1",
+      "kind": "openapi",
+      "artifact_ref": "artifact://agentforge/contracts/control-plane-openapi/v1",
+      "compatibility": "backward",
+      "notes": "Add AF_LEASE_STALE to the existing 409 error-code enum; do not remove or rename existing variants."
+    },
+    {
+      "id": "lease-generation-schema-v1",
+      "kind": "database",
+      "artifact_ref": "artifact://agentforge/contracts/lease-generation-schema/v1",
+      "compatibility": "backward"
+    }
+  ],
+  "routing": {
+    "task_class": "backend.distributed-concurrency",
+    "risk": "critical",
+    "complexity": 0.72,
+    "required": {
+      "capabilities": [
+        "rust",
+        "postgresql",
+        "distributed-systems",
+        "concurrency-testing"
+      ],
+      "tools": [
+        "git",
+        "cargo",
+        "postgres-test-container"
+      ],
+      "os": [
+        "linux"
+      ],
+      "modalities": [
+        "text"
+      ],
+      "hardware": [],
+      "security_level": "project_private"
+    },
+    "preferred": {
+      "capability_weights": {
+        "architecture-code": 0.9,
+        "backend-concurrency": 1.0,
+        "property-testing": 0.75
+      },
+      "task_profiles": [
+        "architecture_code",
+        "backend_concurrency"
+      ],
+      "model_families": [
+        "frontier-reasoning"
+      ]
+    },
+    "minimum_first_pass_probability": 0.8,
+    "deadline_minutes": 240
+  },
+  "permissions": {
+    "network_allowlist": [
+      "dependency-proxy.lan",
+      "git-relay.lan",
+      "postgres-test.lan"
+    ],
+    "git_write_prefix": "task/wp-lease-fencing-001/attempt/",
+    "external_side_effects": "deny",
+    "secrets": [
+      {
+        "name": "git-branch-token",
+        "delivery": "host_broker_only",
+        "scope": "refs/heads/task/wp-lease-fencing-001/attempt/*"
+      }
+    ],
+    "max_artifact_bytes": 268435456
+  },
+  "scheduling": {
+    "mode": "author_reviewer_pair",
+    "priority": 90,
+    "max_budget_units": 24,
+    "max_attempts": 3,
+    "offline_grace_seconds": 600,
+    "lease": {
+      "ttl_seconds": 1200,
+      "renew_after_seconds": 400,
+      "max_execution_seconds": 14400
+    }
+  },
+  "conflicts": {
+    "expected_write_set": [
+      "crates/control-plane/src/lease/**",
+      "crates/control-plane/src/attempt/**",
+      "migrations/**lease_generation*",
+      "crates/control-plane/tests/lease_*"
+    ],
+    "mutex": [
+      "db-schema:lease-generation"
+    ],
+    "integration_after": [
+      "wp-attempt-persistence-002"
+    ],
+    "merge_strategy": "merge_commit"
+  },
+  "communication": {
+    "autonomous_decisions": [
+      "Choose transaction isolation and locking details if all acceptance criteria and invariants remain true.",
+      "Add private helper types and tests inside allowed paths."
+    ],
+    "must_escalate": [
+      "The existing Attempt store cannot provide a compare-and-set transaction boundary.",
+      "A required compatibility change would remove or rename a public API field.",
+      "The pinned baseline fails before any task change."
+    ],
+    "question_timeout_seconds": 1800
+  },
+  "delegation": {
+    "allowed": false,
+    "max_depth": 0,
+    "max_children": 0,
+    "max_budget_units": 0,
+    "allowed_kinds": []
+  },
+  "acceptance": {
+    "criteria": [
+      {
+        "id": "AC-FENCE-01",
+        "covers": [
+          "REQ-GEN-01",
+          "REQ-FENCE-02"
+        ],
+        "kind": "integration_test",
+        "given": "A PostgreSQL test instance and two workers claiming revision 3 in sequence.",
+        "when": "Generation 4 is granted after generation 3, then both generations call renew, checkpoint, artifact and Candidate registration handlers.",
+        "then": "All generation-4 calls succeed; every generation-3 call returns AF_LEASE_STALE; domain and outbox row counts show no stale write.",
+        "runner_image": "registry.lan/agentforge/rust-test@sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+        "argv": [
+          "cargo",
+          "test",
+          "-p",
+          "agentforge-control-plane",
+          "--test",
+          "lease_fencing",
+          "stale_generation_has_no_side_effects",
+          "--",
+          "--exact"
+        ],
+        "working_directory": ".",
+        "environment": {
+          "RUST_BACKTRACE": "1",
+          "TEST_SEED": "42017"
+        },
+        "expect": {
+          "exit_code": 0,
+          "stdout_contains": [
+            "stale_generation_has_no_side_effects"
+          ]
+        },
+        "resources": {
+          "node_class": "test-standard",
+          "cpu_limit": 4,
+          "memory_mb": 4096
+        },
+        "evidence": [
+          "junit.xml",
+          "stdout.log",
+          "db-assertions.json",
+          "git-tree.txt"
+        ],
+        "hard": true,
+        "flaky_retry_limit": 0,
+        "timeout_seconds": 600
+      },
+      {
+        "id": "AC-IDEMP-02",
+        "covers": [
+          "REQ-IDEMP-03"
+        ],
+        "kind": "property_test",
+        "given": "A valid active lease and generated sequences containing duplicate and reordered request deliveries.",
+        "when": "At least 1000 seeded delivery sequences are applied to every fenced command handler.",
+        "then": "Each idempotency key produces at most one domain mutation and one outbox event, and replay returns the recorded response.",
+        "runner_image": "registry.lan/agentforge/rust-test@sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+        "argv": [
+          "cargo",
+          "test",
+          "-p",
+          "agentforge-control-plane",
+          "idempotent_fenced_commands",
+          "--",
+          "--exact"
+        ],
+        "environment": {
+          "PROPTEST_CASES": "1000",
+          "PROPTEST_RNG_SEED": "0000000000000000000000000000a4161"
+        },
+        "expect": {
+          "exit_code": 0
+        },
+        "evidence": [
+          "junit.xml",
+          "proptest-regressions.txt",
+          "db-assertions.json"
+        ],
+        "hard": true,
+        "flaky_retry_limit": 0,
+        "timeout_seconds": 900
+      },
+      {
+        "id": "AC-SALVAGE-03",
+        "covers": [
+          "REQ-SALVAGE-04"
+        ],
+        "kind": "integration_test",
+        "given": "An expired generation-3 attempt with a valid content-addressed bundle and an active generation-4 attempt.",
+        "when": "The expired worker registers salvage and tries to register a normal Candidate.",
+        "then": "The bundle is recorded as salvage, the submission is QUARANTINED, and no verification or integration event is emitted.",
+        "runner_image": "registry.lan/agentforge/rust-test@sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+        "argv": [
+          "cargo",
+          "test",
+          "-p",
+          "agentforge-control-plane",
+          "late_submission_is_quarantined",
+          "--",
+          "--exact"
+        ],
+        "expect": {
+          "exit_code": 0,
+          "submission_state": "QUARANTINED"
+        },
+        "evidence": [
+          "junit.xml",
+          "submission-state.json",
+          "outbox-assertions.json"
+        ],
+        "hard": true,
+        "flaky_retry_limit": 0,
+        "timeout_seconds": 600
+      },
+      {
+        "id": "AC-SCOPE-04",
+        "covers": [],
+        "kind": "changed_paths",
+        "given": "The immutable base and candidate commits.",
+        "when": "The verifier lists all changed paths including renames and submodule entries.",
+        "then": "Every changed path is allowed and no forbidden path is present.",
+        "allow": [
+          "crates/control-plane/src/lease/**",
+          "crates/control-plane/src/attempt/**",
+          "migrations/**lease_generation*",
+          "crates/control-plane/tests/lease_*"
+        ],
+        "deny": [
+          "infra/production/**",
+          ".github/**",
+          "crates/matcher/**"
+        ],
+        "hard": true,
+        "flaky_retry_limit": 0
+      },
+      {
+        "id": "AC-REGRESS-05",
+        "covers": [],
+        "kind": "command",
+        "given": "A clean checkout of the candidate commit with the pinned Rust toolchain and Cargo.lock.",
+        "when": "The complete workspace test suite is executed with network disabled after dependency hydration.",
+        "then": "Compilation and all workspace tests complete successfully.",
+        "runner_image": "registry.lan/agentforge/rust-test@sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+        "argv": [
+          "cargo",
+          "test",
+          "--workspace",
+          "--locked"
+        ],
+        "expect": {
+          "exit_code": 0
+        },
+        "evidence": [
+          "junit.xml",
+          "stdout.log",
+          "toolchain-fingerprint.json"
+        ],
+        "hard": true,
+        "flaky_retry_limit": 0,
+        "timeout_seconds": 1800
+      }
+    ]
+  },
+  "deliverables": [
+    {
+      "id": "candidate-commit",
+      "kind": "git_commit",
+      "required": true,
+      "description": "Immutable candidate commit with required AgentForge trailers."
+    },
+    {
+      "id": "lease-fencing-source",
+      "kind": "source",
+      "path": "crates/control-plane/src/lease/",
+      "required": true
+    },
+    {
+      "id": "lease-fencing-tests",
+      "kind": "test",
+      "path": "crates/control-plane/tests/lease_fencing.rs",
+      "required": true
+    },
+    {
+      "id": "evidence-bundle",
+      "kind": "evidence_bundle",
+      "required": true,
+      "description": "Signed per-criterion evidence and clean-reproduction manifest."
+    }
+  ],
+  "completion": {
+    "branch_pattern": "task/{package_id}/attempt/{attempt_id}",
+    "commit_trailers": [
+      "Task-ID",
+      "Task-Revision",
+      "Attempt-ID",
+      "Package-Hash",
+      "Evidence-Digest",
+      "Worker-ID"
+    ],
+    "rollback": "Revert the integration merge commit. The migration may add generation state but shall not delete or rewrite existing attempt data.",
+    "definition_of_done": [
+      "Every hard acceptance criterion is PASS.",
+      "There are no open critical or high review findings.",
+      "CandidateHead, ReviewedHead and TestedHead are identical.",
+      "The signed evidence bundle is registered.",
+      "The candidate is reproduced on the latest integration target before merge."
+    ]
+  }
+}

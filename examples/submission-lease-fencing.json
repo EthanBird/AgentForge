@@ -1,0 +1,199 @@
+{
+  "schema_version": "agentforge/submission/1.0",
+  "submission_id": "sub-lease-fencing-0004",
+  "submission_kind": "candidate",
+  "candidate_id": "0198f221-52f8-7d6b-92b4-2d89aa25a340",
+  "candidate_artifact_id": "0198f221-52f8-7d6b-92b4-2d89aa25a342",
+  "verification_run_id": "0198f221-52f8-7d6b-92b4-2d89aa25a341",
+  "terminal_outcome": "PASS",
+  "completed_stage": "candidate_ready",
+  "created_at": "2026-08-07T12:42:31Z",
+  "package_id": "wp-lease-fencing-001",
+  "package_revision": 3,
+  "package_hash": "sha256:e02271c1d96c4b82fa250eecaac34ea4a8542639b9d87d7cf4b26d11ac95b83f",
+  "attempt_id": "att-lease-fencing-04",
+  "lease": {
+    "lease_id": "lease-fencing-04",
+    "generation": 4,
+    "fencing_token_hash": "sha256:73b7bb1f785c465749903ca13d45a09016a8e28e9404dd9bd57a61313558b81c",
+    "issued_at": "2026-08-07T10:00:00Z",
+    "expires_at": "2026-08-07T14:00:00Z"
+  },
+  "git": {
+    "repository": "ssh://git.lan/agentforge/agentforge.git",
+    "base_commit": "2a6d174ea95e04b31f6096d330e52a2dcbdd9f80",
+    "candidate_commit": "7bb16476323d65f0989b9c671246746c9e95f3e1",
+    "tree_hash": "12f04aa3c0df75bfc18fd16068a79d45f2d5b63c",
+    "branch": "task/wp-lease-fencing-001/attempt/att-lease-fencing-04"
+  },
+  "deliverables": [
+    {
+      "id": "lease-fencing-source",
+      "kind": "source",
+      "path": "crates/control-plane/src/lease/fence.rs",
+      "sha256": "sha256:63a3ed3e91d2b00e0e527c2c9bf6f815618b2cf4ae20e6c0cb2801bc55c5fddc",
+      "media_type": "text/x-rust",
+      "size_bytes": 9184
+    },
+    {
+      "id": "lease-fencing-tests",
+      "kind": "test",
+      "path": "crates/control-plane/tests/lease_fencing.rs",
+      "sha256": "sha256:9e23df93b842fd8909ff35a75b6b3107ca8c173884d60b7f7fd4e8b2f6c2f25c",
+      "media_type": "text/x-rust",
+      "size_bytes": 12761
+    },
+    {
+      "id": "candidate-commit",
+      "kind": "git_commit",
+      "path": "candidate/git.json",
+      "sha256": "sha256:c3d827cbd1ce93d8e336af21ba0133f6985daed5199df2b5a2fe1163152a941c",
+      "media_type": "application/vnd.agentforge.git-candidate+json",
+      "size_bytes": 418
+    },
+    {
+      "id": "evidence-bundle",
+      "kind": "evidence_bundle",
+      "path": "evidence/bundle.tar.zst",
+      "sha256": "sha256:b7644131536f1dad3247d4d20dfc3551f15032e6206a3586525e2d2ab9b3040d",
+      "media_type": "application/zstd",
+      "size_bytes": 4382912
+    }
+  ],
+  "criteria": [
+    {
+      "acceptance_id": "AC-FENCE-01",
+      "status": "PASS",
+      "hard": true,
+      "runner_digest": "sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+      "started_at": "2026-08-07T11:31:02Z",
+      "duration_ms": 32781,
+      "exit_code": 0,
+      "attempts": 1,
+      "evidence_refs": [
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-fence-01/junit.xml",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-fence-01/stdout.log",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-fence-01/db-assertions.json",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-fence-01/git-tree.txt"
+      ],
+      "summary": "Generation 3 was rejected after generation 4 became active; no stale domain or outbox rows were observed."
+    },
+    {
+      "acceptance_id": "AC-IDEMP-02",
+      "status": "PASS",
+      "hard": true,
+      "runner_digest": "sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+      "started_at": "2026-08-07T11:32:01Z",
+      "duration_ms": 98117,
+      "exit_code": 0,
+      "attempts": 1,
+      "evidence_refs": [
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-idemp-02/junit.xml",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-idemp-02/proptest-regressions.txt",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-idemp-02/db-assertions.json"
+      ]
+    },
+    {
+      "acceptance_id": "AC-SALVAGE-03",
+      "status": "PASS",
+      "hard": true,
+      "runner_digest": "sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+      "started_at": "2026-08-07T11:34:02Z",
+      "duration_ms": 21389,
+      "exit_code": 0,
+      "attempts": 1,
+      "evidence_refs": [
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-salvage-03/junit.xml",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-salvage-03/submission-state.json",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-salvage-03/outbox-assertions.json"
+      ]
+    },
+    {
+      "acceptance_id": "AC-SCOPE-04",
+      "status": "PASS",
+      "hard": true,
+      "runner_digest": "sha256:80c46290d45d4acb0bcf8d1752514dbd73d1e62a294b969e521bcb292da14d06",
+      "started_at": "2026-08-07T11:34:30Z",
+      "duration_ms": 933,
+      "attempts": 1,
+      "evidence_refs": [
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-scope-04/changed-paths.json"
+      ]
+    },
+    {
+      "acceptance_id": "AC-REGRESS-05",
+      "status": "PASS",
+      "hard": true,
+      "runner_digest": "sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+      "started_at": "2026-08-07T11:35:01Z",
+      "duration_ms": 371244,
+      "exit_code": 0,
+      "attempts": 1,
+      "evidence_refs": [
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-regress-05/junit.xml",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-regress-05/stdout.log",
+        "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/ac-regress-05/toolchain-fingerprint.json"
+      ]
+    }
+  ],
+  "review": {
+    "reviewed_head": "7bb16476323d65f0989b9c671246746c9e95f3e1",
+    "reviewer_id": "agent-reviewer-19",
+    "reviewer_executor_id": "executor-review-frontier-02",
+    "verdict": "pass",
+    "findings": [
+      {
+        "id": "RV-DOC-01",
+        "severity": "low",
+        "status": "resolved",
+        "summary": "The original transaction comment did not explain why client time is excluded; the final candidate documents the invariant.",
+        "location": "crates/control-plane/src/lease/fence.rs:41",
+        "acceptance_id": "AC-FENCE-01",
+        "evidence_refs": [
+          "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/review/report.json"
+        ]
+      }
+    ],
+    "report_ref": "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/review/report.json"
+  },
+  "clean_reproduction": {
+    "tested_head": "7bb16476323d65f0989b9c671246746c9e95f3e1",
+    "runner_digest": "sha256:3b08e2840f899c917efc17c28701512a2861d654f2f647fa0f3c645b3e9f2225",
+    "verdict": "pass",
+    "report_ref": "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/clean-reproduction/report.json"
+  },
+  "evidence_bundle": {
+    "uri": "artifact://evidence/0198f221-52f8-7d6b-92b4-2d89aa25a341/bundle.tar.zst",
+    "sha256": "sha256:b7644131536f1dad3247d4d20dfc3551f15032e6206a3586525e2d2ab9b3040d",
+    "manifest_sha256": "sha256:4efca7d84370b07b3306b199faca7c8c12a3fbe0535e7aeea9eae722a04de1ec",
+    "size_bytes": 4382912
+  },
+  "decisions": [
+    "Generation is allocated with an UPDATE RETURNING inside the same transaction that activates the new lease.",
+    "The persisted fencing record uses server sequence state and never compares worker timestamps."
+  ],
+  "residual_risks": [
+    "The implementation has not been exercised on a multi-region PostgreSQL deployment; that topology is outside this work package."
+  ],
+  "provenance": {
+    "agent_id": "agent-author-07",
+    "executor_id": "executor-rust-frontier-03",
+    "node_id": "worker-tokyo-03",
+    "executor_fingerprint": "sha256:0ff04bb33289d4ee0ec44ad56c0099c4b65c1044894c4340e023677b78f91af6",
+    "jcode_version": "0.9.2",
+    "toolchain_digest": "sha256:e24461bb9f87da290535772b0f6a1157c0b93dcf13baad4b382383c8ad44be6a",
+    "signature": {
+      "algorithm": "ed25519",
+      "key_id": "agentforge-fixture-submission-signer-v1",
+      "signer_role": "verification_coordinator",
+      "signed_digest": "sha256:60a1b81aad2eef1a8e608a34a7bb21f394982e3247f2cdcb2aaeaa7b95613d09",
+      "value": "wi3hc8qRpgG4EUWu0bNVUfZnQ_hfgSYMkKJgQCx5fv3NxdkGh1MuQZXqEQ4mzI1svrhHfw_H25ZCMBT-Li7DCg"
+    }
+  },
+  "lineage": {
+    "parent_submission_id": "sub-lease-fencing-0003",
+    "supersedes": [
+      "sub-lease-fencing-0003"
+    ]
+  }
+}

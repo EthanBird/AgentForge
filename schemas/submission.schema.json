@@ -1,0 +1,931 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentforge.dev/schemas/submission/1.0.0/schema.json",
+  "title": "AgentForge Submission Manifest 1.0",
+  "description": "Immutable manifest binding an AFWP revision, lease generation, candidate Git commit and acceptance evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "submission_id",
+    "submission_kind",
+    "terminal_outcome",
+    "completed_stage",
+    "created_at",
+    "package_id",
+    "package_revision",
+    "package_hash",
+    "attempt_id",
+    "lease",
+    "provenance",
+    "lineage"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "agentforge/submission/1.0"
+    },
+    "submission_id": {
+      "type": "string",
+      "pattern": "^sub-[a-z0-9][a-z0-9-]{2,95}$"
+    },
+    "submission_kind": {
+      "enum": [
+        "candidate",
+        "salvage"
+      ]
+    },
+    "candidate_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "candidate_artifact_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "verification_run_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "terminal_outcome": {
+      "enum": [
+        "PASS",
+        "FAIL",
+        "INCONCLUSIVE",
+        "QUARANTINED"
+      ]
+    },
+    "completed_stage": {
+      "enum": [
+        "provenance_check",
+        "reviewing",
+        "reproducing",
+        "candidate_ready",
+        "salvage_registration"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "package_id": {
+      "type": "string",
+      "pattern": "^(?:WP-M[0-9]+-[0-9]{3}|wp-[a-z0-9][a-z0-9-]{2,95})$"
+    },
+    "package_revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "package_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^att-[a-z0-9][a-z0-9-]{2,95}$"
+    },
+    "lease": {
+      "$ref": "#/$defs/lease"
+    },
+    "git": {
+      "$ref": "#/$defs/git"
+    },
+    "deliverables": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/deliverable"
+      }
+    },
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/criterion_result"
+      }
+    },
+    "review": {
+      "$ref": "#/$defs/review"
+    },
+    "clean_reproduction": {
+      "$ref": "#/$defs/clean_reproduction"
+    },
+    "evidence_bundle": {
+      "$ref": "#/$defs/evidence_bundle"
+    },
+    "salvage": {
+      "$ref": "#/$defs/salvage"
+    },
+    "failure_dossier": {
+      "$ref": "#/$defs/failure_dossier"
+    },
+    "decisions": {
+      "$ref": "#/$defs/string_array"
+    },
+    "residual_risks": {
+      "$ref": "#/$defs/string_array"
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    },
+    "lineage": {
+      "$ref": "#/$defs/lineage"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "submission_kind": {
+            "const": "candidate"
+          }
+        },
+        "required": [
+          "submission_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "candidate_id": {},
+          "candidate_artifact_id": {},
+          "verification_run_id": {},
+          "terminal_outcome": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "INCONCLUSIVE"
+            ]
+          },
+          "completed_stage": {
+            "enum": [
+              "provenance_check",
+              "reviewing",
+              "reproducing",
+              "candidate_ready"
+            ]
+          },
+          "git": {},
+          "provenance": {
+            "type": "object",
+            "properties": {
+              "signature": {
+                "type": "object",
+                "properties": {
+                  "signer_role": {
+                    "const": "verification_coordinator"
+                  }
+                }
+              }
+            }
+          },
+          "salvage": false
+        },
+        "required": [
+          "candidate_id",
+          "candidate_artifact_id",
+          "verification_run_id",
+          "git"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "submission_kind": {
+            "const": "candidate"
+          },
+          "terminal_outcome": {
+            "const": "PASS"
+          }
+        },
+        "required": [
+          "submission_kind",
+          "terminal_outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "deliverables": {},
+          "criteria": {},
+          "review": {},
+          "clean_reproduction": {},
+          "evidence_bundle": {},
+          "decisions": {},
+          "residual_risks": {},
+          "completed_stage": {
+            "const": "candidate_ready"
+          },
+          "failure_dossier": false
+        },
+        "required": [
+          "deliverables",
+          "criteria",
+          "review",
+          "clean_reproduction",
+          "evidence_bundle",
+          "decisions",
+          "residual_risks"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "submission_kind": {
+            "const": "candidate"
+          },
+          "terminal_outcome": {
+            "enum": [
+              "FAIL",
+              "INCONCLUSIVE"
+            ]
+          }
+        },
+        "required": [
+          "submission_kind",
+          "terminal_outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "completed_stage": {
+            "enum": [
+              "provenance_check",
+              "reviewing",
+              "reproducing"
+            ]
+          },
+          "failure_dossier": {}
+        },
+        "required": [
+          "failure_dossier"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "submission_kind": {
+            "const": "candidate"
+          },
+          "terminal_outcome": {
+            "enum": [
+              "FAIL",
+              "INCONCLUSIVE"
+            ]
+          },
+          "completed_stage": {
+            "const": "provenance_check"
+          }
+        },
+        "required": [
+          "submission_kind",
+          "terminal_outcome",
+          "completed_stage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "criteria": false,
+          "review": false,
+          "clean_reproduction": false,
+          "evidence_bundle": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "submission_kind": {
+            "const": "candidate"
+          },
+          "terminal_outcome": {
+            "enum": [
+              "FAIL",
+              "INCONCLUSIVE"
+            ]
+          },
+          "completed_stage": {
+            "const": "reviewing"
+          }
+        },
+        "required": [
+          "submission_kind",
+          "terminal_outcome",
+          "completed_stage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "clean_reproduction": false,
+          "evidence_bundle": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "submission_kind": {
+            "const": "candidate"
+          },
+          "terminal_outcome": {
+            "enum": [
+              "FAIL",
+              "INCONCLUSIVE"
+            ]
+          },
+          "completed_stage": {
+            "const": "reproducing"
+          }
+        },
+        "required": [
+          "submission_kind",
+          "terminal_outcome",
+          "completed_stage"
+        ]
+      },
+      "then": {
+        "properties": {
+          "review": {}
+        },
+        "required": [
+          "review"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "submission_kind": {
+            "const": "salvage"
+          }
+        },
+        "required": [
+          "submission_kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "candidate_id": false,
+          "candidate_artifact_id": false,
+          "verification_run_id": false,
+          "terminal_outcome": {
+            "const": "QUARANTINED"
+          },
+          "completed_stage": {
+            "const": "salvage_registration"
+          },
+          "salvage": {},
+          "git": false,
+          "deliverables": false,
+          "criteria": false,
+          "review": false,
+          "clean_reproduction": false,
+          "evidence_bundle": false,
+          "failure_dossier": false,
+          "decisions": false,
+          "residual_risks": false,
+          "provenance": {
+            "type": "object",
+            "properties": {
+              "signature": {
+                "type": "object",
+                "properties": {
+                  "signer_role": {
+                    "const": "salvage_registrar"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "salvage"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "git_oid": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "string_array": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 2000
+      }
+    },
+    "lease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lease_id",
+        "generation",
+        "fencing_token_hash",
+        "issued_at",
+        "expires_at"
+      ],
+      "properties": {
+        "lease_id": {
+          "type": "string",
+          "pattern": "^lease-[a-z0-9][a-z0-9-]{2,95}$"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "fencing_token_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "base_commit",
+        "candidate_commit",
+        "tree_hash",
+        "branch"
+      ],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "base_commit": {
+          "$ref": "#/$defs/git_oid"
+        },
+        "candidate_commit": {
+          "$ref": "#/$defs/git_oid"
+        },
+        "tree_hash": {
+          "$ref": "#/$defs/git_oid"
+        },
+        "branch": {
+          "type": "string",
+          "pattern": "^task/[A-Za-z0-9._/-]{3,240}$"
+        }
+      }
+    },
+    "deliverable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,127}$"
+        },
+        "kind": {
+          "enum": [
+            "source",
+            "test",
+            "document",
+        "report",
+        "image",
+        "binary",
+        "sbom",
+        "evidence",
+        "git_commit",
+        "evidence_bundle"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "media_type": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "criterion_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acceptance_id",
+        "status",
+        "hard",
+        "runner_digest",
+        "started_at",
+        "duration_ms",
+        "evidence_refs"
+      ],
+      "properties": {
+        "acceptance_id": {
+          "type": "string",
+          "pattern": "^AC-[A-Z0-9][A-Z0-9-]{1,47}$"
+        },
+        "status": {
+          "enum": [
+            "PASS",
+            "FAIL",
+            "INCONCLUSIVE",
+            "SKIPPED"
+          ]
+        },
+        "hard": {
+          "type": "boolean"
+        },
+        "runner_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 2000
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "severity",
+        "status",
+        "summary",
+        "evidence_refs"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^RV-[A-Z0-9][A-Z0-9-]{1,47}$"
+        },
+        "severity": {
+          "enum": [
+            "critical",
+            "high",
+            "medium",
+            "low"
+          ]
+        },
+        "status": {
+          "enum": [
+            "open",
+            "resolved",
+            "waived"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "location": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "acceptance_id": {
+          "type": "string",
+          "pattern": "^AC-[A-Z0-9][A-Z0-9-]{1,47}$"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewed_head",
+        "reviewer_id",
+        "reviewer_executor_id",
+        "verdict",
+        "findings",
+        "report_ref"
+      ],
+      "properties": {
+        "reviewed_head": {
+          "$ref": "#/$defs/git_oid"
+        },
+        "reviewer_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,127}$"
+        },
+        "reviewer_executor_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,127}$"
+        },
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "blocked"
+          ]
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/finding"
+          }
+        },
+        "report_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      }
+    },
+    "clean_reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tested_head",
+        "runner_digest",
+        "verdict",
+        "report_ref"
+      ],
+      "properties": {
+        "tested_head": {
+          "$ref": "#/$defs/git_oid"
+        },
+        "runner_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "verdict": {
+          "enum": [
+            "pass",
+            "fail",
+            "inconclusive"
+          ]
+        },
+        "report_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      }
+    },
+    "evidence_bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uri",
+        "sha256",
+        "manifest_sha256",
+        "size_bytes"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "salvage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_uri",
+        "sha256",
+        "size_bytes",
+        "base_commit",
+        "quarantine_reason"
+      ],
+      "properties": {
+        "artifact_uri": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "base_commit": {
+          "$ref": "#/$defs/git_oid"
+        },
+        "candidate_commit": {
+          "$ref": "#/$defs/git_oid"
+        },
+        "quarantine_reason": {
+          "enum": [
+            "lease_expired",
+            "lease_revoked",
+            "generation_superseded",
+            "node_session_lost",
+            "manual_quarantine"
+          ]
+        }
+      }
+    },
+    "failure_dossier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "summary",
+        "retryable",
+        "evidence_digest",
+        "evidence_refs"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^(?:AF_[A-Z0-9_]+|[A-Z][A-Z0-9_]{2,127})$"
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "evidence_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "remediation": {
+          "$ref": "#/$defs/string_array"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "executor_id",
+        "node_id",
+        "executor_fingerprint",
+        "jcode_version",
+        "toolchain_digest",
+        "signature"
+      ],
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,127}$"
+        },
+        "executor_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,127}$"
+        },
+        "node_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,127}$"
+        },
+        "executor_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "jcode_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "toolchain_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "algorithm",
+            "key_id",
+            "signer_role",
+            "signed_digest",
+            "value"
+          ],
+          "properties": {
+            "algorithm": {
+              "const": "ed25519"
+            },
+            "key_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._:-]{1,255}$"
+            },
+            "signer_role": {
+              "enum": [
+                "verification_coordinator",
+                "salvage_registrar"
+              ]
+            },
+            "signed_digest": {
+              "$ref": "#/$defs/sha256"
+            },
+            "value": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{86}$"
+            }
+          }
+        }
+      }
+    },
+    "lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parent_submission_id",
+        "supersedes"
+      ],
+      "properties": {
+        "parent_submission_id": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^sub-[a-z0-9][a-z0-9-]{2,95}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "supersedes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^sub-[a-z0-9][a-z0-9-]{2,95}$"
+          }
+        }
+      }
+    }
+  }
+}

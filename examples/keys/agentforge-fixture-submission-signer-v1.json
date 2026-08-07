@@ -1,0 +1,15 @@
+{
+  "key_id": "agentforge-fixture-submission-signer-v1",
+  "algorithm": "ed25519",
+  "allowed_signer_roles": [
+    "verification_coordinator",
+    "salvage_registrar"
+  ],
+  "public_key_jwk": {
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "6k_AREgi2bKc3nNuT31hTKptU8b1dT_zTLQszz7b7yk"
+  },
+  "fixture_only": true,
+  "production_trust": "denied"
+}

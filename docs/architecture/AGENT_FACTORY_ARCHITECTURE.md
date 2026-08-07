@@ -10,14 +10,17 @@
 
 > **以不可变任务包作为执行契约，以动态任务图表达依赖，以事件账本保存事实，以租约表达临时执行权，以验收证据和 Git Commit 表达结果的异步任务市场。**
 
-系统的核心不是一个永远在线、永远不停止推理的 Boss，也不是某个特定模型，而是以下四个必须严格分离的对象：
+系统的核心不是一个永远在线、永远不停止推理的 Boss，也不是某个特定模型，而是以下必须严格分离的对象：
 
 | 对象 | 定义 | 为什么必须分离 |
 | --- | --- | --- |
 | `WorkPackage` | Boss 发布的、不可变且版本化的工作契约 | 需求、范围和验收不能在执行中被静默篡改 |
 | `Attempt` | 某个 Worker 对某一任务包版本的一次执行 | 同一任务可能失败、重试、换节点或并行竞赛 |
 | `Lease` | Worker 在有限时间内拥有的临时执行权 | 防止失联 Worker 永久占单或迟到覆盖新成果 |
-| `Submission` | Attempt 产生的候选提交及证据包 | 结果可以独立复验、比较、退回和集成 |
+| `Candidate` | 作者在有效 Lease 下封存并登记的不可变 Commit | 作者交付与独立验收事实不能混在一起 |
+| `VerificationRun` | 独立来源检查、复现、Review 和逐项 AC 的可推进运行记录 | 中间状态不能通过改写最终证明保存 |
+| `Submission` | Coordinator 在 run 终结后一次性创建的签名终态 Manifest | 结果可审计、比较和返工，但不能原地补写 |
+| `Integration` | Candidate 与目标基线合成、L5 复验和合并的记录 | `Accepted` 不能冒充 `Integrated` |
 
 最重要的设计原则有八条：
 
@@ -25,7 +28,7 @@
 2. **Boss 可以停止一次会话，但项目监督义务不能消失。**监督义务由服务器持久化，在事件触发时重新唤起合适的 Boss。
 3. **Worker 的一次模型回复结束，不等于任务结束。**确定性的本地 Supervisor 决定继续、等待、提交还是失败。
 4. **作者不能成为自己代码的唯一验收者。**最终验收必须在干净环境中独立执行。
-5. **被测试、被审查、被推送的必须是同一个精确 Commit。**
+5. **被测试、被审查、被提交和 Relay 接收的必须是同一个精确 Candidate Commit。**集成可产生新的 Integration Commit，但它必须绑定 Candidate 与目标基线并在自身 SHA 上重跑集成门禁。
 6. **Worker 永远不能直接写保护分支。**代码通过任务分支、Git Relay 和合并队列进入局域网 Git。
 7. **系统不追求虚假的“恰好一次”。**采用至少一次投递、幂等键、事务 Outbox、fencing token 和唯一 Attempt 分支。
 8. **模型名不能写死为岗位。**实际调度对象是“模型部署 + jcode + 提示词包 + 工具 + 节点 + 权限策略”的完整 Executor。
@@ -390,7 +393,7 @@ DQS=
 
 - 全部硬性验收项为 `PASS`；
 - 没有未处理的 Critical/High Reviewer finding；
-- `TestedHead = ReviewedHead = SubmittedHead`；
+- PASS/candidate-ready 时 `TestedHead = ReviewedHead = SubmittedHead = CandidateHead`；提前失败只记录真实已产生的 Head。IntegrationHead 可不同，但必须绑定 Candidate、目标基线和独立 L5 复验；
 - 干净环境复现通过；
 - 证据包已签名并登记；
 - 任务分支已进入局域网 Git；
@@ -398,10 +401,12 @@ DQS=
 - 合并完成并记录回滚点；
 - 需求追踪矩阵和后继 WorkGraph 已更新。
 
-### 5.5 完整任务包示例
+### 5.5 任务包概念示例
+
+以下 YAML 用于解释设计，不作为 conformance vector。机器可执行的权威定义是 `schemas/afwp.schema.json`，完整可校验实例是 `examples/afwp-lease-fencing.json`：
 
 ```yaml
-schema: "afwp/1.0"
+schema_version: "afwp/1.0"
 package_id: "wp-lease-fencing-001"
 revision: 3
 package_hash: "sha256:..."
@@ -413,7 +418,7 @@ title: "实现租约 fencing 校验"
 
 goal:
   background: "Worker 失联后任务可能被重新授予，旧 Worker 随后恢复并迟到提交。"
-  objective: "阻止旧租约代次的续租、检查点、制品登记和正式提交。"
+  objective: "阻止旧租约代次的续租、检查点、制品登记和正式 Candidate 登记。"
   value: "消除双重执行对任务状态和 Git 集成的污染。"
 
 requirements:
@@ -424,7 +429,7 @@ requirements:
   - id: "REQ-02"
     level: "must"
     source: "SYS-LEASE-05"
-    text: "低 generation 的 renew、checkpoint、artifact 和 submit 必须返回 STALE_LEASE。"
+    text: "低 generation 的 renew、checkpoint、artifact 和 Candidate 登记必须返回 AF_LEASE_STALE。"
   - id: "REQ-03"
     level: "must"
     source: "SYS-SALVAGE-01"
@@ -433,7 +438,7 @@ requirements:
 scope:
   must_do:
     - "在数据库事务中生成和验证 generation。"
-    - "在所有有副作用的 Attempt API 上验证 fencing_token。"
+    - "在作者侧 progress/checkpoint、Candidate Artifact init/chunk/complete 和 RecordCandidate 上验证 fencing_token。"
     - "增加并发与迟到提交测试。"
   non_goals:
     - "修改 Agent 匹配算法。"
@@ -501,10 +506,10 @@ acceptance:
       covers: ["REQ-01", "REQ-02"]
       kind: "command"
       given: "PostgreSQL 测试实例和两个并发 claim 请求"
-      when: "旧 generation 在新租约产生后调用所有有副作用 API"
-      then: "新 generation 成功；旧 generation 全部返回 STALE_LEASE，且数据库无旧代次写入"
+      when: "旧 generation 在新租约产生后调用任一作者侧 Attempt/Candidate/Artifact mutation API"
+      then: "新 generation 成功；旧 generation 全部返回 AF_LEASE_STALE，且数据库无旧代次写入"
       runner_image: "registry.lan/agentforge/rust-test@sha256:..."
-      argv: ["cargo", "test", "-p", "control-plane", "lease_fencing", "--", "--exact"]
+      argv: ["cargo", "test", "-p", "agentforge-control-plane", "lease_fencing", "--", "--exact"]
       expect:
         exit_code: 0
       evidence: ["junit", "stdout", "db_assertions", "git_tree_hash"]
@@ -513,7 +518,10 @@ acceptance:
     - id: "AC-SALVAGE-01"
       covers: ["REQ-03"]
       kind: "integration_test"
-      argv: ["cargo", "test", "-p", "control-plane", "late_submission_is_quarantined"]
+      given: "一个仍为当前但已过服务器到期时间的作者 Lease，以及可内容寻址的迟到 Bundle"
+      when: "先调用正式 RecordCandidate，再显式调用 RegisterSalvage"
+      then: "正式登记返回 AF_LEASE_EXPIRED 且无 Candidate；只有 salvage Submission 被记录为 QUARANTINED"
+      argv: ["cargo", "test", "-p", "agentforge-control-plane", "expired_candidate_rejected_and_salvage_quarantined"]
       expect:
         exit_code: 0
         submission_state: "QUARANTINED"
@@ -616,23 +624,24 @@ stateDiagram-v2
 ### 6.3 Lease 状态
 
 ```text
-ACTIVE -> RENEWED -> ACTIVE
+RenewLease: ACTIVE -> ACTIVE（产生 LeaseRenewed 事件）
 ACTIVE -> RELEASED | REVOKED | EXPIRED
 ```
 
-每次重新授予生成单调递增的 `generation/fencing_token`。所有进度、检查点、制品、Submission 和 Git 集成请求都必须携带当前 token。
+每次重新授予生成单调递增的 `generation/fencing_token`。作者侧 Attempt/Candidate/Artifact mutation——包括 progress、checkpoint、Candidate Artifact init/chunk/complete 与 `RecordCandidate`——都必须携带当前 token，并由服务器时间判定 Lease 仍有效。作者必须先完整上传并完成内容寻址校验，再由 `RecordCandidate` 原子绑定不可变 Candidate、创建 VerificationRun 并关闭作者 Lease。
 
-### 6.4 Submission 状态
+后续 Verifier、Reviewer、Verification Coordinator、Relay 与 Integrator 不要求作者 Lease 继续有效，也不得接收或重放作者 bearer token。它们分别使用服务身份、最小 capability、job/queue lease 和 version CAS，并重新校验 Candidate 中已保存的 fencing 来源、Artifact digest、OID/tree 与 lineage。
+
+### 6.4 Candidate、VerificationRun 与 Submission 状态
 
 ```text
-RECEIVED
-  -> PROVENANCE_CHECK
-  -> REPRODUCING
-  -> REVIEWING
-  -> PASS | FAIL | INCONCLUSIVE | QUARANTINED
+Candidate:       SEALED（不可变）
+VerificationRun: QUEUED -> PROVENANCE_CHECK -> REVIEWING -> REPRODUCING
+                 -> PASS | FAIL | INCONCLUSIVE | CANCELLED
+Submission:      PASS | FAIL | INCONCLUSIVE | QUARANTINED（创建即终态）
 ```
 
-`INCONCLUSIVE` 永远不能按通过处理。过期租约产生的结果进入 `QUARANTINED`，可以作为 salvage 输入复用，但不能自动合并。
+Candidate 只在有效 Lease 下登记；独立服务按 provenance → isolated review → clean reproduction 推进 VerificationRun，只有 clean reproduction 完成且全部 PASS 条件成立后才能进入 PASS；Coordinator 在 run 终结后一次性创建签名 Submission。`INCONCLUSIVE` 永远不能按通过处理。过期租约产生的结果只可形成 `QUARANTINED` salvage Submission，不能自动验证或合并。
 
 ---
 
@@ -758,7 +767,7 @@ bid:
   "generation": 4,
   "progress_seq": 17,
   "phase": "integration-tests",
-  "milestones_completed": ["M1", "M2"],
+  "milestones_completed": ["schema-ready", "lease-cas-tested"],
   "checkpoint_sha256": "a71...",
   "operation_deadline": "2026-08-07T20:18:00+09:00",
   "idempotency_key": "renew:lease-19:g4:seq17"
@@ -772,7 +781,7 @@ bid:
 
 无需每秒 Ping。典型 TaskLease 可为 10–30 分钟，在 TTL 的约三分之一处续期；长编译或测试开始时登记预计截止时间，Supervisor 根据事件和截止时间判断，而不是机械打断。
 
-所有有副作用的写入都验证 fencing token。旧代次只能上传到隔离区：
+只有作者侧 Attempt/Candidate/Artifact mutation 验证当前 fencing token；旧代次的作者结果只能上传到隔离区。独立验收、终态 Submission、Relay 和集成写入改由对应服务身份、作用域 capability、job/queue lease、幂等键与 CAS 防止迟到覆盖，并校验 Candidate 已保存的来源事实：
 
 ```text
 task/{project_id}/{package_id}/attempt/{attempt_id}
@@ -787,7 +796,7 @@ task/{project_id}/{package_id}/attempt/{attempt_id}
 - 结果在观察期内无逃逸缺陷；
 - 即使未胜出，但架构或代码被最终方案实质吸收，可获得部分价值积分。
 
-不能只奖励最快完成，否则会诱导跳过测试和隐藏风险。任务本身无效时应标记 `TASK_INVALID` 并修订任务包，不应处罚 Worker。
+不能只奖励最快完成，否则会诱导跳过测试和隐藏风险。任务本身无效时应标记 `AF_TASK_INVALID` 并修订任务包，不应处罚 Worker。
 
 ---
 
@@ -910,8 +919,8 @@ Worker Runtime 而不是模型自然语言决定是否进入下一状态。
 
 ```text
 on_jcode_turn_done:
-    if all_submission_gates_passed:
-        seal_candidate_and_submit
+    if all_author_candidate_gates_passed:
+        seal_upload_and_record_candidate
     else if valid_external_blocker and wake_condition_is_explicit:
         checkpoint_and_release_executor
     else if budget_remaining:
@@ -1097,7 +1106,7 @@ CandidateReady={}&
 
 - package ID、revision、hash、Attempt ID；
 - Worker、Executor、模型、jcode、提示词包和工具链指纹；
-- Lease generation 与 fencing token；
+- Lease generation、fencing token hash 与 Candidate 登记来源证明；不保存可用 bearer token；
 - base commit、candidate commit、tree hash；
 - 修改文件、diffstat 和作用域检查；
 - 每个 `AC-*` 的 PASS/FAIL/INCONCLUSIVE；
@@ -1122,13 +1131,28 @@ Worker-ID: worker-tokyo-03
 
 ### 9.8 Submission Manifest
 
+以下为便于阅读的字段节选；机器可执行的权威定义是 `schemas/submission.schema.json`，candidate/salvage 完整向量位于 `examples/`：
+
 ```yaml
+schema_version: "agentforge/submission/1.0"
 submission_id: "sub-22"
+submission_kind: "candidate"
+candidate_id: "0198f221-52f8-7d6b-92b4-2d89aa25a340"
+candidate_artifact_id: "0198f221-52f8-7d6b-92b4-2d89aa25a342"
+verification_run_id: "0198f221-52f8-7d6b-92b4-2d89aa25a341"
+terminal_outcome: "PASS"
+completed_stage: "candidate_ready"
+created_at: "2026-08-07T12:00:00Z"
 package_id: "wp-lease-fencing-001"
 package_revision: 3
 package_hash: "sha256:..."
 attempt_id: "att-8831"
-lease_generation: 4
+lease:
+  lease_id: "lease-44"
+  generation: 4
+  fencing_token_hash: "sha256:..."
+  issued_at: "2026-08-07T10:00:00Z"
+  expires_at: "2026-08-07T10:20:00Z"
 git:
   base_commit: "2a6d..."
   candidate_commit: "7bb1..."
@@ -1141,7 +1165,7 @@ criteria:
     status: "PASS"
     runner_digest: "sha256:..."
     exit_code: 0
-    evidence_ref: "artifact://evidence/ac-func-01"
+    evidence_refs: ["artifact://evidence/ac-func-01"]
 review:
   reviewed_head: "7bb1..."
   verdict: "pass"
@@ -1156,7 +1180,15 @@ provenance:
   agent_id: "agent-5"
   executor_id: "executor-207"
   node_id: "worker-tokyo-03"
-  signature: "ed25519:..."
+  signature:
+    algorithm: "ed25519"
+    key_id: "verification-coordinator-1"
+    signer_role: "verification_coordinator"
+    signed_digest: "sha256:..."
+    value: "base64url-ed25519-signature"
+lineage:
+  parent_submission_id: null
+  supersedes: []
 ```
 
 Submission 一经登记不可覆盖。任何代码、测试环境或验收结果改变，都生成新的 Submission，并保留与旧版本的 lineage。
@@ -1192,7 +1224,7 @@ UI 的“美观”不能是唯一验收文本。任务包应提供参考图、�
 | Ready 任务长时间无人报价 | 扩大路由、提高赏金或创建规格诊断包 |
 | Attempt 超过语义进度截止时间 | 发送 Nudge；必要时创建 Diagnosis Task |
 | Lease 过期 | 回收执行权、隔离迟到结果、重新悬赏 |
-| Submission 到达 | 创建独立 Verification/Review Task |
+| Candidate 登记 | 创建独立 VerificationRun/Review Task；run 终结后一次性创建 Submission |
 | 验收失败可修复 | 生成带 Failure Dossier 的返工 Attempt |
 | 连续失败超过阈值 | 唤起 Root/Domain Boss 做重规划 |
 | 子图完成 | 创建汇总和集成任务 |
@@ -1242,7 +1274,7 @@ UI 的“美观”不能是唯一验收文本。任务包应提供参考图、�
 - 每个 Attempt 唯一分支：`task/{package_id}/attempt/{attempt_id}`；
 - Worker 不能写 `main/master/release`；
 - Git Broker 只获得任务分支前缀的短期凭据；
-- 推送前验证 fencing token、候选 Commit、证据摘要和修改路径；
+- 作者侧 Candidate Artifact init/chunk/complete 与 `RecordCandidate` 验证当前 fencing token、候选 Commit、证据摘要和修改路径；
 - 保护分支只允许 Integration Bot 写入；
 - Reviewer 和 Runner 使用只读凭据。
 
@@ -1256,20 +1288,21 @@ UI 的“美观”不能是唯一验收文本。任务包应提供参考图、�
 
 局域网内运行 `git-relay`，它只建立出站连接：
 
-1. Worker 生成签名的增量 Git Bundle 和 Evidence Bundle；
-2. 中央服务器短期保存加密 Bundle 或转发流；
-3. 局域网 Relay 主动领取已通过来源校验的候选；
-4. Relay 验证签名、base commit、tree hash 和 fencing token；
-5. Relay 推送任务分支到 Forgejo/Gitea；
-6. 中央临时 Bundle 在确认后按策略删除；
-7. Integration Bot 在局域网完成合并验证。
+1. Worker 在有效作者 Lease 下初始化 Candidate Artifact，获得预留 Candidate ID；
+2. Worker 上传签名的增量 Git Bundle 和 Author Evidence，中央服务器逐块保存并在 `complete` 时校验 digest、base commit、candidate OID 与 tree hash；
+3. `RecordCandidate` 再次验证当前 fencing，把 COMPLETE Artifact 绑定为不可变 Candidate，创建 VerificationRun，并关闭作者 Lease；
+4. 独立服务按 provenance → isolated review → clean reproduction 推进并终结 VerificationRun；Coordinator 在事务外预上传签名 Manifest，再由 `FinalizeVerification` 原子绑定终态 Submission；
+5. 只有 PASS/Accepted 且 Artifact 仍 COMPLETE、完整 lineage 一致时，`EnqueueIntegration` 才原子创建 Integration、首张版本化 Relay Ticket 与 Relay obligation；
+6. 局域网 Relay 使用自己的服务身份领取绑定 `ticket_id + ticket_version` 的 queue claim lease，校验签名、base commit、tree hash、Artifact digest 和 Candidate 中已保存的 fencing 来源证明；它不要求作者 Lease 仍有效，也不接收作者 token；
+7. Relay 在 push/result 前重验当前 claim generation/job version，以目标 ref 的 expected OID 做 CAS，把任务分支推送到 Forgejo/Gitea；过期重签保留历史票并 supersede 旧票/旧 claim；
+8. 中央临时 Bundle 在确认后按策略删除，Integration Bot 再以独立服务身份完成合并验证。
 
 这样无需把局域网 Git 暴露到公网。低带宽场景使用相对 base commit 的增量 Bundle、压缩、断点续传和内容去重。
 
 ### 11.3 合并队列
 
 1. Submission 通过独立验收；
-2. Git 分支进入 `MERGE_QUEUED`；
+2. `EnqueueIntegration` 签发的当前 live Ticket 被 Relay 接受，任务分支精确指向 Candidate 后进入 `MERGE_QUEUED`；
 3. Integrator 基于最新目标分支构造临时合成 Commit；
 4. 运行受影响测试和必要全量回归；
 5. 若冲突，创建独立 RebasePackage，不改写旧候选；
@@ -1357,7 +1390,7 @@ A2A 的通用 Task 状态适合互操作，但不应直接成为 WorkPackage、A
 - 状态判断使用服务器时间，Worker 时间只作展示；
 - `(aggregate_id, aggregate_seq)` 唯一；
 - `(actor_id, idempotency_key)` 唯一；
-- 命令携带 `expected_version`，过期返回 `STALE_VERSION`；
+- 命令携带 `expected_version`，过期返回 `AF_VERSION_STALE`；
 - 状态行、审计事件和 Outbox 在同一数据库事务提交；
 - 外部调用结果未知时先查询幂等结果，不能盲目重放变更操作。
 
@@ -1373,8 +1406,8 @@ LeaseGranted / LeaseRenewed / LeaseExpired
 AttemptStarted / ProgressReported / CheckpointRecorded
 QuestionRaised / DecisionRecorded / BlockerRaised
 ExpansionProposed
-ArtifactProduced / SubmissionReceived
-EvaluationCompleted / ReworkRequested
+ArtifactProduced / CandidateRecorded / VerificationRunStarted
+VerificationFinalized / SubmissionFinalized / ReworkRequested
 PackageAccepted
 IntegrationConflictDetected / IntegrationSucceeded
 PackageSuperseded
@@ -1399,9 +1432,11 @@ DefectReported
 | `offers` / `bids` | 市场和报价 |
 | `attempts` / `leases` | 执行尝试、代次、状态和预算 |
 | `checkpoints` | 可恢复状态和内容哈希 |
-| `submissions` / `criterion_results` | 候选和逐项验收 |
-| `reviews` / `findings` | 独立审查结果 |
-| `git_candidates` / `integrations` | 分支、Commit、合并和回滚 |
+| `candidate_artifacts` / `candidates` | 有效作者 Lease 下完成的不可变 Git 交付与 Candidate |
+| `verification_runs` / `verification_stage_results` / `criterion_results` | 独立验收状态、终结阶段和不可变逐阶段/逐项事实 |
+| `review_reports` / `review_findings` / `reproduction_results` | 独立审查与干净复现事实 |
+| `submission_manifest_staging` / `submissions` | 预上传 Manifest 事实与一次性终态 Submission |
+| `relay_tickets` / `relay_claims` / `integrations` | 版本化 Ticket、queue claim 历史、分支、Commit、合并和回滚 |
 | `obligations` | 未履行监督义务、到期与升级 |
 | `domain_events` / `outbox` / `inbox` | 审计、投递和去重 |
 
@@ -1412,34 +1447,43 @@ DefectReported
 ```text
 POST /v1/agents/register
 POST /v1/node-sessions
-POST /v1/node-sessions/{id}/renew
+POST /v1/node-sessions/{id}:renew
 
 POST /v1/projects
 POST /v1/projects/{id}/contracts
 GET  /v1/projects/{id}/graph
-POST /v1/graphs/{id}/plan-patches
+POST /v1/projects/{id}/plan-patches
 
 POST /v1/work-packages
-POST /v1/work-packages/{id}/validate
-POST /v1/work-packages/{id}/publish
+POST /v1/work-packages/{id}:validate
+POST /v1/work-packages/{id}:publish
 POST /v1/work-packages/{id}/revisions
 
 GET  /v1/market/offers
 POST /v1/work-packages/{id}/bids
-POST /v1/work-packages/{id}/claim
+POST /v1/work-packages/{id}:claim
 
-POST /v1/leases/{id}/renew
-POST /v1/leases/{id}/release
+POST /v1/leases/{id}:renew
+POST /v1/leases/{id}:release
 
 POST /v1/attempts/{id}/progress
 POST /v1/attempts/{id}/checkpoints
 POST /v1/attempts/{id}/questions
 POST /v1/attempts/{id}/blockers
 POST /v1/attempts/{id}/expansion-proposals
-POST /v1/attempts/{id}/submissions
+POST /v1/attempts/{id}/candidate-artifacts
+PUT  /v1/candidate-artifacts/{id}/chunks/{index}
+POST /v1/candidate-artifacts/{id}:complete
+POST /v1/attempts/{id}/candidates
 
-GET  /v1/submissions/{id}/evaluations
-POST /v1/integrations/{submission_id}/enqueue
+POST /v1/verification-runs/{id}:advance
+POST /v1/verification-runs/{id}/submission-manifests
+POST /v1/verification-runs/{id}:finalize
+GET  /v1/submissions/{id}
+POST /v1/submissions/{id}:enqueue-integration  # PASS/Accepted + COMPLETE Artifact + exact lineage
+POST /v1/integrations/{id}:requeue-target      # target CAS 前移；复用已 RELAYED Ticket
+POST /v1/integrations/{id}:fail
+POST /v1/integrations/{id}:complete
 
 GET  /v1/events?after={cursor}
 GET  /v1/events/stream
@@ -1600,16 +1644,19 @@ provider/model endpoint
 ```text
 agentforge/
   crates/
-    domain/                  # WorkPackage、Attempt、Lease、Submission
-    control-plane/           # API 与命令处理
-    workgraph/               # DAG、PlanPatch、就绪投影
+    domain/                  # package agentforge-domain；聚合与 WorkGraph
+    application/             # package agentforge-application；用例与 ports
+    protocol/                # package agentforge-protocol；AFWP/Submission
+    persistence-postgres/    # package agentforge-storage-postgres
+    control-plane/           # package agentforge-control-plane；API 与组合根
     matcher/                 # 路由、报价和信誉
     obligation-engine/       # 持久监督义务
-    event-store/             # 事件、Outbox、Inbox
+    outbox/                  # 事件投递、Outbox、Inbox、SSE
     verification/            # 验收编排
     git-integration/         # Relay、分支和合并队列
     worker-daemon/           # Worker Runtime
     protocol-a2a/            # A2A 适配
+    test-support/            # fixtures、并发屏障和 FakeClock
   adapters/
     jcode-bridge/            # 官方 SDK 适配器
   schemas/
@@ -1645,20 +1692,26 @@ sequenceDiagram
     participant U as 用户
     participant B as Boss Pool
     participant S as 悬赏服务器
-    participant W as Worker/Reviewer
-    participant G as 局域网 Git
+    participant A as Author Worker
+    participant D as 独立验收/Relay/Integrator
 
     U->>B: 系统需求
     B->>S: Project Contract + WorkGraph
-    S->>W: 合格 Offer
-    W->>S: Bid + 预检
-    S->>W: Lease + AFWP
-    W->>W: 计划、实现、验证、独立审查
-    W->>S: Submission + Evidence
-    S->>W: 独立复验任务
-    W->>S: Evaluation
-    S->>G: Git Relay / Merge Queue
-    G->>S: 集成结果与 Commit
+    S->>A: 合格 Offer
+    A->>S: Bid + 预检
+    S->>A: Lease + AFWP
+    A->>A: 计划、实现、本地验证
+    A->>S: init/upload/complete Candidate Artifact
+    A->>S: RecordCandidate（当前 fencing）
+    S->>S: 绑定 Candidate，关闭 Lease，创建 VerificationRun
+    S->>D: provenance/review/reproduction jobs
+    D->>S: 不可变 stage/review/reproduction facts
+    D->>S: stage Manifest + FinalizeVerification
+    S->>S: 绑定终态 Submission
+    S->>S: PASS -> Enqueue Integration + Ticket
+    D->>S: claim Ticket（version + generation）
+    D->>D: Relay task ref + L5 + merge CAS
+    D->>S: 签名 Relay/Integration Receipt
     S->>B: 子图完成或重规划事件
     B->>U: 可审计的项目结果
 ```
@@ -1673,24 +1726,27 @@ sequenceDiagram
 6. 服务器发布满足 Ready 条件的 Offer；
 7. Worker 报价、预检并获得带 fencing 的 Lease；
 8. Local Supervisor 驱动 jcode 完成计划—实现—验证微循环；
-9. Git Broker 固化候选 Commit，独立 Reviewer 审查；
-10. 干净 Runner 复现并形成 Evidence Bundle；
-11. 服务器逐项验收；失败则返工、移交或重规划；
-12. Git Relay 把候选分支写入局域网 Git；
-13. Merge Queue 在最新主分支上复验并合并；
-14. 事件解锁下游任务或唤起 Boss 处理新的监督义务。
+9. Git Broker 固化候选 Commit；Worker 在有效作者 Lease 下初始化并完整上传 Candidate Artifact，服务器校验 digest/OID/tree 后由 `RecordCandidate` 绑定不可变 Candidate、创建 VerificationRun，并关闭作者 Lease；
+10. 独立服务按 provenance → isolated review → clean reproduction 执行，分别登记不可变 stage/review/finding/reproduction/criterion facts；任何阶段均可真实终结 FAIL/INCONCLUSIVE；
+11. VerificationRun 终结后，Coordinator 在数据库事务外预上传并校验签名 Manifest，再由 `FinalizeVerification` 原子绑定终态 Submission；失败则经 ReworkReady 创建新 Attempt lineage；
+12. PASS Submission 只创建 `RequestIntegrationEnqueue` obligation；`EnqueueIntegration` 重验 PASS/Accepted、COMPLETE Artifact 与完整 lineage，并原子创建 Integration、首张版本化 Ticket 和 Relay obligation；
+13. Git Relay 以服务身份领取绑定 Ticket version 的 queue claim lease，重验 generation/job version 与已保存来源后把候选分支写入局域网 Git；作者 Lease 无需继续有效；
+14. Integrator 以独立服务身份和目标 ref CAS 在最新基线上复验并合并；终态失败与 Package 离开 Integrating 同事务投影；
+15. 事件解锁下游任务或唤起 Boss 处理新的监督义务。
 
 ---
 
 ## 18. 分阶段实施路线
 
-### 阶段 0：先把协议做对
+本节是概念路线，不是排期编号；唯一权威的 M0–M6、工单 ID 与依赖见[可执行开发总计划](../development/00_EXECUTIVE_IMPLEMENTATION_PLAN.md)和[里程碑与首批工单](../development/09_MILESTONES_AND_WORK_PACKAGES.md)。
+
+### 概念阶段 A：先把协议做对
 
 交付：
 
 - AFWP JSON Schema；
-- Executor Profile、Bid、Lease、Checkpoint、Submission 和 Evidence Schema；
-- WorkPackage/Attempt/Lease/Submission 四套状态模型；
+- Executor Profile、Bid、Lease、Checkpoint、Candidate、Submission 和 Evidence Schema；
+- WorkPackage/Attempt/Lease、VerificationRun、Submission 与 Integration 状态模型；
 - WorkGraph 边和 PlanPatch；
 - 任务包 Linter；
 - 模拟服务器和协议一致性测试。
@@ -1701,7 +1757,7 @@ sequenceDiagram
 - 100% MUST 要求有验收映射；
 - 模拟重复消息、乱序重连和租约过期，不产生双重正式提交。
 
-### 阶段 1：单仓库纵向 MVP
+### 概念阶段 B：单仓库纵向 MVP
 
 交付：
 
@@ -1721,7 +1777,7 @@ sequenceDiagram
 - 没有 Worker 能写主分支；
 - 每个候选都能按 Evidence 重新运行验收。
 
-### 阶段 2：独立验收与 Git Relay
+### 概念阶段 C：独立验收与 Git Relay
 
 交付：
 
@@ -1733,12 +1789,12 @@ sequenceDiagram
 
 通过标准：
 
-- 被测试、审查、Relay 和合并的 Commit SHA 完全一致；
+- TestedHead、ReviewedHead、SubmittedHead、RelayedHead 与 CandidateHead 完全一致；IntegrationHead 绑定该 Candidate 和最新目标基线，并在自身 SHA 上重跑 L5；
 - 外网 Worker 无需访问局域网 Git；
 - 合并冲突不会改写已验收候选；
 - Bundle 重复上传不会重复产生分支或合并。
 
-### 阶段 3：分层 Boss 与动态 DAG
+### 概念阶段 D：分层 Boss 与动态 DAG
 
 交付：
 
@@ -1756,7 +1812,7 @@ sequenceDiagram
 - 无 Ready/Active 节点但项目未完成时能自动诊断死锁；
 - 委派不会突破父级权限和预算。
 
-### 阶段 4：异构路由与生产化
+### 概念阶段 E：异构路由与生产化
 
 交付：
 
@@ -1823,19 +1879,20 @@ sequenceDiagram
 5. 每个等待状态必须有明确 `wake_condition`，并释放模型进程。
 6. 每个重试都有上限，并改变至少一个条件。
 7. NodeSessionLease 与 TaskLease 分离。
-8. 所有有副作用操作都验证当前 fencing token。
-9. 过期 Lease 的结果不能成为正式 Submission，只能隔离或 salvage。
-10. Worker 永远不能直接写保护分支。
-11. jcode 沙箱不持有 Git 或生产凭据。
-12. 开发 Agent 不能成为自己代码的唯一 Reviewer。
-13. TestedHead、ReviewedHead、SubmittedHead 必须相同。
-14. `INCONCLUSIVE` 不等于 `PASS`。
-15. `ACCEPTED` 不等于 `INTEGRATED`。
-16. 代码类下游默认依赖上游 `INTEGRATED`。
-17. 队列 ACK 不等于业务完成；PostgreSQL 状态和验收结果才是事实。
-18. 所有外部消息按至少一次处理，所有命令必须幂等。
-19. 机械状态迁移由确定性控制器完成，架构取舍才调用 Boss。
-20. 任务的最终成功定义是“可验证地集成进目标基线”，不是“模型生成了代码”。
+8. 作者侧 progress/checkpoint/question/blocker、Candidate Artifact init/chunk/complete 与 `RecordCandidate` mutation 在首次执行（receipt miss）时必须验证当前 author fencing；同 actor、同 key/hash 的已提交回执必须先回放，不能因 Lease 已关闭而把成功改成失败。Candidate Artifact 必须在有效 Lease 下完整上传并完成校验，`RecordCandidate` 后关闭作者 Lease。
+9. Verifier、Reviewer、Coordinator、Relay 和 Integrator 不使用作者 token；它们使用服务身份、作用域 capability、job/queue claim lease、幂等键与 version/destination CAS，并校验 Candidate 已保存的来源证明。Relay claim 绑定 Ticket ID/version、claim ID/generation 与 job version。
+10. 过期 Lease 的结果不能登记为正式 Candidate；只能隔离或产生 `QUARANTINED` salvage Submission。
+11. Worker 永远不能直接写保护分支。
+12. jcode 沙箱不持有 Git 或生产凭据。
+13. 开发 Agent 不能成为自己代码的唯一 Reviewer。
+14. 仅对 PASS/CandidateReady，TestedHead、ReviewedHead、SubmittedHead、RelayedHead、CandidateHead 必须相同；早期 FAIL/INCONCLUSIVE 只保存真实已执行阶段的 Head。IntegrationHead 可不同，但必须记录 Candidate 与目标基线并另跑 L5。
+15. `INCONCLUSIVE` 不等于 `PASS`。
+16. `ACCEPTED` 不等于 `INTEGRATED`。
+17. 代码类下游默认依赖上游 `INTEGRATED`。
+18. 队列 ACK 不等于业务完成；PostgreSQL 状态和验收结果才是事实。
+19. 所有外部消息按至少一次处理，所有命令必须幂等。
+20. 机械状态迁移由确定性控制器完成，架构取舍才调用 Boss。
+21. 任务的最终成功定义是“可验证地集成进目标基线”，不是“模型生成了代码”。
 
 ---
 
