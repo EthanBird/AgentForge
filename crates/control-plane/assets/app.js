@@ -7,10 +7,11 @@ const state = {
   refreshController: null,
   projectEpoch: 1,
   refreshGeneration: 0,
-  selectedDecision: null,
+  selectedDecisionId: null,
   sseFailures: 0,
   etag: null,
   cursor: "",
+  snapshotCursor: "",
   projectionDegraded: false,
   projectionStale: false,
 };
@@ -50,6 +51,11 @@ function setConnection(kind, label) {
 
 function cursorKey(projectId) {
   return `agentforge.cursor.${projectId}`;
+}
+
+function controlRoomStreamUrl(projectId, cursor) {
+  const query = new URLSearchParams({ cursor });
+  return `/v1/projects/${encodeURIComponent(projectId)}/control-room-stream?${query}`;
 }
 
 function isCurrentProject(projectId, projectEpoch) {
@@ -137,9 +143,14 @@ async function requestJson(path, { etag, signal }) {
   const headers = { Accept: "application/json" };
   if (etag) headers["If-None-Match"] = etag;
   const response = await fetch(path, { headers, credentials: "same-origin", signal });
-  if (response.status === 304) return { data: null, etag };
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-  return { data: await response.json(), etag: response.headers.get("ETag") };
+  const streamCursor = response.headers.get("X-AgentForge-Stream-Cursor") || "";
+  if (response.status === 304) return { data: null, etag, streamCursor };
+  if (!response.ok) {
+    const error = new Error(`${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
+  }
+  return { data: await response.json(), etag: response.headers.get("ETag"), streamCursor };
 }
 
 async function refresh() {
@@ -163,8 +174,12 @@ async function refresh() {
       signal: controller.signal,
     });
     if (!isCurrentRefresh(projectId, projectEpoch, refreshGeneration)) return;
+    if (!result.streamCursor) throw new Error("快照响应缺少精确 SSE 交接 cursor");
     if (result.data) state.data = result.data;
     state.etag = result.etag || state.etag;
+    state.snapshotCursor = result.streamCursor;
+    state.cursor = result.streamCursor;
+    localStorage.setItem(cursorKey(projectId), result.streamCursor);
     showNotice("");
     render();
     setLiveConnection("已同步");
@@ -185,11 +200,12 @@ function connectEvents({ projectId, projectEpoch, refreshGeneration }) {
   if (!isCurrentRefresh(projectId, projectEpoch, refreshGeneration)) return;
   state.source?.close();
   const projectCursorKey = cursorKey(projectId);
-  const query = new URLSearchParams();
-  if (state.cursor) query.set("cursor", state.cursor);
-  const encoded = encodeURIComponent(projectId);
-  const suffix = query.toString() ? `?${query}` : "";
-  const source = new EventSource(`/v1/projects/${encoded}/control-room-stream${suffix}`, { withCredentials: true });
+  if (!state.cursor) {
+    scheduleRefresh(0, { projectId, projectEpoch });
+    return;
+  }
+  const streamUrl = controlRoomStreamUrl(projectId, state.cursor);
+  const source = new EventSource(streamUrl, { withCredentials: true });
   const sourceIsCurrent = () => isCurrentProject(projectId, projectEpoch) && state.source === source;
   source.onopen = () => {
     if (!sourceIsCurrent()) return source.close();
@@ -201,10 +217,8 @@ function connectEvents({ projectId, projectEpoch, refreshGeneration }) {
     setConnection("connecting", "重连中");
     source.close();
     if (state.source === source) state.source = null;
-    state.cursor = "";
-    localStorage.removeItem(projectCursorKey);
     state.sseFailures += 1;
-    scheduleRefresh(Math.min(30_000, 1_000 * (2 ** Math.min(state.sseFailures, 5))), { projectId, projectEpoch });
+    inspectStreamFailure(controlRoomStreamUrl(projectId, state.cursor), { projectId, projectEpoch });
   };
   source.addEventListener("projection.invalidated", (event) => {
     if (!sourceIsCurrent()) return source.close();
@@ -216,13 +230,56 @@ function connectEvents({ projectId, projectEpoch, refreshGeneration }) {
   });
   source.addEventListener("projection.reset", () => {
     if (!sourceIsCurrent()) return source.close();
-    state.cursor = "";
-    localStorage.removeItem(projectCursorKey);
     source.close();
     if (state.source === source) state.source = null;
-    scheduleRefresh(0, { projectId, projectEpoch });
+    recoverFromSnapshotCursor({ projectId, projectEpoch });
   });
   state.source = source;
+}
+
+async function inspectStreamFailure(streamUrl, context) {
+  try {
+    const response = await fetch(streamUrl, {
+      method: "HEAD",
+      headers: { Accept: "text/event-stream" },
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    if (!isCurrentProject(context.projectId, context.projectEpoch)) return;
+    if (response.status === 409) {
+      recoverFromSnapshotCursor(context);
+      return;
+    }
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      setConnection("offline", "授权或 Cursor 已拒绝");
+      showNotice(`实时流恢复被服务端拒绝（HTTP ${response.status}），不会丢弃现有 cursor。`);
+      return;
+    }
+  } catch (_error) {
+    // A failed probe is another transport failure. Preserve the durable cursor.
+  }
+  scheduleReconnect(
+    Math.min(30_000, 1_000 * (2 ** Math.min(state.sseFailures, 5))),
+    context,
+  );
+}
+
+function recoverFromSnapshotCursor(context) {
+  if (!isCurrentProject(context.projectId, context.projectEpoch)) return;
+  state.snapshotCursor = "";
+  scheduleRefresh(0, context);
+}
+
+function scheduleReconnect(delay, context) {
+  clearTimeout(state.refreshTimer);
+  state.refreshTimer = setTimeout(() => {
+    if (document.visibilityState !== "visible" || !isCurrentProject(context.projectId, context.projectEpoch)) return;
+    connectEvents({
+      projectId: context.projectId,
+      projectEpoch: context.projectEpoch,
+      refreshGeneration: state.refreshGeneration,
+    });
+  }, delay);
 }
 
 function scheduleRefresh(delay = 0, context = { projectId: state.projectId, projectEpoch: state.projectEpoch }) {
@@ -275,16 +332,20 @@ function describeDriver(driver) {
 
 function decisionRow(item, interactive = false) {
   const risk = item.risk || item.severity || "normal";
-  const row = element("div", { class: "list-row" }, [
+  const caseId = stableId(item.case_id);
+  const row = element("div", {
+    class: "list-row",
+    "data-case-id": caseId,
+  }, [
     element("div", {}, [element("h3", {}, projected(item.summary, item.kind || "治理事件")), element("p", {}, projected(item.why_now, "需要操作者决策"))]),
     element("div", { class: "row-meta" }, pill(risk, toneFor(risk))),
   ]);
   if (interactive) {
     row.tabIndex = 0;
     row.setAttribute("role", "button");
-    row.addEventListener("click", () => selectDecision(item));
+    row.addEventListener("click", () => selectDecision(caseId));
     row.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") selectDecision(item);
+      if (event.key === "Enter" || event.key === " ") selectDecision(caseId);
     });
   }
   return row;
@@ -392,9 +453,16 @@ function renderViews(data) {
   renderTable($("#activity-list"), [["时间", (x) => String(x.occurred_at || "—")], ["动作", (x) => x.typed_action || "—"], ["主体", (x) => JSON.stringify(x.subject)], ["结果", (x) => x.result || "—"], ["摘要", (x) => projected(x.summary)], ["Correlation", (x) => x.correlation_id || "—"]], entries(data?.activity?.items).sort((a, b) => String(b.occurred_at).localeCompare(String(a.occurred_at))));
 }
 
-function selectDecision(item, remember = true) {
-  if (remember) state.selectedDecision = item;
+function renderDecisionInspector(item) {
   const inspector = $("#decision-inspector");
+  if (!item) {
+    inspector.replaceChildren(
+      element("p", { class: "eyebrow" }, "IMPACT PREVIEW"),
+      element("h2", {}, "选择一项决策"),
+      element("p", {}, "从决策列表查看当前快照中的精确目标与影响。"),
+    );
+    return;
+  }
   const effects = (item.effect_preview || []).map((value) => projected(value)).join("；") || "无可执行 effect preview";
   inspector.replaceChildren(
     element("p", { class: "eyebrow" }, "IMPACT PREVIEW"),
@@ -410,13 +478,35 @@ function selectDecision(item, remember = true) {
   );
 }
 
+function rebindSelectedDecision() {
+  const decisions = entries(state.data?.governance_inbox?.cases);
+  const selected = state.selectedDecisionId
+    ? decisions.find((item) => stableId(item.case_id) === state.selectedDecisionId)
+    : null;
+  if (state.selectedDecisionId && !selected) state.selectedDecisionId = null;
+  $$("#decision-list [data-case-id]").forEach((row) => {
+    const active = Boolean(selected) && row.dataset.caseId === state.selectedDecisionId;
+    row.classList.toggle("is-selected", active);
+    row.setAttribute("aria-pressed", String(active));
+  });
+  renderDecisionInspector(selected);
+}
+
+function selectDecision(caseId) {
+  state.selectedDecisionId = caseId;
+  rebindSelectedDecision();
+  if (matchMedia("(max-width: 720px)").matches) {
+    $("#decision-inspector").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
+}
+
 function render() {
   const data = state.data;
   renderProjectionHealth(data);
   renderMetrics(data);
   renderMission(data);
   renderViews(data);
-  if (!state.selectedDecision) selectDecision({ summary: "选择一项决策", why_now: "从左侧列表查看精确目标与影响。" }, false);
+  rebindSelectedDecision();
 }
 
 function switchView(view, moveFocus = true) {
@@ -447,9 +537,10 @@ function switchProject(projectId) {
   state.refreshTimer = null;
   state.projectId = projectId;
   state.data = null;
-  state.selectedDecision = null;
+  state.selectedDecisionId = null;
   state.etag = null;
-  state.cursor = "";
+  state.cursor = projectId ? localStorage.getItem(cursorKey(projectId)) || "" : "";
+  state.snapshotCursor = "";
   state.sseFailures = 0;
   state.projectionDegraded = false;
   state.projectionStale = false;

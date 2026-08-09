@@ -97,6 +97,7 @@ button { color: inherit; }
 .list-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 16px; border-bottom: 1px solid #202c42; }
 .list-row:last-child { border-bottom: 0; }
 .list-row:hover { background: #131d2e; }
+.list-row.is-selected { background: #18243a; box-shadow: inset 3px 0 var(--accent); }
 .list-row h3 { margin: 0 0 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .list-row p { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .list-row .row-meta { text-align: right; }
@@ -171,7 +172,7 @@ dialog p { color: var(--muted); font-size: 13px; line-height: 1.6; }
   .panel-header { padding: 13px 14px 10px; }
   .list-row { padding: 11px 14px; }
   .split-layout { grid-template-columns: 1fr; }
-  .inspector { display: none; }
+  .inspector { display: block; min-height: 0; scroll-margin-bottom: 82px; }
   .more-switcher:not([hidden]) { display: flex; }
   .full-panel { overflow-x: auto; }
   .data-table { min-width: 660px; }

@@ -24,7 +24,8 @@ const BROADCAST_CAPACITY: usize = 512;
 
 pub type SourceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProjectionSourceError>> + Send + 'a>>;
-pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>;
+pub type StoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, ControlRoomStoreError>> + Send + 'a>>;
 pub type ProjectionChangeStream =
     Pin<Box<dyn Stream<Item = Result<ProjectionChange, ProjectionSourceError>> + Send + 'static>>;
 
@@ -79,6 +80,7 @@ impl StorePosition {
 
 #[derive(Clone, Debug)]
 pub struct ControlRoomSnapshot {
+    pub project_id: ProjectId,
     pub position: StorePosition,
     pub projection_version: u64,
     pub source_digest: Sha256Digest,
@@ -110,6 +112,9 @@ impl ProjectionChange {
 }
 
 pub struct ProjectionSubscription {
+    pub project_id: ProjectId,
+    pub epoch: StoreEpoch,
+    pub after: DurableChangeSequence,
     pub changes: ProjectionChangeStream,
 }
 
@@ -132,16 +137,50 @@ impl std::fmt::Display for ProjectionSourceError {
 
 impl std::error::Error for ProjectionSourceError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlRoomStoreError {
+    InvalidCheckpoint,
+    CheckpointStale,
+    IdempotencyConflict,
+    ConcurrencyConflict { current: StorePosition },
+    SequenceExhausted,
+    Unavailable,
+}
+
+impl std::fmt::Display for ControlRoomStoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCheckpoint => formatter.write_str("projection checkpoint is invalid"),
+            Self::CheckpointStale => formatter.write_str("projection checkpoint moved backwards"),
+            Self::IdempotencyConflict => {
+                formatter.write_str("projection cursor was reused with different content")
+            }
+            Self::ConcurrencyConflict { .. } => {
+                formatter.write_str("projection store head changed")
+            }
+            Self::SequenceExhausted => formatter.write_str("projection change sequence exhausted"),
+            Self::Unavailable => formatter.write_str("projection store unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for ControlRoomStoreError {}
+
 /// Async read boundary consumed by every Control Room HTTP endpoint.
 pub trait ProjectionSource: Send + Sync + 'static {
+    /// Returns the adapter's current epoch and global durable feed head.
+    fn head(&self) -> SourceFuture<'_, StorePosition>;
+
+    /// Returns a project snapshot and the global feed head observed under the
+    /// same atomic store read.
     fn snapshot(&self, project_id: ProjectId) -> SourceFuture<'_, Option<ControlRoomSnapshot>>;
 
     /// Opens a project-scoped feed after atomically validating the adapter-owned
-    /// epoch and sequence. `None` starts at the retained head for a fresh client.
+    /// epoch, retained hot floor, and durable sequence.
     fn subscribe(
         &self,
         project_id: ProjectId,
-        resume: Option<StorePosition>,
+        resume: StorePosition,
     ) -> SourceFuture<'_, ProjectionSubscription>;
 
     fn ready(&self) -> SourceFuture<'_, bool>;
@@ -149,13 +188,21 @@ pub trait ProjectionSource: Send + Sync + 'static {
 
 /// Async write boundary implemented by projection stores.
 pub trait ControlRoomStore: ProjectionSource {
-    fn replace(&self, checkpoint: StoredProjection) -> StoreFuture<'_, DurableChangeSequence>;
+    /// Atomically validates `expected_head`, commits the checkpoint and its
+    /// change record, then returns that change's position. Exact replays are
+    /// idempotent even if `expected_head` has since advanced.
+    fn commit_checkpoint(
+        &self,
+        checkpoint: StoredProjection,
+        expected_head: StorePosition,
+    ) -> StoreFuture<'_, StorePosition>;
 }
 
 #[derive(Clone)]
 pub struct ProjectionRegistry {
     inner: Arc<RwLock<RegistryInner>>,
     sender: broadcast::Sender<ProjectionChange>,
+    change_log_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -170,6 +217,7 @@ struct RegistryInner {
 struct ProjectSnapshot {
     last_change_sequence: DurableChangeSequence,
     projection_version: u64,
+    checkpoint: StoredProjection,
     source_digest: Sha256Digest,
     source_cursor: ProjectionCursor,
     read_models: ProjectReadModels,
@@ -178,11 +226,32 @@ struct ProjectSnapshot {
 impl ProjectionRegistry {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_epoch(StoreEpoch::new(Uuid::now_v7()))
+        Self::with_options(
+            StoreEpoch::new(Uuid::now_v7()),
+            CHANGE_LOG_CAPACITY,
+            BROADCAST_CAPACITY,
+        )
     }
 
+    #[cfg(test)]
     fn with_epoch(epoch: StoreEpoch) -> Self {
-        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+        Self::with_options(epoch, CHANGE_LOG_CAPACITY, BROADCAST_CAPACITY)
+    }
+
+    fn with_options(
+        epoch: StoreEpoch,
+        change_log_capacity: usize,
+        broadcast_capacity: usize,
+    ) -> Self {
+        assert!(
+            change_log_capacity > 0,
+            "change log capacity must be positive"
+        );
+        assert!(
+            broadcast_capacity > 0,
+            "broadcast capacity must be positive"
+        );
+        let (sender, _) = broadcast::channel(broadcast_capacity);
         Self {
             inner: Arc::new(RwLock::new(RegistryInner {
                 epoch,
@@ -191,26 +260,41 @@ impl ProjectionRegistry {
                 changes: VecDeque::new(),
             })),
             sender,
+            change_log_capacity,
         }
     }
 
-    async fn replace_inner(
+    async fn commit_checkpoint_inner(
         &self,
         checkpoint: StoredProjection,
-    ) -> anyhow::Result<DurableChangeSequence> {
-        checkpoint.validate()?;
-        validate_checkpoint_for_serving(&checkpoint)?;
+        expected_head: StorePosition,
+    ) -> Result<StorePosition, ControlRoomStoreError> {
+        checkpoint
+            .validate()
+            .map_err(|_| ControlRoomStoreError::InvalidCheckpoint)?;
+        validate_checkpoint_for_serving(&checkpoint)
+            .map_err(|_| ControlRoomStoreError::InvalidCheckpoint)?;
         let mut inner = self.inner.write().await;
         if let Some(current) = inner.projects.get(&checkpoint.project_id) {
             if checkpoint.cursor < current.source_cursor {
-                anyhow::bail!("projection checkpoint cursor moved backwards");
+                return Err(ControlRoomStoreError::CheckpointStale);
             }
             if checkpoint.cursor == current.source_cursor {
-                if checkpoint.payload == current.read_models {
-                    return Ok(current.last_change_sequence);
+                if checkpoint == current.checkpoint {
+                    return Ok(StorePosition::new(
+                        inner.epoch,
+                        current.last_change_sequence,
+                    ));
                 }
-                anyhow::bail!("projection checkpoint reused a cursor with different content");
+                return Err(ControlRoomStoreError::IdempotencyConflict);
             }
+        }
+
+        let current_head = StorePosition::new(inner.epoch, inner.next_sequence);
+        if expected_head != current_head {
+            return Err(ControlRoomStoreError::ConcurrencyConflict {
+                current: current_head,
+            });
         }
 
         let next_sequence = inner
@@ -218,7 +302,7 @@ impl ProjectionRegistry {
             .get()
             .checked_add(1)
             .map(DurableChangeSequence::new)
-            .ok_or_else(|| anyhow::anyhow!("projection change sequence exhausted"))?;
+            .ok_or(ControlRoomStoreError::SequenceExhausted)?;
         inner.next_sequence = next_sequence;
         let epoch = inner.epoch;
         let projection_version =
@@ -229,7 +313,7 @@ impl ProjectionRegistry {
                     snapshot
                         .projection_version
                         .checked_add(1)
-                        .ok_or_else(|| anyhow::anyhow!("projection version exhausted"))
+                        .ok_or(ControlRoomStoreError::SequenceExhausted)
                 })?;
         let change = ProjectionChange {
             epoch,
@@ -244,18 +328,21 @@ impl ProjectionRegistry {
             ProjectSnapshot {
                 last_change_sequence: next_sequence,
                 projection_version,
+                checkpoint: checkpoint.clone(),
                 source_digest: checkpoint.payload_digest,
                 source_cursor: checkpoint.cursor,
                 read_models: checkpoint.payload,
             },
         );
         inner.changes.push_back(change.clone());
-        while inner.changes.len() > CHANGE_LOG_CAPACITY {
+        while inner.changes.len() > self.change_log_capacity {
             inner.changes.pop_front();
         }
-        drop(inner);
+        // Sending while the write lock is held makes broadcast order identical
+        // to the durable sequence order assigned above.
         let _ = self.sender.send(change);
-        Ok(next_sequence)
+        drop(inner);
+        Ok(StorePosition::new(epoch, next_sequence))
     }
 
     async fn snapshot_inner(&self, project_id: ProjectId) -> Option<ControlRoomSnapshot> {
@@ -264,7 +351,8 @@ impl ProjectionRegistry {
             .projects
             .get(&project_id)
             .map(|snapshot| ControlRoomSnapshot {
-                position: StorePosition::new(inner.epoch, snapshot.last_change_sequence),
+                project_id,
+                position: StorePosition::new(inner.epoch, inner.next_sequence),
                 projection_version: snapshot.projection_version,
                 source_digest: snapshot.source_digest,
                 source_cursor: snapshot.source_cursor,
@@ -275,19 +363,17 @@ impl ProjectionRegistry {
     async fn subscribe_inner(
         &self,
         project_id: ProjectId,
-        resume: Option<StorePosition>,
+        resume: StorePosition,
     ) -> Result<ProjectionSubscription, ProjectionSourceError> {
         let mut receiver = self.sender.subscribe();
         let inner = self.inner.read().await;
-        let position =
-            resume.unwrap_or(StorePosition::new(inner.epoch, DurableChangeSequence::ZERO));
-        let after = position.sequence.get();
-        let expired = position.epoch != inner.epoch
+        let after = resume.sequence.get();
+        let expired = resume.epoch != inner.epoch
             || after > inner.next_sequence.get()
             || inner
                 .changes
                 .front()
-                .is_some_and(|oldest| after > 0 && after.saturating_add(1) < oldest.sequence.get());
+                .is_some_and(|oldest| after.saturating_add(1) < oldest.sequence.get());
         if expired {
             return Err(ProjectionSourceError::CursorExpired);
         }
@@ -321,12 +407,22 @@ impl ProjectionRegistry {
             }
         };
         Ok(ProjectionSubscription {
+            project_id,
+            epoch: resume.epoch,
+            after: resume.sequence,
             changes: Box::pin(changes),
         })
     }
 }
 
 impl ProjectionSource for ProjectionRegistry {
+    fn head(&self) -> SourceFuture<'_, StorePosition> {
+        Box::pin(async move {
+            let inner = self.inner.read().await;
+            Ok(StorePosition::new(inner.epoch, inner.next_sequence))
+        })
+    }
+
     fn snapshot(&self, project_id: ProjectId) -> SourceFuture<'_, Option<ControlRoomSnapshot>> {
         Box::pin(async move { Ok(self.snapshot_inner(project_id).await) })
     }
@@ -334,7 +430,7 @@ impl ProjectionSource for ProjectionRegistry {
     fn subscribe(
         &self,
         project_id: ProjectId,
-        resume: Option<StorePosition>,
+        resume: StorePosition,
     ) -> SourceFuture<'_, ProjectionSubscription> {
         Box::pin(self.subscribe_inner(project_id, resume))
     }
@@ -345,8 +441,12 @@ impl ProjectionSource for ProjectionRegistry {
 }
 
 impl ControlRoomStore for ProjectionRegistry {
-    fn replace(&self, checkpoint: StoredProjection) -> StoreFuture<'_, DurableChangeSequence> {
-        Box::pin(self.replace_inner(checkpoint))
+    fn commit_checkpoint(
+        &self,
+        checkpoint: StoredProjection,
+        expected_head: StorePosition,
+    ) -> StoreFuture<'_, StorePosition> {
+        Box::pin(self.commit_checkpoint_inner(checkpoint, expected_head))
     }
 }
 
@@ -398,8 +498,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ControlRoomStore, DurableChangeSequence, ProjectionRegistry, ProjectionSource,
-        ProjectionSourceError, StoreEpoch, StorePosition, next_change,
+        ControlRoomStore, ControlRoomStoreError, DurableChangeSequence, ProjectionRegistry,
+        ProjectionSource, ProjectionSourceError, StoreEpoch, StorePosition, next_change,
     };
 
     fn project() -> ProjectId {
@@ -441,19 +541,52 @@ mod tests {
         checkpoint
     }
 
+    async fn commit(registry: &ProjectionRegistry, checkpoint: StoredProjection) -> StorePosition {
+        let expected = registry.head().await.expect("read store head");
+        registry
+            .commit_checkpoint(checkpoint, expected)
+            .await
+            .expect("commit checkpoint")
+    }
+
     #[tokio::test]
-    async fn registry_is_monotonic_idempotent_and_rejects_split_headers() {
+    async fn commit_is_typed_cas_idempotent_and_monotonic() {
+        let project_id = project();
+        let registry = ProjectionRegistry::new();
+        let initial = registry.head().await.expect("initial head");
+        let first = checkpoint(project_id, 1);
+        let first_position = registry
+            .commit_checkpoint(first.clone(), initial)
+            .await
+            .expect("insert");
+        assert_eq!(first_position.sequence, DurableChangeSequence::new(1));
+        assert_eq!(
+            registry
+                .commit_checkpoint(first, initial)
+                .await
+                .expect("idempotent replay ignores stale expected head"),
+            first_position
+        );
+        assert!(matches!(
+            registry
+                .commit_checkpoint(checkpoint(project_id, 2), initial)
+                .await,
+            Err(ControlRoomStoreError::ConcurrencyConflict { current })
+                if current == first_position
+        ));
+        let second_position = registry
+            .commit_checkpoint(checkpoint(project_id, 2), first_position)
+            .await
+            .expect("CAS at current head");
+        assert_eq!(second_position.sequence, DurableChangeSequence::new(2));
+    }
+
+    #[tokio::test]
+    async fn commit_rejects_idempotency_conflicts_and_split_headers() {
         let project_id = project();
         let registry = ProjectionRegistry::new();
         let first = checkpoint(project_id, 1);
-        assert_eq!(
-            registry.replace(first.clone()).await.expect("insert"),
-            DurableChangeSequence::new(1)
-        );
-        assert_eq!(
-            registry.replace(first.clone()).await.expect("replay"),
-            DurableChangeSequence::new(1)
-        );
+        let first_position = commit(&registry, first.clone()).await;
 
         let mut conflicting = first;
         conflicting
@@ -464,7 +597,12 @@ mod tests {
         conflicting = ProjectionEnvelope::new(project_id, conflicting.cursor, conflicting.payload)
             .expect("conflicting envelope");
         conflicting.source_digest = Sha256Digest::of_bytes(1_u64.to_be_bytes());
-        assert!(registry.replace(conflicting).await.is_err());
+        assert!(matches!(
+            registry
+                .commit_checkpoint(conflicting, first_position)
+                .await,
+            Err(ControlRoomStoreError::IdempotencyConflict)
+        ));
 
         let mut split = checkpoint(project_id, 2);
         split.payload.activity.header.degraded_reason =
@@ -472,39 +610,96 @@ mod tests {
         split = ProjectionEnvelope::new(project_id, split.cursor, split.payload)
             .expect("split envelope");
         split.source_digest = Sha256Digest::of_bytes(2_u64.to_be_bytes());
-        assert!(registry.replace(split).await.is_err());
-
-        assert!(registry.replace(checkpoint(project_id, 0)).await.is_err());
+        assert!(matches!(
+            registry.commit_checkpoint(split, first_position).await,
+            Err(ControlRoomStoreError::InvalidCheckpoint)
+        ));
     }
 
     #[tokio::test]
-    async fn source_contract_replays_changes_and_invalidates_a_rebuilt_store_epoch() {
+    async fn snapshot_returns_project_data_and_global_feed_head_atomically() {
+        let first_project = project();
+        let second_project =
+            ProjectId::from_str("018f0000-0000-7000-8000-000000000002").expect("second project");
+        let registry = ProjectionRegistry::new();
+        let first_position = commit(&registry, checkpoint(first_project, 1)).await;
+        let global_head = commit(&registry, checkpoint(second_project, 1)).await;
+        assert!(global_head.sequence > first_position.sequence);
+
+        let snapshot = registry
+            .snapshot(first_project)
+            .await
+            .expect("source available")
+            .expect("snapshot");
+        assert_eq!(snapshot.project_id, first_project);
+        assert_eq!(snapshot.position, global_head);
+        assert_eq!(snapshot.source_cursor.event_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn source_contract_replays_in_order_and_invalidates_a_rebuilt_epoch() {
         let project_id = project();
         let first_epoch = StoreEpoch::new(Uuid::from_bytes([3; 16]));
         let rebuilt_epoch = StoreEpoch::new(Uuid::from_bytes([4; 16]));
         let first = ProjectionRegistry::with_epoch(first_epoch);
-        first
-            .replace(checkpoint(project_id, 1))
+        let initial = first.head().await.expect("first head");
+        let first_position = first
+            .commit_checkpoint(checkpoint(project_id, 1), initial)
             .await
-            .expect("write first store");
+            .expect("first commit");
+        let second_position = first
+            .commit_checkpoint(checkpoint(project_id, 2), first_position)
+            .await
+            .expect("second commit");
 
         let mut subscription = first
-            .subscribe(
-                project_id,
-                Some(StorePosition::new(first_epoch, DurableChangeSequence::ZERO)),
-            )
+            .subscribe(project_id, initial)
             .await
             .expect("resume current epoch");
-        let change = next_change(&mut subscription.changes)
-            .await
-            .expect("backlog item")
-            .expect("valid change");
-        assert_eq!(change.sequence, DurableChangeSequence::new(1));
+        for expected in [first_position, second_position] {
+            let change = next_change(&mut subscription.changes)
+                .await
+                .expect("backlog item")
+                .expect("valid change");
+            assert_eq!(change.position(), expected);
+        }
 
         let rebuilt = ProjectionRegistry::with_epoch(rebuilt_epoch);
         assert!(matches!(
-            rebuilt.subscribe(project_id, Some(change.position())).await,
+            rebuilt.subscribe(project_id, second_position).await,
             Err(ProjectionSourceError::CursorExpired)
         ));
+    }
+
+    #[tokio::test]
+    async fn retained_capacity_expires_old_positions_but_accepts_snapshot_handoff() {
+        let project_id = project();
+        let epoch = StoreEpoch::new(Uuid::from_bytes([5; 16]));
+        let registry = ProjectionRegistry::with_options(epoch, 2, 8);
+        let initial = registry.head().await.expect("initial head");
+        let mut positions = Vec::new();
+        for sequence in 1..=4 {
+            positions.push(commit(&registry, checkpoint(project_id, sequence)).await);
+        }
+        assert!(matches!(
+            registry.subscribe(project_id, positions[0]).await,
+            Err(ProjectionSourceError::CursorExpired)
+        ));
+        assert!(matches!(
+            registry.subscribe(project_id, initial).await,
+            Err(ProjectionSourceError::CursorExpired)
+        ));
+
+        let snapshot = registry
+            .snapshot(project_id)
+            .await
+            .expect("source available")
+            .expect("snapshot");
+        assert_eq!(snapshot.position, positions[3]);
+        let subscription = registry
+            .subscribe(project_id, snapshot.position)
+            .await
+            .expect("snapshot handoff remains valid");
+        assert_eq!(subscription.after, positions[3].sequence);
     }
 }
