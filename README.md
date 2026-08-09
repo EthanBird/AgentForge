@@ -32,6 +32,7 @@ AgentForge 是一套面向分布式 AI Agent 的异步软件工厂：高能力 B
 | [里程碑与首批工单](docs/development/09_MILESTONES_AND_WORK_PACKAGES.md) | 可直接发布的 Epic、任务依赖和逐项验收 |
 | [本地开发与部署](docs/development/10_LOCAL_DEV_AND_DEPLOYMENT.md) | 目标命令、配置、单机部署与运维 |
 | [M0 进度报告](docs/development/M0_PROGRESS_REPORT.md) | 已完成工单、门禁证据、审查修复与后续边界 |
+| [`v0.1.0-mvp` 发布计划](docs/development/V0_1_0_MVP_RELEASE_PLAN.md) | MVP 纵向闭环、阶段检查点、发布门禁与实时证据账本 |
 | [可行性报告](docs/feasibility/FEASIBILITY_REPORT.md) | 官方能力核验、实测结果、限制和 PoC 门禁 |
 | [ADR 索引](docs/adr/README.md) | 已冻结的关键架构决定 |
 
