@@ -1,14 +1,9 @@
 //! Read-only Control Room query API and resumable projection notifications.
 
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    convert::Infallible,
-    sync::Arc,
-    time::Duration,
-};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
-use agentforge_application::{ProjectReadModels, StoredProjection};
-use agentforge_domain::{ProjectId, ServerInstant, Sha256Digest};
+use agentforge_application::{ProjectReadModels, ProjectionEnvelope};
+use agentforge_domain::{ProjectId, Sha256Digest};
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
@@ -20,16 +15,24 @@ use axum::{
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::sync::{RwLock, broadcast};
 use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
-use uuid::Uuid;
+
+use crate::{
+    access::{
+        ActorContext, AuthorizationGrant, LocalLoopbackActorExtractor, LocalProjectAuthorizer,
+        ProjectAuthorizer, RequestActorExtractor, server_now,
+    },
+    control_room::{
+        DurableChangeSequence, ProjectionChange, ProjectionRegistry, ProjectionSource,
+        ProjectionSourceError, StoreEpoch, StorePosition, next_change,
+    },
+};
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_CSS: &str = include_str!("../assets/app.css");
 const APP_JS: &str = include_str!("../assets/app.js");
-const CHANGE_LOG_CAPACITY: usize = 2_048;
-const BROADCAST_CAPACITY: usize = 512;
-
+const STREAM_CURSOR_HEADER: &str = "x-agentforge-stream-cursor";
+const AUTHORIZATION_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -54,8 +57,21 @@ impl CursorCodec {
     }
 
     #[must_use]
-    pub fn encode(&self, project_id: ProjectId, epoch: Uuid, sequence: u64) -> String {
-        let payload = format!("v1.{project_id}.{epoch}.{sequence}");
+    pub fn encode(
+        &self,
+        project_id: ProjectId,
+        position: StorePosition,
+        grant: &AuthorizationGrant,
+    ) -> String {
+        let authorization_binding = authorization_binding_digest(grant);
+        let payload = format!(
+            "v3.{project_id}.{}.{}.{}.{}.{}",
+            position.epoch.get(),
+            position.sequence.get(),
+            authorization_binding,
+            grant.authorization_epoch,
+            grant.expires_at.0.unix_timestamp(),
+        );
         let mut mac =
             HmacSha256::new_from_slice(self.key.as_ref()).expect("HMAC key length is valid");
         mac.update(payload.as_bytes());
@@ -66,8 +82,8 @@ impl CursorCodec {
         &self,
         value: &str,
         expected_project: ProjectId,
-        expected_epoch: Uuid,
-    ) -> Result<u64, UiError> {
+        grant: &AuthorizationGrant,
+    ) -> Result<StorePosition, UiError> {
         let mut parts = value.rsplitn(2, '.');
         let signature = parts.next().ok_or(UiError::InvalidCursor)?;
         let payload = parts.next().ok_or(UiError::InvalidCursor)?;
@@ -79,7 +95,7 @@ impl CursorCodec {
             .map_err(|_| UiError::InvalidCursor)?;
 
         let mut fields = payload.split('.');
-        if fields.next() != Some("v1") {
+        if fields.next() != Some("v3") {
             return Err(UiError::InvalidCursor);
         }
         let project = fields
@@ -90,224 +106,129 @@ impl CursorCodec {
         if project != expected_project {
             return Err(UiError::InvalidCursor);
         }
-        let epoch = fields
+        let epoch = StoreEpoch::new(
+            fields
+                .next()
+                .ok_or(UiError::InvalidCursor)?
+                .parse()
+                .map_err(|_| UiError::InvalidCursor)?,
+        );
+        let sequence = DurableChangeSequence::new(
+            fields
+                .next()
+                .ok_or(UiError::InvalidCursor)?
+                .parse::<u64>()
+                .map_err(|_| UiError::InvalidCursor)?,
+        );
+        let scope_digest = fields
             .next()
             .ok_or(UiError::InvalidCursor)?
-            .parse::<Uuid>()
+            .parse::<Sha256Digest>()
             .map_err(|_| UiError::InvalidCursor)?;
-        if epoch != expected_epoch {
-            return Err(UiError::CursorExpired);
-        }
-        let sequence = fields
+        let authorization_epoch = fields
             .next()
             .ok_or(UiError::InvalidCursor)?
-            .parse::<u64>()
+            .parse::<uuid::Uuid>()
+            .map_err(|_| UiError::InvalidCursor)?;
+        let expires_at = fields
+            .next()
+            .ok_or(UiError::InvalidCursor)?
+            .parse::<i64>()
             .map_err(|_| UiError::InvalidCursor)?;
         if fields.next().is_some() {
             return Err(UiError::InvalidCursor);
         }
-        Ok(sequence)
+        if scope_digest != authorization_binding_digest(grant)
+            || authorization_epoch != grant.authorization_epoch
+        {
+            return Err(UiError::InvalidCursor);
+        }
+        if expires_at > grant.expires_at.0.unix_timestamp()
+            || server_now().0.unix_timestamp() >= expires_at
+        {
+            return Err(UiError::CursorExpired);
+        }
+        Ok(StorePosition::new(epoch, sequence))
     }
+}
+
+fn authorization_binding_digest(grant: &AuthorizationGrant) -> Sha256Digest {
+    Sha256Digest::of_bytes(format!(
+        "control-room-cursor-scope:v1\n{}\n{}\n{}\n{}\n{}",
+        grant.tenant.as_str(),
+        grant.actor.as_str(),
+        grant.project_id,
+        grant.scope_digest,
+        grant.authorization_epoch,
+    ))
 }
 
 #[derive(Clone)]
 pub struct ControlPlaneState {
-    registry: ProjectionRegistry,
+    source: Arc<dyn ProjectionSource>,
     cursor: CursorCodec,
-    allowed_projects: Arc<BTreeSet<ProjectId>>,
+    actor_extractor: Option<Arc<dyn RequestActorExtractor>>,
+    authorizer: Option<Arc<dyn ProjectAuthorizer>>,
 }
 
 impl ControlPlaneState {
-    pub fn for_projects(
+    /// Builds the explicit loopback reference composition and returns its write
+    /// handle separately. HTTP handlers retain only the `ProjectionSource` trait.
+    pub fn local_reference(
         cursor: CursorCodec,
         allowed_projects: impl IntoIterator<Item = ProjectId>,
-    ) -> anyhow::Result<Self> {
-        let allowed_projects = allowed_projects.into_iter().collect::<BTreeSet<_>>();
-        if allowed_projects.is_empty() {
-            anyhow::bail!("at least one local Control Room project must be allowed");
-        }
-        Ok(Self {
-            registry: ProjectionRegistry::new(),
+    ) -> anyhow::Result<(Self, ProjectionRegistry)> {
+        let authorizer = LocalProjectAuthorizer::new(allowed_projects)?;
+        let store = ProjectionRegistry::new();
+        let state = Self::with_source(
+            Arc::new(store.clone()),
             cursor,
-            allowed_projects: Arc::new(allowed_projects),
-        })
-    }
-
-    #[must_use]
-    pub fn registry(&self) -> ProjectionRegistry {
-        self.registry.clone()
-    }
-
-    fn authorize_project(&self, project_id: ProjectId) -> Result<(), UiError> {
-        if self.allowed_projects.contains(&project_id) {
-            Ok(())
-        } else {
-            Err(UiError::ProjectNotFound)
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct ProjectionRegistry {
-    inner: Arc<RwLock<RegistryInner>>,
-    sender: broadcast::Sender<ProjectionChange>,
-}
-
-#[derive(Debug, Default)]
-struct RegistryInner {
-    epoch: Uuid,
-    next_sequence: u64,
-    projects: BTreeMap<ProjectId, ProjectSnapshot>,
-    changes: VecDeque<ProjectionChange>,
-}
-
-#[derive(Clone, Debug)]
-struct ProjectSnapshot {
-    last_change_sequence: u64,
-    projection_version: u64,
-    source_digest: Sha256Digest,
-    source_cursor: agentforge_application::ProjectionCursor,
-    read_models: ProjectReadModels,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct ProjectionChange {
-    epoch: Uuid,
-    sequence: u64,
-    resource: &'static str,
-    project_id: ProjectId,
-    projection_version: u64,
-    source_occurred_at: ServerInstant,
-}
-
-impl ProjectionRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-        Self {
-            inner: Arc::new(RwLock::new(RegistryInner {
-                epoch: Uuid::now_v7(),
-                ..RegistryInner::default()
-            })),
-            sender,
-        }
-    }
-
-    pub async fn replace(&self, checkpoint: StoredProjection) -> anyhow::Result<u64> {
-        checkpoint.validate()?;
-        validate_checkpoint_for_serving(&checkpoint)?;
-        let mut inner = self.inner.write().await;
-        if let Some(current) = inner.projects.get(&checkpoint.project_id) {
-            if checkpoint.cursor < current.source_cursor {
-                anyhow::bail!("projection checkpoint cursor moved backwards");
-            }
-            if checkpoint.cursor == current.source_cursor {
-                if checkpoint.payload == current.read_models {
-                    return Ok(current.last_change_sequence);
-                }
-                anyhow::bail!("projection checkpoint reused a cursor with different content");
-            }
-        }
-        inner.next_sequence = inner
-            .next_sequence
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("projection change sequence exhausted"))?;
-        let sequence = inner.next_sequence;
-        let epoch = inner.epoch;
-        let projection_version =
-            inner
-                .projects
-                .get(&checkpoint.project_id)
-                .map_or(Ok(1), |snapshot| {
-                    snapshot
-                        .projection_version
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow::anyhow!("projection version exhausted"))
-                })?;
-        let change = ProjectionChange {
-            epoch,
-            sequence,
-            resource: "project_read_models",
-            project_id: checkpoint.project_id,
-            projection_version,
-            source_occurred_at: checkpoint.cursor.occurred_at,
-        };
-        inner.projects.insert(
-            checkpoint.project_id,
-            ProjectSnapshot {
-                last_change_sequence: sequence,
-                projection_version,
-                source_digest: checkpoint.payload_digest,
-                source_cursor: checkpoint.cursor,
-                read_models: checkpoint.payload,
-            },
+            Some(Arc::new(LocalLoopbackActorExtractor)),
+            Some(Arc::new(authorizer)),
         );
-        inner.changes.push_back(change.clone());
-        while inner.changes.len() > CHANGE_LOG_CAPACITY {
-            inner.changes.pop_front();
+        Ok((state, store))
+    }
+
+    #[must_use]
+    pub fn with_source(
+        source: Arc<dyn ProjectionSource>,
+        cursor: CursorCodec,
+        actor_extractor: Option<Arc<dyn RequestActorExtractor>>,
+        authorizer: Option<Arc<dyn ProjectAuthorizer>>,
+    ) -> Self {
+        Self {
+            source,
+            cursor,
+            actor_extractor,
+            authorizer,
         }
-        drop(inner);
-        let _ = self.sender.send(change);
-        Ok(sequence)
     }
 
-    async fn snapshot(&self, project_id: ProjectId) -> Option<ProjectSnapshot> {
-        self.inner.read().await.projects.get(&project_id).cloned()
-    }
-
-    async fn epoch(&self) -> Uuid {
-        self.inner.read().await.epoch
-    }
-
-    async fn subscribe(
+    async fn authorize_project(
         &self,
+        headers: &HeaderMap,
         project_id: ProjectId,
-        after: u64,
-    ) -> Result<(Vec<ProjectionChange>, broadcast::Receiver<ProjectionChange>), UiError> {
-        let receiver = self.sender.subscribe();
-        let inner = self.inner.read().await;
-        let expired = after > inner.next_sequence
-            || inner
-                .changes
-                .front()
-                .is_some_and(|oldest| after > 0 && after.saturating_add(1) < oldest.sequence);
-        if expired {
-            return Err(UiError::CursorExpired);
+    ) -> Result<RequestAuthorization, UiError> {
+        let extractor = self.actor_extractor.as_ref().ok_or(UiError::AccessDenied)?;
+        let authorizer = self.authorizer.as_ref().ok_or(UiError::AccessDenied)?;
+        let actor = extractor
+            .extract(headers)
+            .await
+            .map_err(|_| UiError::AccessDenied)?;
+        let grant = authorizer
+            .authorize(&actor, project_id)
+            .await
+            .map_err(|_| UiError::AccessDenied)?;
+        if !grant.valid_for(&actor, project_id, server_now()) {
+            return Err(UiError::AccessDenied);
         }
-        let backlog = inner
-            .changes
-            .iter()
-            .filter(|change| change.project_id == project_id && change.sequence > after)
-            .cloned()
-            .collect();
-        Ok((backlog, receiver))
+        Ok(RequestAuthorization { actor, grant })
     }
 }
 
-fn validate_checkpoint_for_serving(checkpoint: &StoredProjection) -> anyhow::Result<()> {
-    let header = checkpoint.payload.header();
-    let valid = checkpoint
-        .payload
-        .is_project_consistent(checkpoint.project_id)
-        && checkpoint.payload.checkpoint_invariants_hold()
-        && header.projection_version == checkpoint.projection_version.get()
-        && header.last_event_id == Some(checkpoint.cursor.event_id)
-        && header.last_event_sequence == checkpoint.last_event_sequence
-        && header.source_digest == checkpoint.source_digest
-        && header.as_of == Some(checkpoint.as_of)
-        && header.rebuilt_at == Some(checkpoint.rebuilt_at)
-        && header.staleness_ms == checkpoint.staleness_ms
-        && header.degraded_reason == checkpoint.degraded_reason;
-    if !valid {
-        anyhow::bail!("projection checkpoint metadata is inconsistent");
-    }
-    Ok(())
-}
-
-impl Default for ProjectionRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+struct RequestAuthorization {
+    actor: ActorContext,
+    grant: AuthorizationGrant,
 }
 
 pub fn router(state: ControlPlaneState) -> Router {
@@ -458,10 +379,9 @@ async fn health() -> StatusCode {
 }
 
 async fn ready(State(state): State<ControlPlaneState>) -> StatusCode {
-    if state.registry.inner.read().await.projects.is_empty() {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::NO_CONTENT
+    match state.source.ready().await {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -479,19 +399,28 @@ async fn mission_control(
     headers: HeaderMap,
 ) -> Result<Response, UiError> {
     let project_id = parse_project(&project_id)?;
-    state.authorize_project(project_id)?;
+    let authorization = state.authorize_project(&headers, project_id).await?;
+    let head_before = state.source.head().await.map_err(UiError::from_source)?;
     let snapshot = state
-        .registry
+        .source
         .snapshot(project_id)
         .await
+        .map_err(UiError::from_source)?
         .ok_or(UiError::ProjectNotFound)?;
+    let head_after = state.source.head().await.map_err(UiError::from_source)?;
+    validate_source_snapshot(project_id, &snapshot, head_before, head_after)?;
     let etag = format!("\"{}\"", snapshot.source_digest);
+    let stream_cursor = state
+        .cursor
+        .encode(project_id, snapshot.position, &authorization.grant);
     if headers
         .get(header::IF_NONE_MATCH)
         .and_then(|value| value.to_str().ok())
         == Some(etag.as_str())
     {
-        return Ok(StatusCode::NOT_MODIFIED.into_response());
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        attach_snapshot_headers(&mut response, &etag, &stream_cursor)?;
+        return Ok(response);
     }
     let mut response = Json(MissionControlResponse {
         projection_version: snapshot.projection_version,
@@ -499,11 +428,60 @@ async fn mission_control(
         read_models: snapshot.read_models,
     })
     .into_response();
+    attach_snapshot_headers(&mut response, &etag, &stream_cursor)?;
+    Ok(response)
+}
+
+fn validate_source_snapshot(
+    project_id: ProjectId,
+    snapshot: &crate::control_room::ControlRoomSnapshot,
+    head_before: StorePosition,
+    head_after: StorePosition,
+) -> Result<(), UiError> {
+    let header = snapshot.read_models.header();
+    let canonical_payload_digest = ProjectionEnvelope::new(
+        project_id,
+        snapshot.source_cursor,
+        snapshot.read_models.clone(),
+    )
+    .map_err(|_| UiError::SourceContractInvalid)?
+    .payload_digest;
+    let position_is_monotonic = head_before.epoch == snapshot.position.epoch
+        && snapshot.position.epoch == head_after.epoch
+        && head_before.sequence <= snapshot.position.sequence
+        && snapshot.position.sequence <= head_after.sequence;
+    let cursor_matches_headers = snapshot.source_cursor.event_sequence != 0
+        && header.last_event_id == Some(snapshot.source_cursor.event_id)
+        && header.last_event_sequence == snapshot.source_cursor.event_sequence
+        && header.as_of == Some(snapshot.source_cursor.occurred_at);
+    if snapshot.project_id != project_id
+        || snapshot.projection_version == 0
+        || snapshot.position.sequence == DurableChangeSequence::ZERO
+        || !position_is_monotonic
+        || !snapshot.read_models.is_project_consistent(project_id)
+        || !snapshot.read_models.checkpoint_invariants_hold()
+        || !cursor_matches_headers
+        || snapshot.source_digest != canonical_payload_digest
+    {
+        return Err(UiError::SourceContractInvalid);
+    }
+    Ok(())
+}
+
+fn attach_snapshot_headers(
+    response: &mut Response,
+    etag: &str,
+    stream_cursor: &str,
+) -> Result<(), UiError> {
     response.headers_mut().insert(
         header::ETAG,
-        HeaderValue::from_str(&etag).expect("digest is a valid ETag"),
+        HeaderValue::from_str(etag).map_err(|_| UiError::SourceContractInvalid)?,
     );
-    Ok(response)
+    response.headers_mut().insert(
+        HeaderName::from_static(STREAM_CURSOR_HEADER),
+        HeaderValue::from_str(stream_cursor).map_err(|_| UiError::SourceContractInvalid)?,
+    );
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,33 +496,94 @@ async fn events(
     Query(query): Query<EventsQuery>,
 ) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, UiError> {
     let project_id = parse_project(&project_id)?;
-    state.authorize_project(project_id)?;
-    let epoch = state.registry.epoch().await;
+    let authorization = state.authorize_project(&headers, project_id).await?;
     let reconnect_cursor = headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok());
-    let after = reconnect_cursor
+    let cursor = reconnect_cursor
         .or(query.cursor.as_deref())
-        .map_or(Ok(0), |cursor| {
-            state.cursor.decode(cursor, project_id, epoch)
-        })?;
-    let (backlog, mut receiver) = state.registry.subscribe(project_id, after).await?;
+        .ok_or(UiError::CursorRequired)?;
+    let resume = state
+        .cursor
+        .decode(cursor, project_id, &authorization.grant)?;
+    let mut subscription = state
+        .source
+        .subscribe(project_id, resume)
+        .await
+        .map_err(UiError::from_source)?;
+    let subscription_contract_is_valid = subscription.project_id == project_id
+        && subscription.epoch == resume.epoch
+        && subscription.after == resume.sequence;
     let codec = state.cursor.clone();
+    let actor = authorization.actor;
+    let grant = authorization.grant;
+    let authorizer = state.authorizer.clone().ok_or(UiError::AccessDenied)?;
     let stream = async_stream::stream! {
-        for change in backlog {
-            yield Ok(change_event(&codec, &change));
-        }
-        loop {
-            match receiver.recv().await {
-                Ok(change) if change.project_id == project_id => {
-                    yield Ok(change_event(&codec, &change));
+        if !subscription_contract_is_valid {
+            yield Ok(projection_reset_event("source_contract_failure"));
+        } else {
+            let mut last_sequence = resume.sequence;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(AUTHORIZATION_RECHECK_INTERVAL) => {
+                        if refresh_authorization(
+                            authorizer.as_ref(),
+                            &actor,
+                            project_id,
+                            &grant,
+                        ).await.is_none() {
+                            break;
+                        }
+                    }
+                    change = next_change(&mut subscription.changes) => {
+                        let Some(change) = change else {
+                            break;
+                        };
+                        match change {
+                            Ok(change) => {
+                                let source_is_valid = change.project_id == project_id
+                                    && change.epoch == resume.epoch
+                                    && change.sequence > last_sequence;
+                                if !source_is_valid {
+                                    yield Ok(projection_reset_event("source_contract_failure"));
+                                    break;
+                                }
+                                let Some(current_grant) = refresh_authorization(
+                                    authorizer.as_ref(),
+                                    &actor,
+                                    project_id,
+                                    &grant,
+                                ).await else {
+                                    break;
+                                };
+                                // Authorization can expire while an async
+                                // authorizer is resolving. Re-read the clock and
+                                // compare the epoch/scope immediately before
+                                // emitting protected data.
+                                if !grants_allow_emit(
+                                    &grant,
+                                    &current_grant,
+                                    &actor,
+                                    project_id,
+                                    server_now(),
+                                ) {
+                                    break;
+                                }
+                                last_sequence = change.sequence;
+                                yield Ok(change_event(&codec, &change, &current_grant));
+                            }
+                            Err(ProjectionSourceError::ChangeFeedLagged) => {
+                                yield Ok(projection_reset_event("change_feed_lagged"));
+                                break;
+                            }
+                            Err(ProjectionSourceError::CursorExpired) => {
+                                yield Ok(projection_reset_event("cursor_expired"));
+                                break;
+                            }
+                            Err(ProjectionSourceError::Unavailable) => break,
+                        }
+                    }
                 }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    yield Ok(Event::default().event("projection.reset").data("{}"));
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -555,11 +594,43 @@ async fn events(
     ))
 }
 
-fn change_event(codec: &CursorCodec, change: &ProjectionChange) -> Event {
+async fn refresh_authorization(
+    authorizer: &dyn ProjectAuthorizer,
+    actor: &ActorContext,
+    project_id: ProjectId,
+    initial: &AuthorizationGrant,
+) -> Option<AuthorizationGrant> {
+    let current = authorizer.authorize(actor, project_id).await.ok()?;
+    grants_allow_emit(initial, &current, actor, project_id, server_now()).then_some(current)
+}
+
+fn grants_allow_emit(
+    initial: &AuthorizationGrant,
+    current: &AuthorizationGrant,
+    actor: &ActorContext,
+    project_id: ProjectId,
+    now: agentforge_domain::ServerInstant,
+) -> bool {
+    initial.valid_for(actor, project_id, now)
+        && current.valid_for(actor, project_id, now)
+        && initial.same_authority(current)
+}
+
+fn projection_reset_event(reason: &'static str) -> Event {
+    Event::default()
+        .event("projection.reset")
+        .data(serde_json::json!({ "reason": reason }).to_string())
+}
+
+fn change_event(
+    codec: &CursorCodec,
+    change: &ProjectionChange,
+    grant: &AuthorizationGrant,
+) -> Event {
     let data = serde_json::to_string(change).expect("projection change is serializable");
     Event::default()
         .event("projection.invalidated")
-        .id(codec.encode(change.project_id, change.epoch, change.sequence))
+        .id(codec.encode(change.project_id, change.position(), grant))
         .data(data)
 }
 
@@ -570,9 +641,24 @@ fn parse_project(value: &str) -> Result<ProjectId, UiError> {
 #[derive(Clone, Copy, Debug)]
 enum UiError {
     InvalidProjectId,
+    CursorRequired,
     InvalidCursor,
     CursorExpired,
     ProjectNotFound,
+    AccessDenied,
+    SourceUnavailable,
+    SourceContractInvalid,
+}
+
+impl UiError {
+    const fn from_source(error: ProjectionSourceError) -> Self {
+        match error {
+            ProjectionSourceError::CursorExpired => Self::CursorExpired,
+            ProjectionSourceError::ChangeFeedLagged | ProjectionSourceError::Unavailable => {
+                Self::SourceUnavailable
+            }
+        }
+    }
 }
 
 impl IntoResponse for UiError {
@@ -582,6 +668,11 @@ impl IntoResponse for UiError {
                 StatusCode::BAD_REQUEST,
                 "AF_PROJECT_ID_INVALID",
                 "project_id must be a UUID",
+            ),
+            Self::CursorRequired => (
+                StatusCode::BAD_REQUEST,
+                "AF_CURSOR_REQUIRED",
+                "a snapshot stream cursor is required",
             ),
             Self::InvalidCursor => (
                 StatusCode::BAD_REQUEST,
@@ -597,6 +688,21 @@ impl IntoResponse for UiError {
                 StatusCode::NOT_FOUND,
                 "AF_PROJECT_NOT_FOUND",
                 "project projection was not found",
+            ),
+            Self::AccessDenied => (
+                StatusCode::FORBIDDEN,
+                "AF_PROJECT_ACCESS_DENIED",
+                "the request actor is not authorized for this project",
+            ),
+            Self::SourceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AF_PROJECTION_SOURCE_UNAVAILABLE",
+                "the Control Room projection source is unavailable",
+            ),
+            Self::SourceContractInvalid => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AF_PROJECTION_SOURCE_CONTRACT_INVALID",
+                "the Control Room projection source returned inconsistent data",
             ),
         };
         (
@@ -619,16 +725,41 @@ async fn not_found() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::{Arc, RwLock},
+    };
 
     use agentforge_application::{
         ProjectReadModels, ProjectionCursor, ProjectionEnvelope, ProjectionHeader, StoredProjection,
     };
-    use agentforge_domain::{EventId, ProjectId, ProtocolKey, ServerInstant, Sha256Digest};
-    use time::{Duration, macros::datetime};
+    use agentforge_domain::{EventId, ProjectId, ServerInstant, Sha256Digest};
+    use axum::{
+        body::to_bytes,
+        extract::{Path, Query, State},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+        response::IntoResponse,
+    };
+    use time::{Duration, OffsetDateTime, macros::datetime};
     use uuid::Uuid;
 
-    use super::{CursorCodec, ProjectionRegistry, UiError, is_loopback_authority, same_authority};
+    use crate::{
+        access::{
+            ActorContext, ActorExtractionFuture, AuthenticationError, AuthorizationFuture,
+            AuthorizationGrant, LocalLoopbackActorExtractor, NonLocalActor, ProjectAuthorizer,
+            RequestActorExtractor, server_now,
+        },
+        control_room::{
+            ControlRoomSnapshot, DurableChangeSequence, ProjectionChange, ProjectionRegistry,
+            ProjectionResource, ProjectionSource, ProjectionSourceError, ProjectionSubscription,
+            SourceFuture, StoreEpoch, StorePosition,
+        },
+    };
+
+    use super::{
+        ControlPlaneState, CursorCodec, EventsQuery, STREAM_CURSOR_HEADER, events,
+        is_loopback_authority, mission_control, refresh_authorization, same_authority,
+    };
 
     fn project(value: &str) -> ProjectId {
         ProjectId::from_str(value).expect("valid project id")
@@ -669,22 +800,262 @@ mod tests {
         checkpoint
     }
 
+    struct FixedProjectionSource {
+        project_id: ProjectId,
+        head_position: StorePosition,
+        snapshot: ControlRoomSnapshot,
+    }
+
+    impl ProjectionSource for FixedProjectionSource {
+        fn head(&self) -> SourceFuture<'_, StorePosition> {
+            Box::pin(async { Ok(self.head_position) })
+        }
+
+        fn snapshot(&self, project_id: ProjectId) -> SourceFuture<'_, Option<ControlRoomSnapshot>> {
+            Box::pin(
+                async move { Ok((project_id == self.project_id).then(|| self.snapshot.clone())) },
+            )
+        }
+
+        fn subscribe(
+            &self,
+            _project_id: ProjectId,
+            _resume: StorePosition,
+        ) -> SourceFuture<'_, ProjectionSubscription> {
+            Box::pin(async { Err(ProjectionSourceError::Unavailable) })
+        }
+
+        fn ready(&self) -> SourceFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    struct MalformedSubscriptionSource {
+        position: StorePosition,
+        wrong_project_id: ProjectId,
+    }
+
+    impl ProjectionSource for MalformedSubscriptionSource {
+        fn head(&self) -> SourceFuture<'_, StorePosition> {
+            Box::pin(async { Ok(self.position) })
+        }
+
+        fn snapshot(
+            &self,
+            _project_id: ProjectId,
+        ) -> SourceFuture<'_, Option<ControlRoomSnapshot>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn subscribe(
+            &self,
+            _project_id: ProjectId,
+            resume: StorePosition,
+        ) -> SourceFuture<'_, ProjectionSubscription> {
+            Box::pin(async move {
+                let changes = async_stream::stream! {
+                    if false {
+                        yield Err(ProjectionSourceError::Unavailable);
+                    }
+                };
+                Ok(ProjectionSubscription {
+                    project_id: self.wrong_project_id,
+                    epoch: resume.epoch,
+                    after: resume.sequence,
+                    changes: Box::pin(changes),
+                })
+            })
+        }
+
+        fn ready(&self) -> SourceFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    struct MalformedChangeSource {
+        position: StorePosition,
+        change_project_id: ProjectId,
+        change_epoch: StoreEpoch,
+        change_sequence: DurableChangeSequence,
+    }
+
+    impl ProjectionSource for MalformedChangeSource {
+        fn head(&self) -> SourceFuture<'_, StorePosition> {
+            Box::pin(async { Ok(self.position) })
+        }
+
+        fn snapshot(
+            &self,
+            _project_id: ProjectId,
+        ) -> SourceFuture<'_, Option<ControlRoomSnapshot>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn subscribe(
+            &self,
+            project_id: ProjectId,
+            resume: StorePosition,
+        ) -> SourceFuture<'_, ProjectionSubscription> {
+            Box::pin(async move {
+                let change = ProjectionChange {
+                    epoch: self.change_epoch,
+                    sequence: self.change_sequence,
+                    resource: ProjectionResource::ProjectReadModels,
+                    project_id: self.change_project_id,
+                    projection_version: 2,
+                    source_occurred_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+                };
+                let changes = async_stream::stream! {
+                    yield Ok(change);
+                };
+                Ok(ProjectionSubscription {
+                    project_id,
+                    epoch: resume.epoch,
+                    after: resume.sequence,
+                    changes: Box::pin(changes),
+                })
+            })
+        }
+
+        fn ready(&self) -> SourceFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    struct DelayedAuthorizer {
+        grant: AuthorizationGrant,
+        delay: std::time::Duration,
+    }
+
+    impl ProjectAuthorizer for DelayedAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            _actor: &'a ActorContext,
+            _project_id: ProjectId,
+        ) -> AuthorizationFuture<'a> {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                Ok(self.grant.clone())
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestAuthorizer {
+        epoch: Arc<RwLock<Uuid>>,
+        expires_at: ServerInstant,
+    }
+
+    impl TestAuthorizer {
+        fn active() -> Self {
+            Self {
+                epoch: Arc::new(RwLock::new(Uuid::from_bytes([8; 16]))),
+                expires_at: ServerInstant(
+                    OffsetDateTime::from_unix_timestamp(253_402_300_799)
+                        .expect("year 9999 is representable"),
+                ),
+            }
+        }
+
+        fn grant(&self, actor: &ActorContext, project_id: ProjectId) -> AuthorizationGrant {
+            let tenant = actor.tenant();
+            let actor_identity = actor.actor();
+            AuthorizationGrant {
+                project_id,
+                scope_digest: Sha256Digest::of_bytes(format!("test-scope:{project_id}")),
+                tenant,
+                actor: actor_identity,
+                authorization_epoch: *self.epoch.read().expect("authorization epoch lock"),
+                expires_at: self.expires_at,
+            }
+        }
+
+        fn rotate_epoch(&self) {
+            *self.epoch.write().expect("authorization epoch lock") = Uuid::from_bytes([9; 16]);
+        }
+    }
+
+    impl ProjectAuthorizer for TestAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            actor: &'a ActorContext,
+            project_id: ProjectId,
+        ) -> AuthorizationFuture<'a> {
+            Box::pin(async move { Ok(self.grant(actor, project_id)) })
+        }
+    }
+
+    struct HeaderActorExtractor;
+
+    impl RequestActorExtractor for HeaderActorExtractor {
+        fn extract<'a>(&'a self, headers: &'a HeaderMap) -> ActorExtractionFuture<'a> {
+            let result = headers
+                .get("x-test-tenant")
+                .and_then(|value| value.to_str().ok())
+                .zip(
+                    headers
+                        .get("x-test-actor")
+                        .and_then(|value| value.to_str().ok()),
+                )
+                .ok_or(AuthenticationError::InvalidCredentials)
+                .and_then(|(tenant, actor)| {
+                    NonLocalActor::new(tenant.to_owned(), actor.to_owned())
+                        .map(ActorContext::NonLocal)
+                        .map_err(|_| AuthenticationError::InvalidCredentials)
+                });
+            Box::pin(async move { result })
+        }
+    }
+
+    fn test_state(
+        source: Arc<dyn ProjectionSource>,
+        cursor: CursorCodec,
+        authorizer: Arc<dyn ProjectAuthorizer>,
+    ) -> ControlPlaneState {
+        ControlPlaneState::with_source(
+            source,
+            cursor,
+            Some(Arc::new(LocalLoopbackActorExtractor)),
+            Some(authorizer),
+        )
+    }
+
     #[test]
-    fn cursor_is_project_bound_and_tamper_evident() {
+    fn cursor_is_actor_scoped_project_bound_tamper_evident_and_expiring() {
         let codec = CursorCodec::from_hex(&"11".repeat(32)).expect("valid key");
         let first = project("018f0000-0000-7000-8000-000000000001");
         let second = project("018f0000-0000-7000-8000-000000000002");
-        let epoch = Uuid::from_bytes([3; 16]);
-        let token = codec.encode(first, epoch, 37);
-        assert_eq!(codec.decode(&token, first, epoch).expect("decode"), 37);
-        assert!(codec.decode(&token, second, epoch).is_err());
-        assert!(matches!(
-            codec.decode(&token, first, Uuid::from_bytes([4; 16])),
-            Err(UiError::CursorExpired)
-        ));
+        let actor = ActorContext::local_reference();
+        let authorizer = TestAuthorizer::active();
+        let first_grant = authorizer.grant(&actor, first);
+        let position = StorePosition::new(
+            StoreEpoch::new(Uuid::from_bytes([3; 16])),
+            DurableChangeSequence::new(37),
+        );
+        let token = codec.encode(first, position, &first_grant);
+        assert_eq!(
+            codec.decode(&token, first, &first_grant).expect("decode"),
+            position
+        );
+        assert!(
+            codec
+                .decode(&token, second, &authorizer.grant(&actor, second))
+                .is_err()
+        );
+        authorizer.rotate_epoch();
+        assert!(
+            codec
+                .decode(&token, first, &authorizer.grant(&actor, first))
+                .is_err()
+        );
         let mut tampered = token;
         tampered.push('0');
-        assert!(codec.decode(&tampered, first, epoch).is_err());
+        assert!(codec.decode(&tampered, first, &first_grant).is_err());
+
+        let mut expired_grant = first_grant.clone();
+        expired_grant.expires_at = ServerInstant(OffsetDateTime::UNIX_EPOCH);
+        let expired = codec.encode(first, position, &expired_grant);
+        assert!(codec.decode(&expired, first, &expired_grant).is_err());
         assert!(CursorCodec::from_hex(&"AA".repeat(32)).is_err());
     }
 
@@ -717,32 +1088,523 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_is_monotonic_idempotent_and_rejects_split_headers() {
+    async fn http_snapshot_uses_projection_source_and_local_authorizer() {
         let project_id = project("018f0000-0000-7000-8000-000000000001");
-        let registry = ProjectionRegistry::new();
-        let first = checkpoint(project_id, 1);
-        assert_eq!(registry.replace(first.clone()).await.expect("insert"), 1);
-        assert_eq!(registry.replace(first.clone()).await.expect("replay"), 1);
+        let checkpoint = checkpoint(project_id, 1);
+        let position = StorePosition::new(
+            StoreEpoch::new(Uuid::from_bytes([7; 16])),
+            DurableChangeSequence::new(9),
+        );
+        let source = FixedProjectionSource {
+            project_id,
+            head_position: position,
+            snapshot: ControlRoomSnapshot {
+                project_id,
+                position,
+                projection_version: 4,
+                source_digest: checkpoint.payload_digest,
+                source_cursor: checkpoint.cursor,
+                read_models: checkpoint.payload,
+            },
+        };
+        let codec = CursorCodec::from_hex(&"11".repeat(32)).expect("valid key");
+        let authorizer = TestAuthorizer::active();
+        let state = test_state(
+            Arc::new(source),
+            codec.clone(),
+            Arc::new(authorizer.clone()),
+        );
 
-        let mut conflicting = first;
-        conflicting
-            .payload
-            .project_control_room
-            .counters
-            .active_runs = 1;
-        conflicting = ProjectionEnvelope::new(project_id, conflicting.cursor, conflicting.payload)
-            .expect("conflicting envelope");
-        conflicting.source_digest = Sha256Digest::of_bytes(1_u64.to_be_bytes());
-        assert!(registry.replace(conflicting).await.is_err());
+        let response = mission_control(
+            State(state.clone()),
+            Path(project_id.to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("authorized snapshot");
+        assert_eq!(response.status(), StatusCode::OK);
+        let etag = response.headers().get(header::ETAG).expect("ETag").clone();
+        let stream_cursor = response
+            .headers()
+            .get(STREAM_CURSOR_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("snapshot stream cursor");
+        assert_eq!(
+            codec
+                .decode(
+                    stream_cursor,
+                    project_id,
+                    &authorizer.grant(&ActorContext::local_reference(), project_id),
+                )
+                .expect("decode snapshot handoff"),
+            position
+        );
 
-        let mut split = checkpoint(project_id, 2);
-        split.payload.activity.header.degraded_reason =
-            Some(ProtocolKey::new("split_header").expect("key"));
-        split = ProjectionEnvelope::new(project_id, split.cursor, split.payload)
-            .expect("split envelope");
-        split.source_digest = Sha256Digest::of_bytes(2_u64.to_be_bytes());
-        assert!(registry.replace(split).await.is_err());
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag);
+        let not_modified = mission_control(State(state), Path(project_id.to_string()), conditional)
+            .await
+            .expect("conditional snapshot");
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert!(not_modified.headers().contains_key(STREAM_CURSOR_HEADER));
+    }
 
-        assert!(registry.replace(checkpoint(project_id, 0)).await.is_err());
+    #[tokio::test]
+    async fn request_headers_produce_distinct_actor_scoped_snapshot_cursors() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let checkpoint = checkpoint(project_id, 1);
+        let position = StorePosition::new(
+            StoreEpoch::new(Uuid::from_bytes([7; 16])),
+            DurableChangeSequence::new(9),
+        );
+        let source = FixedProjectionSource {
+            project_id,
+            head_position: position,
+            snapshot: ControlRoomSnapshot {
+                project_id,
+                position,
+                projection_version: 1,
+                source_digest: checkpoint.payload_digest,
+                source_cursor: checkpoint.cursor,
+                read_models: checkpoint.payload,
+            },
+        };
+        let codec = CursorCodec::from_hex(&"11".repeat(32)).expect("valid key");
+        let authorizer = TestAuthorizer::active();
+        let state = ControlPlaneState::with_source(
+            Arc::new(source),
+            codec.clone(),
+            Some(Arc::new(HeaderActorExtractor)),
+            Some(Arc::new(authorizer.clone())),
+        );
+
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert("x-test-tenant", HeaderValue::from_static("tenant-a"));
+        first_headers.insert("x-test-actor", HeaderValue::from_static("actor-a"));
+        let first_response = mission_control(
+            State(state.clone()),
+            Path(project_id.to_string()),
+            first_headers,
+        )
+        .await
+        .expect("first request actor");
+        let first_cursor = first_response
+            .headers()
+            .get(STREAM_CURSOR_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("first stream cursor")
+            .to_owned();
+
+        let mut second_headers = HeaderMap::new();
+        second_headers.insert("x-test-tenant", HeaderValue::from_static("tenant-a"));
+        second_headers.insert("x-test-actor", HeaderValue::from_static("actor-b"));
+        let second_response =
+            mission_control(State(state), Path(project_id.to_string()), second_headers)
+                .await
+                .expect("second request actor");
+        let second_cursor = second_response
+            .headers()
+            .get(STREAM_CURSOR_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("second stream cursor");
+        assert_ne!(first_cursor, second_cursor);
+
+        let first_actor =
+            ActorContext::NonLocal(NonLocalActor::new("tenant-a", "actor-a").expect("first actor"));
+        let second_actor = ActorContext::NonLocal(
+            NonLocalActor::new("tenant-a", "actor-b").expect("second actor"),
+        );
+        assert!(
+            codec
+                .decode(
+                    &first_cursor,
+                    project_id,
+                    &authorizer.grant(&first_actor, project_id),
+                )
+                .is_ok()
+        );
+        assert!(
+            codec
+                .decode(
+                    &first_cursor,
+                    project_id,
+                    &authorizer.grant(&second_actor, project_id),
+                )
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_rejects_a_source_snapshot_for_the_wrong_project() {
+        let requested = project("018f0000-0000-7000-8000-000000000001");
+        let wrong = project("018f0000-0000-7000-8000-000000000002");
+        let checkpoint = checkpoint(wrong, 1);
+        let source = FixedProjectionSource {
+            project_id: requested,
+            head_position: StorePosition::new(
+                StoreEpoch::new(Uuid::from_bytes([7; 16])),
+                DurableChangeSequence::new(1),
+            ),
+            snapshot: ControlRoomSnapshot {
+                project_id: wrong,
+                position: StorePosition::new(
+                    StoreEpoch::new(Uuid::from_bytes([7; 16])),
+                    DurableChangeSequence::new(1),
+                ),
+                projection_version: 1,
+                source_digest: checkpoint.payload_digest,
+                source_cursor: checkpoint.cursor,
+                read_models: checkpoint.payload,
+            },
+        };
+        let state = test_state(
+            Arc::new(source),
+            CursorCodec::from_hex(&"11".repeat(32)).expect("valid key"),
+            Arc::new(TestAuthorizer::active()),
+        );
+        let response =
+            mission_control(State(state), Path(requested.to_string()), HeaderMap::new()).await;
+        let error = response.expect_err("wrong-project snapshot must fail");
+        assert_eq!(
+            error.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn http_rejects_unverified_snapshot_digest_cursor_and_position() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let checkpoint = checkpoint(project_id, 1);
+        let epoch = StoreEpoch::new(Uuid::from_bytes([7; 16]));
+        let position = StorePosition::new(epoch, DurableChangeSequence::new(9));
+        let valid = ControlRoomSnapshot {
+            project_id,
+            position,
+            projection_version: 1,
+            source_digest: checkpoint.payload_digest,
+            source_cursor: checkpoint.cursor,
+            read_models: checkpoint.payload,
+        };
+        let mut bad_digest = valid.clone();
+        bad_digest.source_digest = Sha256Digest::of_bytes("not the JCS payload");
+        let unverified_etag = HeaderValue::from_str(&format!("\"{}\"", bad_digest.source_digest))
+            .expect("digest is a valid ETag");
+        let mut bad_cursor = valid.clone();
+        bad_cursor.source_cursor = ProjectionCursor::new(
+            bad_cursor.source_cursor.occurred_at,
+            EventId::from(Uuid::from_u128(99)),
+            bad_cursor.source_cursor.event_sequence,
+        );
+        let regressing_position = valid;
+
+        for (snapshot, head_position, conditional_etag) in [
+            (bad_digest, position, Some(unverified_etag)),
+            (bad_cursor, position, None),
+            (
+                regressing_position,
+                StorePosition::new(epoch, DurableChangeSequence::new(10)),
+                None,
+            ),
+        ] {
+            let state = test_state(
+                Arc::new(FixedProjectionSource {
+                    project_id,
+                    head_position,
+                    snapshot,
+                }),
+                CursorCodec::from_hex(&"11".repeat(32)).expect("valid key"),
+                Arc::new(TestAuthorizer::active()),
+            );
+            let mut headers = HeaderMap::new();
+            if let Some(etag) = conditional_etag {
+                headers.insert(header::IF_NONE_MATCH, etag);
+            }
+            let response =
+                mission_control(State(state), Path(project_id.to_string()), headers).await;
+            let error = response.expect_err("unverified snapshots must fail closed");
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_rejects_cross_project_tampered_and_expired_cursors() {
+        let first = project("018f0000-0000-7000-8000-000000000001");
+        let second = project("018f0000-0000-7000-8000-000000000002");
+        let codec = CursorCodec::from_hex(&"11".repeat(32)).expect("valid key");
+        let stale_position = StorePosition::new(
+            StoreEpoch::new(Uuid::from_bytes([3; 16])),
+            DurableChangeSequence::new(1),
+        );
+        let authorizer = TestAuthorizer::active();
+        let first_cursor = codec.encode(
+            first,
+            stale_position,
+            &authorizer.grant(&ActorContext::local_reference(), first),
+        );
+        let state = test_state(
+            Arc::new(ProjectionRegistry::new()),
+            codec,
+            Arc::new(authorizer),
+        );
+
+        let cross_project = events(
+            State(state.clone()),
+            Path(second.to_string()),
+            HeaderMap::new(),
+            Query(EventsQuery {
+                cursor: Some(first_cursor.clone()),
+            }),
+        )
+        .await;
+        let error = match cross_project {
+            Ok(_) => panic!("cross-project cursor must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let mut tampered_cursor = first_cursor.clone();
+        tampered_cursor.push('0');
+        let tampered = events(
+            State(state.clone()),
+            Path(first.to_string()),
+            HeaderMap::new(),
+            Query(EventsQuery {
+                cursor: Some(tampered_cursor),
+            }),
+        )
+        .await;
+        let error = match tampered {
+            Ok(_) => panic!("tampered cursor must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let expired = events(
+            State(state),
+            Path(first.to_string()),
+            HeaderMap::new(),
+            Query(EventsQuery {
+                cursor: Some(first_cursor),
+            }),
+        )
+        .await;
+        let error = match expired {
+            Ok(_) => panic!("a cursor from a previous process epoch must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn sse_without_request_actor_extractor_or_authorizer_fails_closed() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let state = ControlPlaneState::with_source(
+            Arc::new(ProjectionRegistry::new()),
+            CursorCodec::from_hex(&"11".repeat(32)).expect("valid key"),
+            None,
+            None,
+        );
+        let response = events(
+            State(state),
+            Path(project_id.to_string()),
+            HeaderMap::new(),
+            Query(EventsQuery { cursor: None }),
+        )
+        .await;
+        let error = match response {
+            Ok(_) => panic!("missing authorizer must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sse_requires_a_snapshot_handoff_cursor() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let (state, _store) = ControlPlaneState::local_reference(
+            CursorCodec::from_hex(&"11".repeat(32)).expect("valid key"),
+            [project_id],
+        )
+        .expect("local reference");
+        let response = events(
+            State(state),
+            Path(project_id.to_string()),
+            HeaderMap::new(),
+            Query(EventsQuery { cursor: None }),
+        )
+        .await;
+        let error = match response {
+            Ok(_) => panic!("cursor-free SSE must not bypass the retained hot floor"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sse_resets_on_inconsistent_subscription_scope_from_the_source() {
+        let requested = project("018f0000-0000-7000-8000-000000000001");
+        let wrong = project("018f0000-0000-7000-8000-000000000002");
+        let position = StorePosition::new(
+            StoreEpoch::new(Uuid::from_bytes([7; 16])),
+            DurableChangeSequence::new(4),
+        );
+        let codec = CursorCodec::from_hex(&"11".repeat(32)).expect("valid key");
+        let authorizer = TestAuthorizer::active();
+        let cursor = codec.encode(
+            requested,
+            position,
+            &authorizer.grant(&ActorContext::local_reference(), requested),
+        );
+        let state = test_state(
+            Arc::new(MalformedSubscriptionSource {
+                position,
+                wrong_project_id: wrong,
+            }),
+            codec,
+            Arc::new(authorizer),
+        );
+        let response = events(
+            State(state),
+            Path(requested.to_string()),
+            HeaderMap::new(),
+            Query(EventsQuery {
+                cursor: Some(cursor),
+            }),
+        )
+        .await
+        .expect("source contract failure is reported in-band")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("read finite reset stream");
+        let body = std::str::from_utf8(&body).expect("SSE is UTF-8");
+        assert!(body.contains("projection.reset"), "{body}");
+        assert!(body.contains("source_contract_failure"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn sse_resets_before_emitting_cross_scope_or_non_monotonic_changes() {
+        let requested = project("018f0000-0000-7000-8000-000000000001");
+        let wrong = project("018f0000-0000-7000-8000-000000000002");
+        let position = StorePosition::new(
+            StoreEpoch::new(Uuid::from_bytes([7; 16])),
+            DurableChangeSequence::new(4),
+        );
+        let codec = CursorCodec::from_hex(&"11".repeat(32)).expect("valid key");
+        let authorizer = TestAuthorizer::active();
+        let cursor = codec.encode(
+            requested,
+            position,
+            &authorizer.grant(&ActorContext::local_reference(), requested),
+        );
+        let next = DurableChangeSequence::new(5);
+        let wrong_epoch = StoreEpoch::new(Uuid::from_bytes([8; 16]));
+        for (change_project_id, change_epoch, change_sequence) in [
+            (wrong, position.epoch, next),
+            (requested, wrong_epoch, next),
+            (requested, position.epoch, position.sequence),
+        ] {
+            let state = test_state(
+                Arc::new(MalformedChangeSource {
+                    position,
+                    change_project_id,
+                    change_epoch,
+                    change_sequence,
+                }),
+                codec.clone(),
+                Arc::new(authorizer.clone()),
+            );
+            let response = events(
+                State(state),
+                Path(requested.to_string()),
+                HeaderMap::new(),
+                Query(EventsQuery {
+                    cursor: Some(cursor.clone()),
+                }),
+            )
+            .await
+            .expect("source contract failure is reported in-band")
+            .into_response();
+            let body = to_bytes(response.into_body(), 1_024)
+                .await
+                .expect("read finite reset stream");
+            let body = std::str::from_utf8(&body).expect("SSE is UTF-8");
+            assert!(body.contains("projection.reset"), "{body}");
+            assert!(body.contains("source_contract_failure"), "{body}");
+            assert!(!body.contains("projection.invalidated"), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_epoch_rotation_revokes_an_existing_stream_grant() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let actor = ActorContext::local_reference();
+        let authorizer = TestAuthorizer::active();
+        let initial = authorizer.grant(&actor, project_id);
+        assert!(
+            refresh_authorization(&authorizer, &actor, project_id, &initial)
+                .await
+                .is_some()
+        );
+        authorizer.rotate_epoch();
+        assert!(
+            refresh_authorization(&authorizer, &actor, project_id, &initial)
+                .await
+                .is_none()
+        );
+
+        let mut expired = initial;
+        expired.expires_at = ServerInstant(OffsetDateTime::UNIX_EPOCH);
+        assert!(
+            refresh_authorization(&authorizer, &actor, project_id, &expired)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_expiring_during_authorizer_await_is_not_emitted() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let actor = ActorContext::local_reference();
+        let mut initial = TestAuthorizer::active().grant(&actor, project_id);
+        initial.expires_at = ServerInstant(server_now().0 + Duration::milliseconds(40));
+        assert!(initial.valid_for(&actor, project_id, server_now()));
+        let delayed = DelayedAuthorizer {
+            grant: initial.clone(),
+            delay: std::time::Duration::from_millis(80),
+        };
+
+        assert!(
+            refresh_authorization(&delayed, &actor, project_id, &initial)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_denied_by_the_local_project_authorizer_fails_closed() {
+        let allowed = project("018f0000-0000-7000-8000-000000000001");
+        let denied = project("018f0000-0000-7000-8000-000000000002");
+        let (state, _store) = ControlPlaneState::local_reference(
+            CursorCodec::from_hex(&"11".repeat(32)).expect("valid key"),
+            [allowed],
+        )
+        .expect("local reference");
+        let response = events(
+            State(state),
+            Path(denied.to_string()),
+            HeaderMap::new(),
+            Query(EventsQuery { cursor: None }),
+        )
+        .await;
+        let error = match response {
+            Ok(_) => panic!("project allowlist denial must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
     }
 }

@@ -60,3 +60,7 @@ jobs:
         run: >-
           cargo test --locked -p agentforge-storage-postgres
           --test postgres_migration -- --nocapture
+      - name: Exercise the transactional PostgreSQL UoW contract
+        run: >-
+          cargo test --locked -p agentforge-storage-postgres
+          --test postgres_uow -- --nocapture

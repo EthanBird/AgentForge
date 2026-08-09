@@ -41,8 +41,232 @@ async fn migrations_are_atomic_idempotent_and_install_required_constraints() -> 
     test_result
 }
 
+#[tokio::test]
+async fn uow_migration_releases_legacy_claims_and_preserves_legacy_receipts() -> Result<()> {
+    let Ok(database_url) = std::env::var("AGENTFORGE_TEST_DATABASE_URL") else {
+        eprintln!("skipped: AGENTFORGE_TEST_DATABASE_URL is not configured");
+        return Ok(());
+    };
+    if std::env::var("AGENTFORGE_TEST_ALLOW_SCHEMA_DROP").as_deref() != Ok("1") {
+        return Err(anyhow!(
+            "AGENTFORGE_TEST_ALLOW_SCHEMA_DROP=1 is required for the isolated schema test"
+        ));
+    }
+
+    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls)
+        .await
+        .context("connect to PostgreSQL fixture")?;
+    let connection_task = tokio::spawn(connection);
+    let schema = format!("af_upgrade_{}", Uuid::now_v7().simple());
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema}; SET search_path TO {schema}, pg_catalog"
+        ))
+        .await?;
+    let result = exercise_uow_upgrade(&mut client).await;
+    client
+        .batch_execute(&format!(
+            "SET search_path TO public, pg_catalog; DROP SCHEMA {schema} CASCADE"
+        ))
+        .await?;
+    drop(client);
+    connection_task.await??;
+    result
+}
+
+#[tokio::test]
+async fn uow_migration_rejects_permuted_legacy_event_history() -> Result<()> {
+    let Ok(database_url) = std::env::var("AGENTFORGE_TEST_DATABASE_URL") else {
+        eprintln!("skipped: AGENTFORGE_TEST_DATABASE_URL is not configured");
+        return Ok(());
+    };
+    if std::env::var("AGENTFORGE_TEST_ALLOW_SCHEMA_DROP").as_deref() != Ok("1") {
+        return Err(anyhow!(
+            "AGENTFORGE_TEST_ALLOW_SCHEMA_DROP=1 is required for the isolated schema test"
+        ));
+    }
+
+    let (mut client, connection) = tokio_postgres::connect(&database_url, NoTls)
+        .await
+        .context("connect to PostgreSQL fixture")?;
+    let connection_task = tokio::spawn(connection);
+    let schema = format!("af_bad_head_{}", Uuid::now_v7().simple());
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema}; SET search_path TO {schema}, pg_catalog"
+        ))
+        .await?;
+
+    let result = exercise_permuted_history_rejection(&mut client).await;
+    // The migration error leaves its explicit transaction aborted.
+    client.batch_execute("ROLLBACK").await?;
+    client
+        .batch_execute(&format!(
+            "SET search_path TO public, pg_catalog; DROP SCHEMA {schema} CASCADE"
+        ))
+        .await?;
+    drop(client);
+    connection_task.await??;
+    result
+}
+
+async fn exercise_permuted_history_rejection(client: &mut Client) -> Result<()> {
+    for migration in &migration::MIGRATIONS[..3] {
+        client.batch_execute(migration.sql).await?;
+    }
+
+    let project = Uuid::now_v7();
+    let aggregate = Uuid::now_v7();
+    let actor = Uuid::now_v7();
+    let correlation = Uuid::now_v7();
+    client
+        .execute(
+            "INSERT INTO projects (id, protocol_key, name, state)
+             VALUES ($1,$2,'Bad Head Fixture','ACTIVE')",
+            &[&project, &format!("bad-head-{project}")],
+        )
+        .await?;
+    for (event_seq, aggregate_version) in [(1_i64, 2_i64), (2, 1)] {
+        client
+            .execute(
+                "INSERT INTO domain_events
+                 (id, project_id, aggregate_type, aggregate_id, aggregate_version, event_seq,
+                  event_type, schema_version, payload, payload_digest, metadata, metadata_digest,
+                  correlation_id, actor_id, occurred_at)
+                 VALUES ($1,$2,'WORK_PACKAGE',$3,$4,$5,'fixture.permuted',1,'{}',
+                         decode(repeat('11',32),'hex'),'{}',decode(repeat('22',32),'hex'),
+                         $6,$7,clock_timestamp())",
+                &[
+                    &Uuid::now_v7(),
+                    &project,
+                    &aggregate,
+                    &aggregate_version,
+                    &event_seq,
+                    &correlation,
+                    &actor,
+                ],
+            )
+            .await?;
+    }
+
+    let error = client
+        .batch_execute(migration::MIGRATIONS[3].sql)
+        .await
+        .expect_err("permuted legacy history must block head derivation");
+    assert_eq!(
+        error.as_db_error().map(|error| error.code()),
+        Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION)
+    );
+    Ok(())
+}
+
+async fn exercise_uow_upgrade(client: &mut Client) -> Result<()> {
+    for migration in &migration::MIGRATIONS[..3] {
+        client.batch_execute(migration.sql).await?;
+    }
+
+    let project = Uuid::now_v7();
+    let aggregate = Uuid::now_v7();
+    let event = Uuid::now_v7();
+    let outbox = Uuid::now_v7();
+    let holder = Uuid::now_v7();
+    let actor = Uuid::now_v7();
+    client
+        .execute(
+            "INSERT INTO projects (id, protocol_key, name, state)
+             VALUES ($1,$2,'Upgrade Fixture','ACTIVE')",
+            &[&project, &format!("upgrade-{project}")],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO domain_events
+             (id, project_id, aggregate_type, aggregate_id, aggregate_version, event_seq,
+              event_type, schema_version, payload, payload_digest, metadata, metadata_digest,
+              correlation_id, actor_id, occurred_at)
+             VALUES ($1,$2,'WORK_PACKAGE',$3,1,1,'fixture.created',1,'{}',
+                     decode(repeat('11',32),'hex'),'{}',decode(repeat('22',32),'hex'),
+                     $4,$5,clock_timestamp())",
+            &[&event, &project, &aggregate, &Uuid::now_v7(), &actor],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO outbox_messages
+             (id, project_id, event_id, topic, message_key, envelope, claimed_by,
+              claim_expires_at, attempts)
+             VALUES ($1,$2,$3,'fixture','fixture','{}',$4,
+                     clock_timestamp()+interval '1 minute',1)",
+            &[&outbox, &project, &event, &holder],
+        )
+        .await?;
+    client
+        .execute(
+            "INSERT INTO command_receipts
+             (actor_id, idempotency_key_hash, project_id, command_type, request_hash,
+              response_classification, response_status, response_body, effect_digest,
+              replay_until)
+             VALUES ($1,decode(repeat('33',32),'hex'),$2,'fixture.legacy',
+                     decode(repeat('44',32),'hex'),'INTERNAL',200,'{}',
+                     decode(repeat('55',32),'hex'),clock_timestamp()+interval '1 hour')",
+            &[&actor, &project],
+        )
+        .await?;
+
+    client.batch_execute(migration::MIGRATIONS[3].sql).await?;
+    let row = client
+        .query_one(
+            "SELECT claimed_by, claim_expires_at, claim_generation,
+                    (SELECT aggregate_version FROM aggregate_event_heads
+                     WHERE project_id=$2 AND aggregate_id=$3),
+                    (SELECT last_event_seq FROM aggregate_event_heads
+                     WHERE project_id=$2 AND aggregate_id=$3)
+             FROM outbox_messages WHERE id=$1",
+            &[&outbox, &project, &aggregate],
+        )
+        .await?;
+    assert_eq!(row.get::<_, Option<Uuid>>(0), None);
+    assert_eq!(row.get::<_, Option<time::OffsetDateTime>>(1), None);
+    assert_eq!(row.get::<_, i64>(2), 0);
+    assert_eq!(row.get::<_, i64>(3), 1);
+    assert_eq!(row.get::<_, i64>(4), 1);
+    let legacy_envelope_version: i16 = client
+        .query_one(
+            "SELECT envelope_version FROM domain_events WHERE id=$1",
+            &[&event],
+        )
+        .await?
+        .get(0);
+    assert_eq!(legacy_envelope_version, 1);
+
+    let legacy = client
+        .query_one(
+            "SELECT command_id, resource_version, response_digest
+             FROM command_receipts WHERE actor_id=$1",
+            &[&actor],
+        )
+        .await?;
+    assert_eq!(legacy.get::<_, Option<Uuid>>(0), None);
+    assert_eq!(legacy.get::<_, Option<i64>>(1), None);
+    assert_eq!(legacy.get::<_, Option<Vec<u8>>>(2), None);
+
+    let old_unique_exists: bool = client
+        .query_one(
+            "SELECT EXISTS (
+               SELECT 1 FROM pg_constraint
+               WHERE conrelid='domain_events'::regclass
+                 AND conname='domain_events_aggregate_type_aggregate_id_aggregate_version_key'
+             )",
+            &[],
+        )
+        .await?
+        .get(0);
+    assert!(!old_unique_exists);
+    Ok(())
+}
+
 async fn exercise_migrations(client: &mut Client) -> Result<()> {
-    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3]);
+    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3, 4]);
     assert!(migration::migrate(client).await?.is_empty());
 
     let installed: Vec<String> = client
@@ -57,6 +281,7 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         .collect();
     for required in [
         "agentforge_schema_migrations",
+        "aggregate_event_heads",
         "attempts",
         "budget_reservations",
         "command_receipts",
@@ -92,7 +317,7 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
 
     let required_indexes: i64 = client
         .query_one(
@@ -158,11 +383,11 @@ async fn exercise_negative_contracts(client: &mut Client) -> Result<()> {
 
             INSERT INTO domain_events
               (id, project_id, aggregate_type, aggregate_id, aggregate_version, event_seq,
-               event_type, schema_version, payload, payload_digest, metadata,
+               event_type, schema_version, envelope_version, payload, payload_digest, metadata,
                metadata_digest, correlation_id, actor_id, occurred_at)
             VALUES
               ('{domain_event}', '{project}', 'PROJECT', '{project}', 1, 1,
-               'ProjectFixtureCreated', 1, '{{}}', decode(repeat('39', 32), 'hex'), '{{}}',
+               'ProjectFixtureCreated', 1, 2, '{{}}', decode(repeat('39', 32), 'hex'), '{{}}',
                decode(repeat('40', 32), 'hex'), gen_random_uuid(), '{actor_one}',
                clock_timestamp());
 
@@ -461,6 +686,20 @@ async fn exercise_negative_contracts(client: &mut Client) -> Result<()> {
 
     client
         .execute(
+            "INSERT INTO domain_events
+             (id, project_id, aggregate_type, aggregate_id, aggregate_version, event_seq,
+              event_type, schema_version, envelope_version, payload, payload_digest, metadata,
+              metadata_digest, correlation_id, actor_id, occurred_at)
+             VALUES ($1,$2,'PROJECT',$2,2,2,'ProjectFixtureChanged',1,3,'{}',
+                     decode(repeat('39',32),'hex'),'{}',decode(repeat('40',32),'hex'),
+                     gen_random_uuid(),$3,clock_timestamp())",
+            &[&Uuid::now_v7(), &project, &actor_one],
+        )
+        .await
+        .expect_err("unknown event envelope versions must be rejected");
+
+    client
+        .execute(
             "UPDATE attempts SET fencing_token=2 WHERE id=$1",
             &[&attempt],
         )
@@ -510,6 +749,26 @@ async fn exercise_negative_contracts(client: &mut Client) -> Result<()> {
         )
         .await
         .expect_err("outbox messages cannot bind an event from another project");
+
+    let inbox_message = Uuid::now_v7();
+    client
+        .execute(
+            "INSERT INTO inbox_messages
+             (consumer, message_id, project_id, payload_digest, applied_at, result_digest)
+             VALUES ('migration-fixture', $1, $2,
+                     decode(repeat('11', 32), 'hex'), clock_timestamp(),
+                     decode(repeat('22', 32), 'hex'))",
+            &[&inbox_message, &project],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE inbox_messages SET result_digest=decode(repeat('33', 32), 'hex')
+             WHERE consumer='migration-fixture' AND message_id=$1",
+            &[&inbox_message],
+        )
+        .await
+        .expect_err("inbox dedupe facts must be immutable");
 
     client
         .execute(

@@ -142,6 +142,7 @@ pub use crate::state::invocation::{
 };
 pub use crate::state::lease::{LeaseCommand, LeaseCommandKind};
 pub use crate::state::policy::{PolicyRevisionCommand, PolicyRevisionCommandKind};
+pub use crate::state::run_claim::{RunClaimCommand, RunClaimCommandKind};
 pub use crate::state::run_signal::{RunSignalCommand, RunSignalCommandKind};
 pub use crate::state::session::{SessionCapsuleCommand, SessionCapsuleCommandKind};
 pub use crate::state::submission::{SubmissionCommand, SubmissionCommandKind};

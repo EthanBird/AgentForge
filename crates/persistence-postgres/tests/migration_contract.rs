@@ -10,6 +10,7 @@ fn migration_manifest_and_repository_files_match() {
         "migrations/0001_m1_core.sql",
         "migrations/0002_m1_invocation_governance.sql",
         "migrations/0003_m1_events_projections.sql",
+        "migrations/0004_m1_uow.sql",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     for (migration, relative_path) in MIGRATIONS.iter().zip(expected) {

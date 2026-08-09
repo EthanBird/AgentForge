@@ -89,6 +89,10 @@ pub struct EventRecord {
     pub aggregate_seq: u64,
     pub event_type: String,
     pub schema_version: u16,
+    /// Digest/envelope protocol version, distinct from the domain event's
+    /// payload schema version. Persistence must retain it so legacy v1 bytes
+    /// are never interpreted as current JCS v2 evidence.
+    pub envelope_version: u16,
     pub actor_id: ActorId,
     pub correlation_id: CorrelationId,
     pub causation_id: Option<EventId>,
@@ -129,6 +133,7 @@ impl EventRecord {
             aggregate_seq: envelope.aggregate_seq,
             event_type: envelope.event_type.clone(),
             schema_version: envelope.schema_version,
+            envelope_version: envelope.envelope_version,
             actor_id: envelope.actor_id,
             correlation_id: envelope.correlation_id,
             causation_id: envelope.causation_id,
@@ -139,11 +144,6 @@ impl EventRecord {
                 .map_err(|_| PortError::Serialization)?,
             optional_metadata: envelope.optional_metadata.clone(),
         })
-    }
-
-    #[must_use]
-    pub const fn cursor(&self) -> ProjectionCursor {
-        ProjectionCursor::new(self.occurred_at, self.event_id, self.aggregate_seq)
     }
 }
 

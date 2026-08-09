@@ -13,6 +13,8 @@
 6. 每个里程碑开始前，从[首批工单](development/09_MILESTONES_AND_WORK_PACKAGES.md)领取任务，并按[测试计划](development/08_TEST_AND_VALIDATION_PLAN.md)执行门禁。
 7. 当前实现状态、M0 验收证据与后续边界见 [M0 进度报告](development/M0_PROGRESS_REPORT.md)。
 8. M1 当前开发范围、提交检查点和 Paperclip 控制面改造见 [M1 进度报告](development/M1_PROGRESS_REPORT.md)。
+9. M1 合入 `main` 后的生产化纵切、并行任务与远端检查点见
+   [M1 生产化进度报告](development/M1_PRODUCTION_PROGRESS_REPORT.md)。
 
 ## 文档权威级别
 

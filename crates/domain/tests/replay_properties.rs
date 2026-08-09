@@ -6,6 +6,9 @@ use agentforge_domain::{
             GrantLease, Lease, LeaseCommand, LeaseEvent, LeaseProof, LeaseState,
             authorize_attempt_write,
         },
+        run_claim::{
+            GrantRunClaim, RunClaim, RunClaimCommand, RunClaimEvent, VerifiedRunClaimHistory,
+        },
         submission::{
             AcceptanceFacts, CompletedStage, CriterionOutcome, Submission, SubmissionCommand,
             SubmissionEvent, SubmissionRecord, SubmissionState,
@@ -46,7 +49,7 @@ fn package_seed(max_attempts: u16) -> NewWorkPackage {
 }
 
 #[test]
-fn replay_matches_online_apply_for_all_four_aggregates() {
+fn replay_matches_online_apply_for_all_five_aggregates() {
     let seed = package_seed(3);
     let mut package = WorkPackage::new(seed.clone()).expect("package");
     let mut package_events = Vec::new();
@@ -197,6 +200,43 @@ fn replay_matches_online_apply_for_all_four_aggregates() {
     assert_eq!(
         Lease::replay(&lease_events).expect("lease replay"),
         released.aggregate
+    );
+
+    let granted_claim = RunClaim::grant_initial(GrantRunClaim {
+        id: id(21),
+        run_id: id(22),
+        previous_generation: None,
+        predecessor_claim_id: None,
+        takeover_authorization: None,
+        claim_generation: RunClaimToken::new(1).expect("generation"),
+        holder_node_id: id(12),
+        granted_at: at(0),
+        expires_at: at(10),
+    })
+    .expect("grant run claim");
+    let mut claim_events: Vec<RunClaimEvent> = granted_claim.events;
+    let renewed_claim = granted_claim
+        .aggregate
+        .execute(&RunClaimCommand::Renew {
+            expected_version: granted_claim.aggregate.version(),
+            proof: granted_claim.aggregate.proof(),
+            now: at(5),
+            new_expires_at: at(20),
+        })
+        .expect("renew run claim");
+    claim_events.extend(renewed_claim.events);
+    let expired_claim = renewed_claim
+        .aggregate
+        .execute(&RunClaimCommand::Expire {
+            expected_version: renewed_claim.aggregate.version(),
+            expired_at: at(20),
+        })
+        .expect("expire run claim");
+    claim_events.extend(expired_claim.events);
+    let history = VerifiedRunClaimHistory::replay(&[claim_events]).expect("run claim replay");
+    assert_eq!(
+        history.get(expired_claim.aggregate.id()),
+        Some(&expired_claim.aggregate)
     );
 
     let head = oid(30);
