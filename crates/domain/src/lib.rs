@@ -14,7 +14,11 @@ pub use command::{
     CommandMetadata, CommandReceipt, IdempotencyScope, ReceiptDecision, check_receipt,
 };
 pub use error::{DomainError, PublicError};
-pub use event::{AggregateId, AggregateType, DomainEventEnvelope, EventEnvelope};
+pub use event::{
+    AggregateId, AggregateType, DomainEventEnvelope, EVENT_ENVELOPE_VERSION, EventContext,
+    EventEnvelope, InvocationRunEvent, InvocationRunEventV1, LEGACY_EVENT_ENVELOPE_VERSION,
+    RunClaimEvent, UpcastInvocationRunEventV1,
+};
 pub use ids::*;
 pub use state::{
     Attempt, BudgetReservation, Decision, GovernanceCase, InvocationIntent, InvocationRun, Lease,
