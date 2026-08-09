@@ -1,4 +1,6 @@
-//! Composition root and command-line adapters.
+//! Composition root, HTTP query adapters, and the thin Control Room.
+
+pub mod ui;
 
 /// Package name used by smoke tests.
 pub const CRATE_NAME: &str = "agentforge-control-plane";

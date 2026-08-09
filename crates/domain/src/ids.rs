@@ -85,6 +85,20 @@ id_type!(
     EventId,
     CommandId,
     CorrelationId,
+    RunSignalId,
+    InvocationIntentId,
+    InvocationRunId,
+    RunClaimId,
+    SessionCapsuleId,
+    BudgetReservationId,
+    GovernanceCaseId,
+    GovernanceExecutionClaimId,
+    DecisionId,
+    PolicyId,
+    PolicyRevisionId,
+    BossSessionId,
+    BudgetAccountId,
+    ExecutionReceiptId,
 );
 
 /// A stable AFWP/Submission key. It is not an internal aggregate identifier.
@@ -283,6 +297,118 @@ impl FencingToken {
             })
     }
 }
+
+/// A generation token for a scheduler-owned invocation claim.
+///
+/// This is intentionally not a [`FencingToken`]: a run claim serializes one
+/// invocation start, while a task lease authorizes writes to an Attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RunClaimToken(NonZeroU64);
+
+impl RunClaimToken {
+    pub fn new(value: u64) -> Result<Self, DomainError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or_else(|| DomainError::InvalidArgument {
+                field: "run_claim_token".into(),
+                reason: "must be non-zero".into(),
+            })
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub fn checked_next(self) -> Result<Self, DomainError> {
+        self.get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+            .ok_or(DomainError::InvariantViolation {
+                invariant: "run_claim_token_must_not_overflow",
+            })
+    }
+}
+
+/// Generation of the scheduler's short-lived claim on an intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IntentClaimToken(NonZeroU64);
+
+impl IntentClaimToken {
+    pub fn new(value: u64) -> Result<Self, DomainError> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or_else(|| DomainError::InvalidArgument {
+                field: "intent_claim_token".into(),
+                reason: "must be non-zero".into(),
+            })
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+
+    pub fn checked_next(self) -> Result<Self, DomainError> {
+        self.get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+            .ok_or(DomainError::InvariantViolation {
+                invariant: "intent_claim_token_must_not_overflow",
+            })
+    }
+}
+
+macro_rules! non_zero_counter {
+    ($name:ident, $field:literal, $invariant:literal) => {
+        #[derive(
+            Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(NonZeroU64);
+
+        impl $name {
+            pub fn new(value: u64) -> Result<Self, DomainError> {
+                NonZeroU64::new(value)
+                    .map(Self)
+                    .ok_or_else(|| DomainError::InvalidArgument {
+                        field: $field.into(),
+                        reason: "must be non-zero".into(),
+                    })
+            }
+
+            #[must_use]
+            pub const fn get(self) -> u64 {
+                self.0.get()
+            }
+
+            pub fn checked_next(self) -> Result<Self, DomainError> {
+                self.get()
+                    .checked_add(1)
+                    .and_then(NonZeroU64::new)
+                    .map(Self)
+                    .ok_or(DomainError::InvariantViolation {
+                        invariant: $invariant,
+                    })
+            }
+        }
+    };
+}
+
+non_zero_counter!(
+    SessionCapsuleRevision,
+    "session_capsule_revision",
+    "session_capsule_revision_must_not_overflow"
+);
+non_zero_counter!(
+    PolicyRevisionNumber,
+    "policy_revision_number",
+    "policy_revision_number_must_not_overflow"
+);
 
 /// SHA-256 value serialized in the protocol form `sha256:<hex-lower>`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]

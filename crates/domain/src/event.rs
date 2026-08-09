@@ -8,8 +8,9 @@ use serde_json::Value;
 use crate::{
     error::DomainError,
     ids::{
-        ActorId, AggregateVersion, AttemptId, CorrelationId, EventId, LeaseId, PackageId,
-        ServerInstant, Sha256Digest, SubmissionId,
+        ActorId, AggregateVersion, AttemptId, BudgetReservationId, CorrelationId, DecisionId,
+        EventId, GovernanceCaseId, InvocationIntentId, InvocationRunId, LeaseId, PackageId,
+        PolicyRevisionId, RunSignalId, ServerInstant, SessionCapsuleId, Sha256Digest, SubmissionId,
     },
 };
 
@@ -22,6 +23,14 @@ pub enum AggregateType {
     Attempt,
     Lease,
     Submission,
+    RunSignal,
+    InvocationIntent,
+    InvocationRun,
+    SessionCapsule,
+    BudgetReservation,
+    GovernanceCase,
+    Decision,
+    PolicyRevision,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -31,6 +40,14 @@ pub enum AggregateId {
     Attempt(AttemptId),
     Lease(LeaseId),
     Submission(SubmissionId),
+    RunSignal(RunSignalId),
+    InvocationIntent(InvocationIntentId),
+    InvocationRun(InvocationRunId),
+    SessionCapsule(SessionCapsuleId),
+    BudgetReservation(BudgetReservationId),
+    GovernanceCase(GovernanceCaseId),
+    Decision(DecisionId),
+    PolicyRevision(PolicyRevisionId),
 }
 
 impl AggregateId {
@@ -41,6 +58,14 @@ impl AggregateId {
             Self::Attempt(_) => AggregateType::Attempt,
             Self::Lease(_) => AggregateType::Lease,
             Self::Submission(_) => AggregateType::Submission,
+            Self::RunSignal(_) => AggregateType::RunSignal,
+            Self::InvocationIntent(_) => AggregateType::InvocationIntent,
+            Self::InvocationRun(_) => AggregateType::InvocationRun,
+            Self::SessionCapsule(_) => AggregateType::SessionCapsule,
+            Self::BudgetReservation(_) => AggregateType::BudgetReservation,
+            Self::GovernanceCase(_) => AggregateType::GovernanceCase,
+            Self::Decision(_) => AggregateType::Decision,
+            Self::PolicyRevision(_) => AggregateType::PolicyRevision,
         }
     }
 }
@@ -225,7 +250,13 @@ fn is_reserved_key(key: &str) -> bool {
 }
 
 pub use crate::state::attempt::AttemptEvent;
+pub use crate::state::budget::BudgetReservationEvent;
+pub use crate::state::governance::{DecisionEvent, GovernanceCaseEvent};
+pub use crate::state::invocation::{InvocationIntentEvent, InvocationRunEvent};
 pub use crate::state::lease::LeaseEvent;
+pub use crate::state::policy::PolicyRevisionEvent;
+pub use crate::state::run_signal::RunSignalEvent;
+pub use crate::state::session::SessionCapsuleEvent;
 pub use crate::state::submission::SubmissionEvent;
 pub use crate::state::work_package::WorkPackageEvent;
 

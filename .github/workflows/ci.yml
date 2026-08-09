@@ -31,3 +31,32 @@ jobs:
         run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --locked
+
+  postgres-migrations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+        env:
+          POSTGRES_DB: agentforge
+          POSTGRES_USER: agentforge
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentforge -d agentforge"
+          --health-interval 1s
+          --health-timeout 2s
+          --health-retries 60
+    env:
+      AGENTFORGE_TEST_DATABASE_URL: host=127.0.0.1 port=5432 user=agentforge dbname=agentforge
+      AGENTFORGE_TEST_ALLOW_SCHEMA_DROP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Apply migrations twice and inspect constraints
+        run: >-
+          cargo test --locked -p agentforge-storage-postgres
+          --test postgres_migration -- --nocapture

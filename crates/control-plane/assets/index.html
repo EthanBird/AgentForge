@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="dark light">
+    <meta name="theme-color" content="#0b1020">
+    <title>AgentForge Control Room</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">跳到主要内容</a>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand" aria-label="AgentForge Control Room">
+          <span class="brand-mark" aria-hidden="true">AF</span>
+          <span>
+            <strong>AgentForge</strong>
+            <small>Control Room</small>
+          </span>
+        </div>
+        <label class="project-field">
+          <span>项目</span>
+          <input id="project-id" autocomplete="off" spellcheck="false" placeholder="Project UUID">
+        </label>
+        <div class="topbar-actions">
+          <button id="refresh" class="icon-button" type="button" aria-label="刷新控制室">↻</button>
+          <span id="connection" class="connection" data-state="connecting">
+            <i aria-hidden="true"></i><span>连接中</span>
+          </span>
+        </div>
+      </header>
+
+      <aside class="sidebar" aria-label="主要导航">
+        <nav id="primary-nav">
+          <button class="nav-item is-active" data-view="mission" type="button" aria-label="项目总控台">
+            <span aria-hidden="true">⌂</span><span>总控台</span>
+          </button>
+          <button class="nav-item" data-view="work" type="button" aria-label="任务图">
+            <span aria-hidden="true">◇</span><span>任务图</span>
+          </button>
+          <button class="nav-item" data-view="decide" type="button" aria-label="待决策">
+            <span aria-hidden="true">✓</span><span>待决策</span><b id="nav-decision-count">0</b>
+          </button>
+          <button class="nav-item" data-view="runs" type="button" aria-label="Invocation Runs">
+            <span aria-hidden="true">▶</span><span>运行</span>
+          </button>
+          <button class="nav-item" data-view="fleet" type="button" aria-label="Agent 舰队">
+            <span aria-hidden="true">⌘</span><span>Agent 舰队</span>
+          </button>
+          <button class="nav-item" data-view="lineage" type="button" aria-label="证据链">
+            <span aria-hidden="true">↳</span><span>证据链</span>
+          </button>
+          <button class="nav-item" data-view="activity" type="button" aria-label="活动审计">
+            <span aria-hidden="true">≋</span><span>活动审计</span>
+          </button>
+        </nav>
+        <div class="sidebar-foot">
+          <span>事实源</span>
+          <strong>Projection API</strong>
+          <small id="projection-version">尚未同步</small>
+        </div>
+      </aside>
+
+      <main id="workspace" class="workspace" tabindex="-1">
+        <section class="page-heading">
+          <div>
+            <p class="eyebrow">MISSION CONTROL</p>
+            <h1 id="view-title">项目总控台</h1>
+            <p id="view-subtitle">所有数字均来自可重建投影，不采用 Agent 自报状态。</p>
+          </div>
+          <div class="heading-actions">
+            <button id="open-command" class="secondary-button" type="button">安全操作</button>
+          </div>
+        </section>
+
+        <section id="projection-health" class="projection-health" data-state="empty" aria-label="投影健康状态" role="status">
+          <strong id="projection-health-label">尚未同步</strong>
+          <time id="projection-as-of">as_of —</time>
+          <span id="projection-staleness">staleness —</span>
+          <span id="projection-degraded">degraded_reason —</span>
+        </section>
+
+        <div id="notice" class="notice" role="status" hidden></div>
+        <nav id="more-switcher" class="more-switcher" aria-label="更多视图" hidden>
+          <button class="text-button" data-view="fleet" type="button">舰队</button>
+          <button class="text-button" data-view="lineage" type="button">证据链</button>
+          <button class="text-button" data-view="activity" type="button">活动</button>
+        </nav>
+
+        <section id="mission-view" class="view is-active" data-view-panel="mission">
+          <div id="metric-grid" class="metric-grid" aria-label="项目关键指标"></div>
+          <div class="dashboard-grid">
+            <article class="panel panel-wide">
+              <header class="panel-header">
+                <div><p class="eyebrow">CRITICAL PATH</p><h2>工作脉冲</h2></div>
+                <button class="text-button" data-go="work" type="button">查看任务图</button>
+              </header>
+              <div id="package-list" class="stack-list"></div>
+            </article>
+
+            <article class="panel panel-decision">
+              <header class="panel-header">
+                <div><p class="eyebrow">WHY NOW</p><h2>待决策</h2></div>
+                <button class="text-button" data-go="decide" type="button">全部</button>
+              </header>
+              <div id="decision-preview" class="stack-list"></div>
+            </article>
+
+            <article class="panel">
+              <header class="panel-header">
+                <div><p class="eyebrow">INVOCATIONS</p><h2>实时运行</h2></div>
+                <button class="text-button" data-go="runs" type="button">详情</button>
+              </header>
+              <div id="run-preview" class="stack-list"></div>
+            </article>
+
+            <article class="panel">
+              <header class="panel-header">
+                <div><p class="eyebrow">NEXT DRIVER</p><h2>推进路径</h2></div>
+              </header>
+              <div id="action-paths" class="stack-list"></div>
+            </article>
+
+            <article class="panel">
+              <header class="panel-header">
+                <div><p class="eyebrow">RESERVED / ACTUAL</p><h2>预算</h2></div>
+              </header>
+              <div id="budget-summary" class="budget-summary"></div>
+            </article>
+
+            <article class="panel">
+              <header class="panel-header">
+                <div><p class="eyebrow">CAPABILITY ROUTING</p><h2>舰队状态</h2></div>
+                <button class="text-button" data-go="fleet" type="button">全部</button>
+              </header>
+              <div id="fleet-preview" class="stack-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" data-view-panel="work">
+          <article class="panel full-panel"><div id="work-table"></div></article>
+        </section>
+        <section class="view" data-view-panel="decide">
+          <div class="split-layout">
+            <article class="panel"><div id="decision-list" class="stack-list"></div></article>
+            <aside id="decision-inspector" class="panel inspector" aria-label="决策影响预览"></aside>
+          </div>
+        </section>
+        <section class="view" data-view-panel="runs">
+          <article class="panel full-panel"><div id="run-table"></div></article>
+        </section>
+        <section class="view" data-view-panel="fleet">
+          <article class="panel full-panel"><div id="fleet-table"></div></article>
+        </section>
+        <section class="view" data-view-panel="lineage">
+          <article class="panel full-panel"><div id="lineage-list"></div></article>
+        </section>
+        <section class="view" data-view-panel="activity">
+          <article class="panel full-panel"><div id="activity-list"></div></article>
+        </section>
+      </main>
+
+      <nav class="mobile-nav" aria-label="手机导航">
+        <button class="is-active" data-view="mission" type="button"><span>⌂</span>总览</button>
+        <button data-view="work" type="button"><span>◇</span>任务</button>
+        <button class="decide-action" data-view="decide" type="button"><span>✓</span>决策</button>
+        <button data-view="runs" type="button"><span>▶</span>运行</button>
+        <button data-view="fleet" type="button"><span>⌘</span>更多</button>
+      </nav>
+    </div>
+
+    <dialog id="command-dialog">
+      <form method="dialog">
+        <header><div><p class="eyebrow">TYPED COMMANDS</p><h2>安全操作</h2></div><button value="cancel" aria-label="关闭">×</button></header>
+        <p>暂停、撤销 Lease、取消 Run 与隔离节点具有不同语义。请选择精确命令，并在服务端影响预览后确认。</p>
+        <div class="command-list">
+          <button value="cancel" disabled>暂停项目调度 <small>即将接入</small></button>
+          <button value="cancel" disabled>取消 InvocationRun <small>即将接入</small></button>
+          <button value="cancel" disabled>隔离 Executor / Node <small>即将接入</small></button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

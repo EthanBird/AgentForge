@@ -3,12 +3,24 @@
 use serde::{Deserialize, Serialize};
 
 pub mod attempt;
+pub mod budget;
+pub mod governance;
+pub mod invocation;
 pub mod lease;
+pub mod policy;
+pub mod run_signal;
+pub mod session;
 pub mod submission;
 pub mod work_package;
 
 pub use attempt::Attempt;
+pub use budget::BudgetReservation;
+pub use governance::{Decision, GovernanceCase};
+pub use invocation::{InvocationIntent, InvocationRun};
 pub use lease::Lease;
+pub use policy::PolicyRevision;
+pub use run_signal::RunSignal;
+pub use session::SessionCapsule;
 pub use submission::Submission;
 pub use work_package::WorkPackage;
 
