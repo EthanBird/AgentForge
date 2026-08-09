@@ -38,6 +38,52 @@ pub enum DomainError {
     InvariantViolation { invariant: &'static str },
     #[error("idempotency key was reused with a different payload")]
     IdempotencyKeyReused,
+    #[error("signal binding is stale")]
+    SignalStale,
+    #[error("signals cannot be coalesced")]
+    SignalNotCoalescible,
+    #[error("invocation intent is not dispatchable")]
+    IntentNotDispatchable,
+    #[error("invocation run claim is stale")]
+    InvocationClaimStale,
+    #[error("invocation outcome is unknown")]
+    InvocationOutcomeUnknown,
+    #[error("invocation run is terminal")]
+    InvocationRunTerminal,
+    #[error("invocation binding does not match")]
+    InvocationBindingMismatch,
+    #[error("session capsule binding does not match")]
+    CapsuleBindingMismatch,
+    #[error("budget reservation failed")]
+    BudgetReservationFailed,
+    #[error("budget reservation is stale")]
+    BudgetReservationStale,
+    #[error("adapter capability is missing")]
+    AdapterCapabilityMissing,
+    #[error("governance case is stale")]
+    GovernanceCaseStale,
+    #[error("governance action binding is stale")]
+    GovernanceActionStale,
+    #[error("governance decision has expired")]
+    GovernanceDecisionExpired,
+    #[error("governance quorum is unmet")]
+    GovernanceQuorumUnmet,
+    #[error("governance self approval is forbidden")]
+    GovernanceSelfApprovalForbidden,
+    #[error("governance execution claim is stale")]
+    GovernanceExecutionClaimStale,
+    #[error("governance execution outcome is unknown")]
+    GovernanceOutcomeUnknown,
+    #[error("policy revision is stale")]
+    PolicyRevisionStale,
+    #[error("projection is rebuilding")]
+    ProjectionRebuilding,
+    #[error("cursor is invalid")]
+    CursorInvalid,
+    #[error("cursor has expired")]
+    CursorExpired,
+    #[error("operator note is not executable")]
+    NoteNotExecutable,
 
     // The remaining variants are the complete AFWP/1.0 public error taxonomy.
     #[error("schema is invalid")]
@@ -105,6 +151,29 @@ impl DomainError {
             Self::SubmissionNotAcceptable { .. } => "AF_SUBMISSION_NOT_ACCEPTABLE",
             Self::InvariantViolation { .. } => "AF_INVARIANT_VIOLATION",
             Self::IdempotencyKeyReused => "AF_IDEMPOTENCY_KEY_REUSED",
+            Self::SignalStale => "AF_SIGNAL_STALE",
+            Self::SignalNotCoalescible => "AF_SIGNAL_NOT_COALESCIBLE",
+            Self::IntentNotDispatchable => "AF_INTENT_NOT_DISPATCHABLE",
+            Self::InvocationClaimStale => "AF_INVOCATION_CLAIM_STALE",
+            Self::InvocationOutcomeUnknown => "AF_INVOCATION_OUTCOME_UNKNOWN",
+            Self::InvocationRunTerminal => "AF_INVOCATION_RUN_TERMINAL",
+            Self::InvocationBindingMismatch => "AF_INVOCATION_BINDING_MISMATCH",
+            Self::CapsuleBindingMismatch => "AF_CAPSULE_BINDING_MISMATCH",
+            Self::BudgetReservationFailed => "AF_BUDGET_RESERVATION_FAILED",
+            Self::BudgetReservationStale => "AF_BUDGET_RESERVATION_STALE",
+            Self::AdapterCapabilityMissing => "AF_ADAPTER_CAPABILITY_MISSING",
+            Self::GovernanceCaseStale => "AF_GOVERNANCE_CASE_STALE",
+            Self::GovernanceActionStale => "AF_GOVERNANCE_ACTION_STALE",
+            Self::GovernanceDecisionExpired => "AF_GOVERNANCE_DECISION_EXPIRED",
+            Self::GovernanceQuorumUnmet => "AF_GOVERNANCE_QUORUM_UNMET",
+            Self::GovernanceSelfApprovalForbidden => "AF_GOVERNANCE_SELF_APPROVAL_FORBIDDEN",
+            Self::GovernanceExecutionClaimStale => "AF_GOVERNANCE_EXECUTION_CLAIM_STALE",
+            Self::GovernanceOutcomeUnknown => "AF_GOVERNANCE_OUTCOME_UNKNOWN",
+            Self::PolicyRevisionStale => "AF_POLICY_REVISION_STALE",
+            Self::ProjectionRebuilding => "AF_PROJECTION_REBUILDING",
+            Self::CursorInvalid => "AF_CURSOR_INVALID",
+            Self::CursorExpired => "AF_CURSOR_EXPIRED",
+            Self::NoteNotExecutable => "AF_NOTE_NOT_EXECUTABLE",
             Self::SchemaInvalid => "AF_SCHEMA_INVALID",
             Self::SchemaVersionUnsupported => "AF_SCHEMA_VERSION_UNSUPPORTED",
             Self::RevisionConflict => "AF_REVISION_CONFLICT",
@@ -140,6 +209,7 @@ impl DomainError {
                 | Self::DependencyUnavailable
                 | Self::CandidateArtifactNotComplete
                 | Self::TargetMoved
+                | Self::ProjectionRebuilding
                 | Self::RateLimited
                 | Self::Internal
         )
@@ -198,6 +268,29 @@ impl DomainError {
             Self::SubmissionNotAcceptable { .. } => "the submission is not acceptable",
             Self::InvariantViolation { .. } => "a domain invariant was violated",
             Self::IdempotencyKeyReused => "the idempotency key was reused with a different payload",
+            Self::SignalStale => "the signal binding is stale",
+            Self::SignalNotCoalescible => "the signals cannot be coalesced",
+            Self::IntentNotDispatchable => "the invocation intent is not dispatchable",
+            Self::InvocationClaimStale => "the invocation run claim is stale",
+            Self::InvocationOutcomeUnknown => "the invocation outcome must be reconciled",
+            Self::InvocationRunTerminal => "the invocation run is terminal",
+            Self::InvocationBindingMismatch => "the invocation binding does not match",
+            Self::CapsuleBindingMismatch => "the session capsule binding does not match",
+            Self::BudgetReservationFailed => "the budget reservation could not be created",
+            Self::BudgetReservationStale => "the budget reservation is stale",
+            Self::AdapterCapabilityMissing => "the adapter lacks a required capability",
+            Self::GovernanceCaseStale => "the governance case is stale",
+            Self::GovernanceActionStale => "the governance action binding is stale",
+            Self::GovernanceDecisionExpired => "the governance decision has expired",
+            Self::GovernanceQuorumUnmet => "the governance quorum is unmet",
+            Self::GovernanceSelfApprovalForbidden => "self approval is forbidden",
+            Self::GovernanceExecutionClaimStale => "the governance execution claim is stale",
+            Self::GovernanceOutcomeUnknown => "the governance outcome must be reconciled",
+            Self::PolicyRevisionStale => "the policy revision is stale",
+            Self::ProjectionRebuilding => "the projection is rebuilding",
+            Self::CursorInvalid => "the cursor is invalid",
+            Self::CursorExpired => "the cursor has expired",
+            Self::NoteNotExecutable => "an operator note is not executable",
             Self::SchemaInvalid => "the schema is invalid",
             Self::SchemaVersionUnsupported => "the schema version is unsupported",
             Self::RevisionConflict => "the package revision conflicts",
@@ -304,6 +397,29 @@ mod tests {
             },
             DomainError::InvariantViolation { invariant: "test" },
             DomainError::IdempotencyKeyReused,
+            DomainError::SignalStale,
+            DomainError::SignalNotCoalescible,
+            DomainError::IntentNotDispatchable,
+            DomainError::InvocationClaimStale,
+            DomainError::InvocationOutcomeUnknown,
+            DomainError::InvocationRunTerminal,
+            DomainError::InvocationBindingMismatch,
+            DomainError::CapsuleBindingMismatch,
+            DomainError::BudgetReservationFailed,
+            DomainError::BudgetReservationStale,
+            DomainError::AdapterCapabilityMissing,
+            DomainError::GovernanceCaseStale,
+            DomainError::GovernanceActionStale,
+            DomainError::GovernanceDecisionExpired,
+            DomainError::GovernanceQuorumUnmet,
+            DomainError::GovernanceSelfApprovalForbidden,
+            DomainError::GovernanceExecutionClaimStale,
+            DomainError::GovernanceOutcomeUnknown,
+            DomainError::PolicyRevisionStale,
+            DomainError::ProjectionRebuilding,
+            DomainError::CursorInvalid,
+            DomainError::CursorExpired,
+            DomainError::NoteNotExecutable,
             DomainError::SchemaInvalid,
             DomainError::SchemaVersionUnsupported,
             DomainError::RevisionConflict,

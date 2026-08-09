@@ -17,7 +17,9 @@ pub use error::{DomainError, PublicError};
 pub use event::{AggregateId, AggregateType, DomainEventEnvelope, EventEnvelope};
 pub use ids::*;
 pub use state::{
-    Attempt, Lease, Submission, Transition, WorkPackage, attempt, lease, submission, work_package,
+    Attempt, BudgetReservation, Decision, GovernanceCase, InvocationIntent, InvocationRun, Lease,
+    PolicyRevision, RunSignal, SessionCapsule, Submission, Transition, WorkPackage, attempt,
+    budget, governance, invocation, lease, policy, run_signal, session, submission, work_package,
 };
 
 /// Package name used by dependency-boundary tests.

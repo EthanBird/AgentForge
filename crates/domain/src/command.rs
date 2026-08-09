@@ -132,7 +132,18 @@ pub fn check_receipt<'a, R>(
 // Aggregate commands are defined next to the states they mutate and re-exported
 // here to provide a single discoverable command surface.
 pub use crate::state::attempt::{AttemptCommand, AttemptCommandKind};
+pub use crate::state::budget::{BudgetReservationCommand, BudgetReservationCommandKind};
+pub use crate::state::governance::{
+    DecisionCommand, DecisionCommandKind, GovernanceCaseCommand, GovernanceCaseCommandKind,
+};
+pub use crate::state::invocation::{
+    InvocationIntentCommand, InvocationIntentCommandKind, InvocationRunCommand,
+    InvocationRunCommandKind,
+};
 pub use crate::state::lease::{LeaseCommand, LeaseCommandKind};
+pub use crate::state::policy::{PolicyRevisionCommand, PolicyRevisionCommandKind};
+pub use crate::state::run_signal::{RunSignalCommand, RunSignalCommandKind};
+pub use crate::state::session::{SessionCapsuleCommand, SessionCapsuleCommandKind};
 pub use crate::state::submission::{SubmissionCommand, SubmissionCommandKind};
 pub use crate::state::work_package::{WorkPackageCommand, WorkPackageCommandKind};
 
