@@ -1,5 +1,7 @@
 //! Composition root, HTTP query adapters, and the thin Control Room.
 
+pub mod access;
+pub mod control_room;
 pub mod ui;
 
 /// Package name used by smoke tests.

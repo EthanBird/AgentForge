@@ -27,8 +27,8 @@ async fn main() -> Result<()> {
         &std::env::var("AGENTFORGE_LOCAL_PROJECT_IDS")
             .context("AGENTFORGE_LOCAL_PROJECT_IDS must contain comma-separated Project UUIDs")?,
     )?;
-    let state =
-        ControlPlaneState::for_projects(CursorCodec::from_hex(&cursor_key)?, allowed_projects)?;
+    let (state, _local_store) =
+        ControlPlaneState::local_reference(CursorCodec::from_hex(&cursor_key)?, allowed_projects)?;
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .context("bind AgentForge control plane")?;
