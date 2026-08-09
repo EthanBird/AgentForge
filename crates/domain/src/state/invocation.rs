@@ -574,6 +574,26 @@ pub struct RunClaimProof {
     pub holder_node_id: NodeId,
 }
 
+impl RunClaimProof {
+    fn validate_shape(self) -> Result<(), DomainError> {
+        if self.claim_id.as_uuid().is_nil() || self.holder_node_id.as_uuid().is_nil() {
+            return Err(DomainError::InvocationClaimStale);
+        }
+        Ok(())
+    }
+}
+
+/// Authorization for a non-governance cancellation.
+///
+/// A dedicated wrapper keeps cancellation authorization explicit in commands
+/// and durable events. Governance-authorized cancellation can be added as a
+/// separate variant once the aggregate can verify a governance execution
+/// claim; until then, a caller must hold the current invocation run claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CancellationAuthorization {
+    pub current_claim: RunClaimProof,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvocationStartMaterial {
     pub intent_id: InvocationIntentId,
@@ -795,6 +815,7 @@ pub enum InvocationRunCommand {
     },
     Fail {
         expected_version: AggregateVersion,
+        proof: RunClaimProof,
         reason_code: String,
         evidence_digest: Sha256Digest,
         budget_settled: bool,
@@ -802,6 +823,7 @@ pub enum InvocationRunCommand {
     },
     Cancel {
         expected_version: AggregateVersion,
+        authorization: CancellationAuthorization,
         reason_code: String,
         stop_or_reconciliation_obligation_created: bool,
         cancelled_at: ServerInstant,
@@ -874,12 +896,14 @@ pub enum InvocationRunEvent {
         completed_at: ServerInstant,
     },
     Failed {
+        proof: RunClaimProof,
         reason_code: String,
         evidence_digest: Sha256Digest,
         budget_settled: bool,
         failed_at: ServerInstant,
     },
     Cancelled {
+        authorization: CancellationAuthorization,
         reason_code: String,
         stop_or_reconciliation_obligation_created: bool,
         cancelled_at: ServerInstant,
@@ -1018,14 +1042,17 @@ impl InvocationRun {
                         ..
                     } => Err(DomainError::InvocationOutcomeUnknown),
                     InvocationRunCommand::Fail {
+                        proof,
                         reason_code,
                         evidence_digest,
                         budget_settled,
                         failed_at,
                         ..
                     } if valid_reason(reason_code) && *budget_settled => {
+                        run.authorize(*proof, *failed_at)?;
                         run.validate_time(*failed_at)?;
                         Ok(InvocationRunEvent::Failed {
+                            proof: *proof,
                             reason_code: reason_code.clone(),
                             evidence_digest: *evidence_digest,
                             budget_settled: *budget_settled,
@@ -1033,6 +1060,7 @@ impl InvocationRun {
                         })
                     }
                     InvocationRunCommand::Cancel {
+                        authorization,
                         reason_code,
                         stop_or_reconciliation_obligation_created,
                         cancelled_at,
@@ -1040,8 +1068,10 @@ impl InvocationRun {
                     } if valid_reason(reason_code)
                         && *stop_or_reconciliation_obligation_created =>
                     {
+                        run.authorize_cancellation(*authorization, *cancelled_at)?;
                         run.validate_time(*cancelled_at)?;
                         Ok(InvocationRunEvent::Cancelled {
+                            authorization: *authorization,
                             reason_code: reason_code.clone(),
                             stop_or_reconciliation_obligation_created:
                                 *stop_or_reconciliation_obligation_created,
@@ -1158,12 +1188,14 @@ impl InvocationRun {
             (
                 Some(run),
                 InvocationRunEvent::Failed {
+                    proof,
                     reason_code,
                     evidence_digest,
                     budget_settled,
                     failed_at,
                 },
             ) if valid_reason(reason_code) && *budget_settled && run.time_valid(*failed_at) => {
+                run.authorize(*proof, *failed_at)?;
                 let mut next = run.terminalize(InvocationRunState::Failed, *failed_at)?;
                 next.terminal_reason = Some(reason_code.clone());
                 next.terminal_evidence_digest = Some(*evidence_digest);
@@ -1172,6 +1204,7 @@ impl InvocationRun {
             (
                 Some(run),
                 InvocationRunEvent::Cancelled {
+                    authorization,
                     reason_code,
                     stop_or_reconciliation_obligation_created,
                     cancelled_at,
@@ -1180,6 +1213,7 @@ impl InvocationRun {
                 && *stop_or_reconciliation_obligation_created
                 && run.time_valid(*cancelled_at) =>
             {
+                run.authorize_cancellation(*authorization, *cancelled_at)?;
                 let mut next = run.terminalize(InvocationRunState::Cancelled, *cancelled_at)?;
                 next.terminal_reason = Some(reason_code.clone());
                 next.outcome = Some(InvocationOutcome::Cancelled);
@@ -1200,6 +1234,7 @@ impl InvocationRun {
     }
 
     fn authorize_identity(&self, proof: RunClaimProof) -> Result<(), DomainError> {
+        proof.validate_shape()?;
         if proof.claim_id != self.current_claim.id
             || proof.claim_generation != self.current_claim.claim_generation
             || proof.holder_node_id != self.current_claim.holder_node_id
@@ -1208,6 +1243,14 @@ impl InvocationRun {
             return Err(DomainError::InvocationClaimStale);
         }
         Ok(())
+    }
+
+    fn authorize_cancellation(
+        &self,
+        authorization: CancellationAuthorization,
+        now: ServerInstant,
+    ) -> Result<(), DomainError> {
+        self.authorize(authorization.current_claim, now)
     }
 
     fn authorize(&self, proof: RunClaimProof, now: ServerInstant) -> Result<(), DomainError> {
@@ -1615,6 +1658,9 @@ mod tests {
             Some(&reserved.aggregate),
             &InvocationRunCommand::Cancel {
                 expected_version: reserved.aggregate.version,
+                authorization: CancellationAuthorization {
+                    current_claim: proof(),
+                },
                 reason_code: "operator_cancel".into(),
                 stop_or_reconciliation_obligation_created: true,
                 cancelled_at: at(1),
@@ -1627,6 +1673,7 @@ mod tests {
                 Some(&cancelled),
                 &InvocationRunCommand::Fail {
                     expected_version: AggregateVersion::new(1),
+                    proof: proof(),
                     reason_code: "late".into(),
                     evidence_digest: Sha256Digest::of_bytes(b"late"),
                     budget_settled: true,
@@ -1678,7 +1725,38 @@ mod tests {
         malicious_replay.push(completed_without_settlement);
         assert!(InvocationRun::replay(&malicious_replay).is_err());
 
+        let fail_with_stale_claim = InvocationRunCommand::Fail {
+            expected_version: running.version,
+            proof: wrong_claim,
+            reason_code: "adapter_failed".into(),
+            evidence_digest: Sha256Digest::of_bytes(b"evidence"),
+            budget_settled: true,
+            failed_at: at(3),
+        };
+        assert_eq!(
+            InvocationRun::decide(Some(&running), &fail_with_stale_claim),
+            Err(DomainError::InvocationClaimStale)
+        );
+        let failed_with_stale_claim = InvocationRunEvent::Failed {
+            proof: wrong_claim,
+            reason_code: "adapter_failed".into(),
+            evidence_digest: Sha256Digest::of_bytes(b"evidence"),
+            budget_settled: true,
+            failed_at: at(3),
+        };
+        assert_eq!(
+            InvocationRun::apply_event(Some(&running), &failed_with_stale_claim),
+            Err(DomainError::InvocationClaimStale)
+        );
+        let mut malicious_replay = prefix.clone();
+        malicious_replay.push(failed_with_stale_claim);
+        assert_eq!(
+            InvocationRun::replay(&malicious_replay),
+            Err(DomainError::InvocationClaimStale)
+        );
+
         let failed_without_settlement = InvocationRunEvent::Failed {
+            proof: proof(),
             reason_code: "adapter_failed".into(),
             evidence_digest: Sha256Digest::of_bytes(b"evidence"),
             budget_settled: false,
@@ -1689,7 +1767,41 @@ mod tests {
         malicious_replay.push(failed_without_settlement);
         assert!(InvocationRun::replay(&malicious_replay).is_err());
 
+        let stale_cancellation_authorization = CancellationAuthorization {
+            current_claim: wrong_claim,
+        };
+        let cancel_with_stale_claim = InvocationRunCommand::Cancel {
+            expected_version: running.version,
+            authorization: stale_cancellation_authorization,
+            reason_code: "operator_cancel".into(),
+            stop_or_reconciliation_obligation_created: true,
+            cancelled_at: at(3),
+        };
+        assert_eq!(
+            InvocationRun::decide(Some(&running), &cancel_with_stale_claim),
+            Err(DomainError::InvocationClaimStale)
+        );
+        let cancelled_with_stale_claim = InvocationRunEvent::Cancelled {
+            authorization: stale_cancellation_authorization,
+            reason_code: "operator_cancel".into(),
+            stop_or_reconciliation_obligation_created: true,
+            cancelled_at: at(3),
+        };
+        assert_eq!(
+            InvocationRun::apply_event(Some(&running), &cancelled_with_stale_claim),
+            Err(DomainError::InvocationClaimStale)
+        );
+        let mut malicious_replay = prefix.clone();
+        malicious_replay.push(cancelled_with_stale_claim);
+        assert_eq!(
+            InvocationRun::replay(&malicious_replay),
+            Err(DomainError::InvocationClaimStale)
+        );
+
         let cancelled_without_obligation = InvocationRunEvent::Cancelled {
+            authorization: CancellationAuthorization {
+                current_claim: proof(),
+            },
             reason_code: "operator_cancel".into(),
             stop_or_reconciliation_obligation_created: false,
             cancelled_at: at(3),

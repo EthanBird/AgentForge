@@ -590,7 +590,9 @@ pub struct GovernanceExecutionClaim {
 
 impl GovernanceExecutionClaim {
     fn validate(self, now: ServerInstant) -> Result<(), DomainError> {
-        if self.generation == 0
+        if self.id.as_uuid().is_nil()
+            || self.generation == 0
+            || self.holder_actor_id.as_uuid().is_nil()
             || self.issued_at > now
             || now >= self.expires_at
             || !digest_is_nonzero(self.token_hash)
@@ -637,9 +639,14 @@ impl ExecutionReceipt {
         {
             return Err(DomainError::GovernanceExecutionClaimStale);
         }
-        if self.observed_at < self.started_at
-            || (self.status == ExecutionReceiptStatus::Succeeded
-                && (self.external_effect_key.is_none() || self.evidence_refs.is_empty()))
+        if self.observed_at < self.started_at {
+            return Err(DomainError::EvidenceInvalid);
+        }
+        if self.status == ExecutionReceiptStatus::Succeeded
+            && (self.external_effect_key.is_none()
+                || !digest_is_nonzero(self.effect_digest)
+                || self.evidence_refs.is_empty()
+                || !self.evidence_refs.iter().all(artifact_ref_is_valid))
         {
             return Err(DomainError::EvidenceInvalid);
         }
@@ -732,6 +739,8 @@ pub enum GovernanceCaseCommand {
         observed_subject_version: AggregateVersion,
         observed_policy_revision_id: PolicyRevisionId,
         observed_action_digest: Sha256Digest,
+        observed_attempt_binding: Option<AttemptFencingBinding>,
+        observed_invocation_claim_generation: Option<u64>,
         execution_claim: Box<GovernanceExecutionClaim>,
         now: ServerInstant,
     },
@@ -817,6 +826,8 @@ pub enum GovernanceCaseEvent {
         observed_subject_version: AggregateVersion,
         observed_policy_revision_id: PolicyRevisionId,
         observed_action_digest: Sha256Digest,
+        observed_attempt_binding: Option<AttemptFencingBinding>,
+        observed_invocation_claim_generation: Option<u64>,
         started_at: ServerInstant,
     },
     ExecutionReceiptRecorded {
@@ -970,15 +981,21 @@ impl GovernanceCase {
                         observed_subject_version,
                         observed_policy_revision_id,
                         observed_action_digest,
+                        observed_attempt_binding,
+                        observed_invocation_claim_generation,
                         execution_claim,
                         now,
                         ..
                     } if case.state == GovernanceCaseState::QuorumReached => {
                         validate_execution_start(
                             case,
-                            *observed_subject_version,
-                            *observed_policy_revision_id,
-                            *observed_action_digest,
+                            ObservedExecutionBinding {
+                                subject_version: *observed_subject_version,
+                                policy_revision_id: *observed_policy_revision_id,
+                                action_digest: *observed_action_digest,
+                                attempt_binding: *observed_attempt_binding,
+                                invocation_claim_generation: *observed_invocation_claim_generation,
+                            },
                             **execution_claim,
                             *now,
                         )?;
@@ -987,6 +1004,9 @@ impl GovernanceCase {
                             observed_subject_version: *observed_subject_version,
                             observed_policy_revision_id: *observed_policy_revision_id,
                             observed_action_digest: *observed_action_digest,
+                            observed_attempt_binding: *observed_attempt_binding,
+                            observed_invocation_claim_generation:
+                                *observed_invocation_claim_generation,
                             started_at: *now,
                         })
                     }
@@ -1164,14 +1184,20 @@ impl GovernanceCase {
                     observed_subject_version,
                     observed_policy_revision_id,
                     observed_action_digest,
+                    observed_attempt_binding,
+                    observed_invocation_claim_generation,
                     started_at,
                 },
             ) if case.state == GovernanceCaseState::QuorumReached => {
                 validate_execution_start(
                     case,
-                    *observed_subject_version,
-                    *observed_policy_revision_id,
-                    *observed_action_digest,
+                    ObservedExecutionBinding {
+                        subject_version: *observed_subject_version,
+                        policy_revision_id: *observed_policy_revision_id,
+                        action_digest: *observed_action_digest,
+                        attempt_binding: *observed_attempt_binding,
+                        invocation_claim_generation: *observed_invocation_claim_generation,
+                    },
                     *execution_claim,
                     *started_at,
                 )?;
@@ -1319,20 +1345,29 @@ fn validate_accepted_decision(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ObservedExecutionBinding {
+    subject_version: AggregateVersion,
+    policy_revision_id: PolicyRevisionId,
+    action_digest: Sha256Digest,
+    attempt_binding: Option<AttemptFencingBinding>,
+    invocation_claim_generation: Option<u64>,
+}
+
 fn validate_execution_start(
     case: &GovernanceCase,
-    observed_subject_version: AggregateVersion,
-    observed_policy_revision_id: PolicyRevisionId,
-    observed_action_digest: Sha256Digest,
+    observed: ObservedExecutionBinding,
     execution_claim: GovernanceExecutionClaim,
     started_at: ServerInstant,
 ) -> Result<(), DomainError> {
     if started_at >= case.expires_at {
         return Err(DomainError::GovernanceDecisionExpired);
     }
-    if observed_subject_version != case.subject.expected_version
-        || observed_policy_revision_id != case.policy_revision_id
-        || observed_action_digest != case.action_digest
+    if observed.subject_version != case.subject.expected_version
+        || observed.policy_revision_id != case.policy_revision_id
+        || observed.action_digest != case.action_digest
+        || observed.attempt_binding != case.attempt_binding
+        || observed.invocation_claim_generation != case.invocation_claim_generation
     {
         return Err(DomainError::GovernanceActionStale);
     }
@@ -1361,6 +1396,13 @@ fn validate_execution_start(
 
 fn digest_is_nonzero(digest: Sha256Digest) -> bool {
     digest.as_bytes().iter().any(|byte| *byte != 0)
+}
+
+fn artifact_ref_is_valid(reference: &ArtifactRef) -> bool {
+    ProtocolKey::new(reference.artifact_id.as_str()).is_ok()
+        && !reference.uri.trim().is_empty()
+        && !reference.uri.chars().any(char::is_control)
+        && digest_is_nonzero(reference.digest)
 }
 
 fn valid_reason(reason: &str) -> bool {
@@ -1623,6 +1665,8 @@ mod tests {
             observed_subject_version: approved.subject.expected_version,
             observed_policy_revision_id: approved.policy_revision_id,
             observed_action_digest: approved.action_digest,
+            observed_attempt_binding: approved.attempt_binding,
+            observed_invocation_claim_generation: approved.invocation_claim_generation,
             execution_claim: Box::new(execution_claim(at(10), at(20))),
             now: approved.expires_at,
         };
@@ -1638,6 +1682,8 @@ mod tests {
                     observed_subject_version: approved.subject.expected_version,
                     observed_policy_revision_id: approved.policy_revision_id,
                     observed_action_digest: approved.action_digest,
+                    observed_attempt_binding: approved.attempt_binding,
+                    observed_invocation_claim_generation: approved.invocation_claim_generation,
                     started_at: approved.expires_at,
                 },
             ),
@@ -1649,12 +1695,91 @@ mod tests {
             observed_subject_version: approved.subject.expected_version,
             observed_policy_revision_id: approved.policy_revision_id,
             observed_action_digest: Sha256Digest::of_bytes(b"changed-action"),
+            observed_attempt_binding: approved.attempt_binding,
+            observed_invocation_claim_generation: approved.invocation_claim_generation,
             execution_claim: Box::new(execution_claim(at(3), at(8))),
             now: at(3),
         };
         assert_eq!(
             GovernanceCase::decide(Some(&approved), &stale_action),
             Err(DomainError::GovernanceActionStale)
+        );
+
+        let stale_invocation_claim = GovernanceCaseCommand::BeginApprovedAction {
+            expected_version: approved.version,
+            observed_subject_version: approved.subject.expected_version,
+            observed_policy_revision_id: approved.policy_revision_id,
+            observed_action_digest: approved.action_digest,
+            observed_attempt_binding: approved.attempt_binding,
+            observed_invocation_claim_generation: Some(5),
+            execution_claim: Box::new(execution_claim(at(3), at(8))),
+            now: at(3),
+        };
+        assert_eq!(
+            GovernanceCase::decide(Some(&approved), &stale_invocation_claim),
+            Err(DomainError::GovernanceActionStale)
+        );
+
+        let stale_attempt_binding = GovernanceCaseEvent::ApprovedActionStarted {
+            execution_claim: execution_claim(at(3), at(8)),
+            observed_subject_version: approved.subject.expected_version,
+            observed_policy_revision_id: approved.policy_revision_id,
+            observed_action_digest: approved.action_digest,
+            observed_attempt_binding: Some(AttemptFencingBinding {
+                attempt_id: id(91),
+                lease_id: id(92),
+                author_fencing_token: FencingToken::new(1).expect("fencing token"),
+            }),
+            observed_invocation_claim_generation: approved.invocation_claim_generation,
+            started_at: at(3),
+        };
+        assert_eq!(
+            GovernanceCase::apply_event(Some(&approved), &stale_attempt_binding),
+            Err(DomainError::GovernanceActionStale)
+        );
+    }
+
+    #[test]
+    fn execution_claim_rejects_invalid_identity_generation_holder_and_window() {
+        let opened =
+            GovernanceCase::transition(None, &GovernanceCaseCommand::Open(Box::new(open())))
+                .expect("open");
+        let approved = record_approval(&opened.aggregate).aggregate;
+        let event_for = |execution_claim| GovernanceCaseEvent::ApprovedActionStarted {
+            execution_claim,
+            observed_subject_version: approved.subject.expected_version,
+            observed_policy_revision_id: approved.policy_revision_id,
+            observed_action_digest: approved.action_digest,
+            observed_attempt_binding: approved.attempt_binding,
+            observed_invocation_claim_generation: approved.invocation_claim_generation,
+            started_at: at(3),
+        };
+
+        let mut invalid_id = execution_claim(at(3), at(8));
+        invalid_id.id = GovernanceExecutionClaimId::from_uuid(Uuid::nil());
+        assert_eq!(
+            GovernanceCase::apply_event(Some(&approved), &event_for(invalid_id)),
+            Err(DomainError::GovernanceExecutionClaimStale)
+        );
+
+        let mut invalid_generation = execution_claim(at(3), at(8));
+        invalid_generation.generation = 0;
+        assert_eq!(
+            GovernanceCase::apply_event(Some(&approved), &event_for(invalid_generation)),
+            Err(DomainError::GovernanceExecutionClaimStale)
+        );
+
+        let mut invalid_holder = execution_claim(at(3), at(8));
+        invalid_holder.holder_actor_id = ActorId::from_uuid(Uuid::nil());
+        assert_eq!(
+            GovernanceCase::apply_event(Some(&approved), &event_for(invalid_holder)),
+            Err(DomainError::GovernanceExecutionClaimStale)
+        );
+
+        let expired = execution_claim(at(1), at(3));
+        assert_eq!(
+            GovernanceCase::apply_event(Some(&approved), &event_for(expired)),
+            Err(DomainError::GovernanceExecutionClaimStale)
         );
     }
 
@@ -1755,23 +1880,26 @@ mod tests {
         let opened =
             GovernanceCase::transition(None, &GovernanceCaseCommand::Open(Box::new(open())))
                 .expect("open");
-        let approved = record_approval(&opened.aggregate).aggregate;
+        let approval = record_approval(&opened.aggregate);
+        let approved = approval.aggregate.clone();
         let claim = execution_claim(at(3), at(8));
-        let executing = GovernanceCase::transition(
+        let started = GovernanceCase::transition(
             Some(&approved),
             &GovernanceCaseCommand::BeginApprovedAction {
                 expected_version: approved.version,
                 observed_subject_version: approved.subject.expected_version,
                 observed_policy_revision_id: approved.policy_revision_id,
                 observed_action_digest: approved.action_digest,
+                observed_attempt_binding: approved.attempt_binding,
+                observed_invocation_claim_generation: approved.invocation_claim_generation,
                 execution_claim: Box::new(claim),
                 now: at(3),
             },
         )
-        .expect("start")
-        .aggregate;
+        .expect("start");
+        let executing = started.aggregate.clone();
 
-        let mut receipt = ExecutionReceipt {
+        let receipt = ExecutionReceipt {
             id: id(15),
             case_id: executing.id,
             action_digest: executing.action_digest,
@@ -1789,27 +1917,84 @@ mod tests {
             started_at: at(3),
             observed_at: at(4),
         };
-        receipt.executor_actor_id = id(99);
+
+        let mut wrong_holder = receipt.clone();
+        wrong_holder.executor_actor_id = id(99);
         assert_eq!(
             GovernanceCase::apply_event(
                 Some(&executing),
                 &GovernanceCaseEvent::ExecutionReceiptRecorded {
-                    receipt: Box::new(receipt.clone()),
+                    receipt: Box::new(wrong_holder),
                 },
             ),
             Err(DomainError::GovernanceExecutionClaimStale)
         );
 
-        receipt.executor_actor_id = claim.holder_actor_id;
-        receipt.evidence_refs.clear();
+        let mut missing_evidence = receipt.clone();
+        missing_evidence.evidence_refs.clear();
         assert_eq!(
             GovernanceCase::apply_event(
                 Some(&executing),
                 &GovernanceCaseEvent::ExecutionReceiptRecorded {
-                    receipt: Box::new(receipt),
+                    receipt: Box::new(missing_evidence),
                 },
             ),
             Err(DomainError::EvidenceInvalid)
         );
+
+        let mut zero_effect = receipt.clone();
+        zero_effect.effect_digest = Sha256Digest::from_bytes([0; 32]);
+        assert_eq!(
+            GovernanceCase::apply_event(
+                Some(&executing),
+                &GovernanceCaseEvent::ExecutionReceiptRecorded {
+                    receipt: Box::new(zero_effect),
+                },
+            ),
+            Err(DomainError::EvidenceInvalid)
+        );
+
+        let mut empty_uri = receipt.clone();
+        empty_uri.evidence_refs[0].uri = " \t".into();
+        assert_eq!(
+            GovernanceCase::apply_event(
+                Some(&executing),
+                &GovernanceCaseEvent::ExecutionReceiptRecorded {
+                    receipt: Box::new(empty_uri),
+                },
+            ),
+            Err(DomainError::EvidenceInvalid)
+        );
+
+        let mut zero_artifact_digest = receipt.clone();
+        zero_artifact_digest.evidence_refs[0].digest = Sha256Digest::from_bytes([0; 32]);
+        let malformed_event = GovernanceCaseEvent::ExecutionReceiptRecorded {
+            receipt: Box::new(zero_artifact_digest),
+        };
+        assert_eq!(
+            GovernanceCase::replay(&[
+                opened.events[0].clone(),
+                approval.events[0].clone(),
+                started.events[0].clone(),
+                malformed_event,
+            ]),
+            Err(DomainError::EvidenceInvalid)
+        );
+
+        let malformed_id = serde_json::json!({
+            "artifact_id": "not/a/protocol/key",
+            "uri": "artifact://governance/proof",
+            "digest": Sha256Digest::of_bytes(b"proof"),
+        });
+        assert!(serde_json::from_value::<ArtifactRef>(malformed_id).is_err());
+
+        let applied = GovernanceCase::apply_event(
+            Some(&executing),
+            &GovernanceCaseEvent::ExecutionReceiptRecorded {
+                receipt: Box::new(receipt),
+            },
+        )
+        .expect("valid receipt");
+        assert_eq!(applied.state, GovernanceCaseState::Applied);
     }
 }

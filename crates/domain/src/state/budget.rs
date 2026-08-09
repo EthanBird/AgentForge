@@ -384,7 +384,7 @@ impl BudgetReservation {
                         && *amount_units > 0
                         && reservation
                             .child_outstanding_units(*child_id)
-                            .is_some_and(|outstanding| *amount_units <= outstanding) =>
+                            .is_some_and(|outstanding| *amount_units == outstanding) =>
                     {
                         Ok(BudgetReservationEvent::ChildAllocationReturned {
                             child_id: *child_id,
@@ -536,7 +536,7 @@ impl BudgetReservation {
                 && *child_is_terminal
                 && reservation
                     .child_outstanding_units(*child_id)
-                    .is_some_and(|outstanding| *amount_units <= outstanding) =>
+                    .is_some_and(|outstanding| *amount_units == outstanding) =>
             {
                 let mut next = reservation.next_version()?;
                 let returned = next.child_allocation_returns.entry(*child_id).or_default();
@@ -939,6 +939,34 @@ mod tests {
             },
         )
         .expect("allocate");
+        let partial_command = BudgetReservationCommand::ReturnChildAllocation {
+            expected_version: allocated.aggregate.version,
+            child_id,
+            amount_units: 20,
+            child_is_terminal: true,
+        };
+        assert!(
+            BudgetReservation::decide(Some(&allocated.aggregate), &partial_command).is_err(),
+            "a terminal child must return its entire outstanding allocation"
+        );
+        let partial_event = BudgetReservationEvent::ChildAllocationReturned {
+            child_id,
+            amount_units: 20,
+            child_is_terminal: true,
+        };
+        assert!(
+            BudgetReservation::apply_event(Some(&allocated.aggregate), &partial_event).is_err(),
+            "direct apply must reject a partial terminal-child return"
+        );
+        assert!(
+            BudgetReservation::replay(&[
+                created.events[0].clone(),
+                allocated.events[0].clone(),
+                partial_event,
+            ])
+            .is_err(),
+            "replay must reject a partial terminal-child return"
+        );
         assert!(
             BudgetReservation::decide(
                 Some(&allocated.aggregate),
