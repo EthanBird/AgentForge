@@ -181,7 +181,9 @@ async function refresh() {
     state.cursor = result.streamCursor;
     localStorage.setItem(cursorKey(projectId), result.streamCursor);
     showNotice("");
-    render();
+    // A 304 still carries a new exact stream handoff cursor, but its DOM is
+    // already current. Avoid replacing rows and stealing keyboard focus.
+    if (result.data) render();
     setLiveConnection("已同步");
     connectEvents({ projectId, projectEpoch, refreshGeneration });
   } catch (error) {
@@ -267,6 +269,8 @@ async function inspectStreamFailure(streamUrl, context) {
 function recoverFromSnapshotCursor(context) {
   if (!isCurrentProject(context.projectId, context.projectEpoch)) return;
   state.snapshotCursor = "";
+  state.cursor = "";
+  localStorage.removeItem(cursorKey(context.projectId));
   scheduleRefresh(0, context);
 }
 
@@ -345,7 +349,10 @@ function decisionRow(item, interactive = false) {
     row.setAttribute("role", "button");
     row.addEventListener("click", () => selectDecision(caseId));
     row.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") selectDecision(caseId);
+      if (event.key === "Enter" || event.key === " ") {
+        if (event.key === " ") event.preventDefault();
+        selectDecision(caseId);
+      }
     });
   }
   return row;

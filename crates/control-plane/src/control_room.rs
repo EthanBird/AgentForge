@@ -276,10 +276,10 @@ impl ProjectionRegistry {
             .map_err(|_| ControlRoomStoreError::InvalidCheckpoint)?;
         let mut inner = self.inner.write().await;
         if let Some(current) = inner.projects.get(&checkpoint.project_id) {
-            if checkpoint.cursor < current.source_cursor {
+            if checkpoint.cursor.event_sequence < current.source_cursor.event_sequence {
                 return Err(ControlRoomStoreError::CheckpointStale);
             }
-            if checkpoint.cursor == current.source_cursor {
+            if checkpoint.cursor.event_sequence == current.source_cursor.event_sequence {
                 if checkpoint == current.checkpoint {
                     return Ok(StorePosition::new(
                         inner.epoch,
@@ -303,7 +303,6 @@ impl ProjectionRegistry {
             .checked_add(1)
             .map(DurableChangeSequence::new)
             .ok_or(ControlRoomStoreError::SequenceExhausted)?;
-        inner.next_sequence = next_sequence;
         let epoch = inner.epoch;
         let projection_version =
             inner
@@ -315,6 +314,9 @@ impl ProjectionRegistry {
                         .checked_add(1)
                         .ok_or(ControlRoomStoreError::SequenceExhausted)
                 })?;
+        // Do not advance the durable feed head until every fallible counter
+        // calculation has succeeded.
+        inner.next_sequence = next_sequence;
         let change = ProjectionChange {
             epoch,
             sequence: next_sequence,
@@ -384,6 +386,13 @@ impl ProjectionRegistry {
             .cloned()
             .collect::<Vec<_>>();
         let live_after = inner.next_sequence;
+        // The receiver is installed before taking the snapshot lock so no
+        // changes can fall into the handoff gap. Commits observed before
+        // `live_after` are already represented by `backlog`; drain those
+        // duplicate notifications while writers are still excluded. This also
+        // clears a broadcast `Lagged` marker caused solely by that covered
+        // prefix instead of reporting a false feed gap.
+        while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = receiver.try_recv() {}
         drop(inner);
 
         let changes = async_stream::stream! {
@@ -507,16 +516,24 @@ mod tests {
     }
 
     fn checkpoint(project_id: ProjectId, sequence: u64) -> StoredProjection {
+        checkpoint_with_identity(project_id, sequence, sequence)
+    }
+
+    fn checkpoint_with_identity(
+        project_id: ProjectId,
+        event_sequence: u64,
+        identity: u64,
+    ) -> StoredProjection {
         let occurred_at = ServerInstant(
             datetime!(2026-08-10 00:00 UTC)
-                + Duration::seconds(i64::try_from(sequence).expect("small sequence")),
+                + Duration::seconds(i64::try_from(identity).expect("small identity")),
         );
-        let event_id = EventId::from(Uuid::from_u128(u128::from(sequence)));
-        let source_digest = Sha256Digest::of_bytes(sequence.to_be_bytes());
+        let event_id = EventId::from(Uuid::from_u128(u128::from(identity)));
+        let source_digest = Sha256Digest::of_bytes(identity.to_be_bytes());
         let header = ProjectionHeader {
             projection_version: 1,
             last_event_id: Some(event_id),
-            last_event_sequence: sequence,
+            last_event_sequence: event_sequence,
             source_digest,
             as_of: Some(occurred_at),
             rebuilt_at: Some(occurred_at),
@@ -532,7 +549,7 @@ mod tests {
         payload.lineage.header = header.clone();
         payload.work_graph.header = header.clone();
         payload.activity.header = header;
-        let cursor = ProjectionCursor::new(occurred_at, event_id, sequence);
+        let cursor = ProjectionCursor::new(occurred_at, event_id, event_sequence);
         let mut checkpoint =
             ProjectionEnvelope::new(project_id, cursor, payload).expect("envelope");
         checkpoint.source_digest = source_digest;
@@ -604,6 +621,13 @@ mod tests {
             Err(ControlRoomStoreError::IdempotencyConflict)
         ));
 
+        assert!(matches!(
+            registry
+                .commit_checkpoint(checkpoint_with_identity(project_id, 1, 99), first_position,)
+                .await,
+            Err(ControlRoomStoreError::IdempotencyConflict)
+        ));
+
         let mut split = checkpoint(project_id, 2);
         split.payload.activity.header.degraded_reason =
             Some(ProtocolKey::new("split_header").expect("key"));
@@ -614,6 +638,32 @@ mod tests {
             registry.commit_checkpoint(split, first_position).await,
             Err(ControlRoomStoreError::InvalidCheckpoint)
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_counter_calculation_does_not_advance_the_feed_head() {
+        let project_id = project();
+        let registry = ProjectionRegistry::new();
+        let first_position = commit(&registry, checkpoint(project_id, 1)).await;
+        {
+            let mut inner = registry.inner.write().await;
+            inner
+                .projects
+                .get_mut(&project_id)
+                .expect("project snapshot")
+                .projection_version = u64::MAX;
+        }
+
+        assert!(matches!(
+            registry
+                .commit_checkpoint(checkpoint(project_id, 2), first_position)
+                .await,
+            Err(ControlRoomStoreError::SequenceExhausted)
+        ));
+        assert_eq!(
+            registry.head().await.expect("head remains readable"),
+            first_position
+        );
     }
 
     #[tokio::test]

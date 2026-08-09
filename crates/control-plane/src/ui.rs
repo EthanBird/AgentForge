@@ -2,7 +2,7 @@
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
-use agentforge_application::ProjectReadModels;
+use agentforge_application::{ProjectReadModels, ProjectionEnvelope};
 use agentforge_domain::{ProjectId, Sha256Digest};
 use axum::{
     Json, Router,
@@ -400,13 +400,15 @@ async fn mission_control(
 ) -> Result<Response, UiError> {
     let project_id = parse_project(&project_id)?;
     let authorization = state.authorize_project(&headers, project_id).await?;
+    let head_before = state.source.head().await.map_err(UiError::from_source)?;
     let snapshot = state
         .source
         .snapshot(project_id)
         .await
         .map_err(UiError::from_source)?
         .ok_or(UiError::ProjectNotFound)?;
-    validate_source_snapshot(project_id, &snapshot)?;
+    let head_after = state.source.head().await.map_err(UiError::from_source)?;
+    validate_source_snapshot(project_id, &snapshot, head_before, head_after)?;
     let etag = format!("\"{}\"", snapshot.source_digest);
     let stream_cursor = state
         .cursor
@@ -433,10 +435,33 @@ async fn mission_control(
 fn validate_source_snapshot(
     project_id: ProjectId,
     snapshot: &crate::control_room::ControlRoomSnapshot,
+    head_before: StorePosition,
+    head_after: StorePosition,
 ) -> Result<(), UiError> {
+    let header = snapshot.read_models.header();
+    let canonical_payload_digest = ProjectionEnvelope::new(
+        project_id,
+        snapshot.source_cursor,
+        snapshot.read_models.clone(),
+    )
+    .map_err(|_| UiError::SourceContractInvalid)?
+    .payload_digest;
+    let position_is_monotonic = head_before.epoch == snapshot.position.epoch
+        && snapshot.position.epoch == head_after.epoch
+        && head_before.sequence <= snapshot.position.sequence
+        && snapshot.position.sequence <= head_after.sequence;
+    let cursor_matches_headers = snapshot.source_cursor.event_sequence != 0
+        && header.last_event_id == Some(snapshot.source_cursor.event_id)
+        && header.last_event_sequence == snapshot.source_cursor.event_sequence
+        && header.as_of == Some(snapshot.source_cursor.occurred_at);
     if snapshot.project_id != project_id
+        || snapshot.projection_version == 0
+        || snapshot.position.sequence == DurableChangeSequence::ZERO
+        || !position_is_monotonic
         || !snapshot.read_models.is_project_consistent(project_id)
         || !snapshot.read_models.checkpoint_invariants_hold()
+        || !cursor_matches_headers
+        || snapshot.source_digest != canonical_payload_digest
     {
         return Err(UiError::SourceContractInvalid);
     }
@@ -486,57 +511,77 @@ async fn events(
         .subscribe(project_id, resume)
         .await
         .map_err(UiError::from_source)?;
-    if subscription.project_id != project_id
-        || subscription.epoch != resume.epoch
-        || subscription.after != resume.sequence
-    {
-        return Err(UiError::SourceContractInvalid);
-    }
+    let subscription_contract_is_valid = subscription.project_id == project_id
+        && subscription.epoch == resume.epoch
+        && subscription.after == resume.sequence;
     let codec = state.cursor.clone();
     let actor = authorization.actor;
     let grant = authorization.grant;
     let authorizer = state.authorizer.clone().ok_or(UiError::AccessDenied)?;
     let stream = async_stream::stream! {
-        let mut last_sequence = resume.sequence;
-        loop {
-            tokio::select! {
-                () = tokio::time::sleep(AUTHORIZATION_RECHECK_INTERVAL) => {
-                    if !authorization_is_current(
-                        authorizer.as_ref(),
-                        &actor,
-                        project_id,
-                        &grant,
-                    ).await {
-                        break;
+        if !subscription_contract_is_valid {
+            yield Ok(projection_reset_event("source_contract_failure"));
+        } else {
+            let mut last_sequence = resume.sequence;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep(AUTHORIZATION_RECHECK_INTERVAL) => {
+                        if refresh_authorization(
+                            authorizer.as_ref(),
+                            &actor,
+                            project_id,
+                            &grant,
+                        ).await.is_none() {
+                            break;
+                        }
                     }
-                }
-                change = next_change(&mut subscription.changes) => {
-                    let Some(change) = change else {
-                        break;
-                    };
-                    match change {
-                        Ok(change) => {
-                            let source_is_valid = change.project_id == project_id
-                                && change.epoch == resume.epoch
-                                && change.sequence > last_sequence;
-                            if !source_is_valid
-                                || !authorization_is_current(
+                    change = next_change(&mut subscription.changes) => {
+                        let Some(change) = change else {
+                            break;
+                        };
+                        match change {
+                            Ok(change) => {
+                                let source_is_valid = change.project_id == project_id
+                                    && change.epoch == resume.epoch
+                                    && change.sequence > last_sequence;
+                                if !source_is_valid {
+                                    yield Ok(projection_reset_event("source_contract_failure"));
+                                    break;
+                                }
+                                let Some(current_grant) = refresh_authorization(
                                     authorizer.as_ref(),
                                     &actor,
                                     project_id,
                                     &grant,
-                                ).await
-                            {
+                                ).await else {
+                                    break;
+                                };
+                                // Authorization can expire while an async
+                                // authorizer is resolving. Re-read the clock and
+                                // compare the epoch/scope immediately before
+                                // emitting protected data.
+                                if !grants_allow_emit(
+                                    &grant,
+                                    &current_grant,
+                                    &actor,
+                                    project_id,
+                                    server_now(),
+                                ) {
+                                    break;
+                                }
+                                last_sequence = change.sequence;
+                                yield Ok(change_event(&codec, &change, &current_grant));
+                            }
+                            Err(ProjectionSourceError::ChangeFeedLagged) => {
+                                yield Ok(projection_reset_event("change_feed_lagged"));
                                 break;
                             }
-                            last_sequence = change.sequence;
-                            yield Ok(change_event(&codec, &change, &grant));
+                            Err(ProjectionSourceError::CursorExpired) => {
+                                yield Ok(projection_reset_event("cursor_expired"));
+                                break;
+                            }
+                            Err(ProjectionSourceError::Unavailable) => break,
                         }
-                        Err(ProjectionSourceError::ChangeFeedLagged | ProjectionSourceError::CursorExpired) => {
-                            yield Ok(Event::default().event("projection.reset").data("{}"));
-                            break;
-                        }
-                        Err(ProjectionSourceError::Unavailable) => break,
                     }
                 }
             }
@@ -549,22 +594,32 @@ async fn events(
     ))
 }
 
-async fn authorization_is_current(
+async fn refresh_authorization(
     authorizer: &dyn ProjectAuthorizer,
     actor: &ActorContext,
     project_id: ProjectId,
     initial: &AuthorizationGrant,
+) -> Option<AuthorizationGrant> {
+    let current = authorizer.authorize(actor, project_id).await.ok()?;
+    grants_allow_emit(initial, &current, actor, project_id, server_now()).then_some(current)
+}
+
+fn grants_allow_emit(
+    initial: &AuthorizationGrant,
+    current: &AuthorizationGrant,
+    actor: &ActorContext,
+    project_id: ProjectId,
+    now: agentforge_domain::ServerInstant,
 ) -> bool {
-    let now = server_now();
-    if !initial.valid_for(actor, project_id, now) {
-        return false;
-    }
-    authorizer
-        .authorize(actor, project_id)
-        .await
-        .is_ok_and(|current| {
-            current.valid_for(actor, project_id, now) && initial.same_authority(&current)
-        })
+    initial.valid_for(actor, project_id, now)
+        && current.valid_for(actor, project_id, now)
+        && initial.same_authority(current)
+}
+
+fn projection_reset_event(reason: &'static str) -> Event {
+    Event::default()
+        .event("projection.reset")
+        .data(serde_json::json!({ "reason": reason }).to_string())
 }
 
 fn change_event(
@@ -680,6 +735,7 @@ mod tests {
     };
     use agentforge_domain::{EventId, ProjectId, ServerInstant, Sha256Digest};
     use axum::{
+        body::to_bytes,
         extract::{Path, Query, State},
         http::{HeaderMap, HeaderValue, StatusCode, header},
         response::IntoResponse,
@@ -691,17 +747,18 @@ mod tests {
         access::{
             ActorContext, ActorExtractionFuture, AuthenticationError, AuthorizationFuture,
             AuthorizationGrant, LocalLoopbackActorExtractor, NonLocalActor, ProjectAuthorizer,
-            RequestActorExtractor,
+            RequestActorExtractor, server_now,
         },
         control_room::{
-            ControlRoomSnapshot, DurableChangeSequence, ProjectionRegistry, ProjectionSource,
-            ProjectionSourceError, ProjectionSubscription, SourceFuture, StoreEpoch, StorePosition,
+            ControlRoomSnapshot, DurableChangeSequence, ProjectionChange, ProjectionRegistry,
+            ProjectionResource, ProjectionSource, ProjectionSourceError, ProjectionSubscription,
+            SourceFuture, StoreEpoch, StorePosition,
         },
     };
 
     use super::{
-        ControlPlaneState, CursorCodec, EventsQuery, STREAM_CURSOR_HEADER,
-        authorization_is_current, events, is_loopback_authority, mission_control, same_authority,
+        ControlPlaneState, CursorCodec, EventsQuery, STREAM_CURSOR_HEADER, events,
+        is_loopback_authority, mission_control, refresh_authorization, same_authority,
     };
 
     fn project(value: &str) -> ProjectId {
@@ -745,12 +802,13 @@ mod tests {
 
     struct FixedProjectionSource {
         project_id: ProjectId,
+        head_position: StorePosition,
         snapshot: ControlRoomSnapshot,
     }
 
     impl ProjectionSource for FixedProjectionSource {
         fn head(&self) -> SourceFuture<'_, StorePosition> {
-            Box::pin(async { Ok(self.snapshot.position) })
+            Box::pin(async { Ok(self.head_position) })
         }
 
         fn snapshot(&self, project_id: ProjectId) -> SourceFuture<'_, Option<ControlRoomSnapshot>> {
@@ -811,6 +869,74 @@ mod tests {
 
         fn ready(&self) -> SourceFuture<'_, bool> {
             Box::pin(async { Ok(true) })
+        }
+    }
+
+    struct MalformedChangeSource {
+        position: StorePosition,
+        change_project_id: ProjectId,
+        change_epoch: StoreEpoch,
+        change_sequence: DurableChangeSequence,
+    }
+
+    impl ProjectionSource for MalformedChangeSource {
+        fn head(&self) -> SourceFuture<'_, StorePosition> {
+            Box::pin(async { Ok(self.position) })
+        }
+
+        fn snapshot(
+            &self,
+            _project_id: ProjectId,
+        ) -> SourceFuture<'_, Option<ControlRoomSnapshot>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn subscribe(
+            &self,
+            project_id: ProjectId,
+            resume: StorePosition,
+        ) -> SourceFuture<'_, ProjectionSubscription> {
+            Box::pin(async move {
+                let change = ProjectionChange {
+                    epoch: self.change_epoch,
+                    sequence: self.change_sequence,
+                    resource: ProjectionResource::ProjectReadModels,
+                    project_id: self.change_project_id,
+                    projection_version: 2,
+                    source_occurred_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+                };
+                let changes = async_stream::stream! {
+                    yield Ok(change);
+                };
+                Ok(ProjectionSubscription {
+                    project_id,
+                    epoch: resume.epoch,
+                    after: resume.sequence,
+                    changes: Box::pin(changes),
+                })
+            })
+        }
+
+        fn ready(&self) -> SourceFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+    }
+
+    struct DelayedAuthorizer {
+        grant: AuthorizationGrant,
+        delay: std::time::Duration,
+    }
+
+    impl ProjectAuthorizer for DelayedAuthorizer {
+        fn authorize<'a>(
+            &'a self,
+            _actor: &'a ActorContext,
+            _project_id: ProjectId,
+        ) -> AuthorizationFuture<'a> {
+            Box::pin(async move {
+                tokio::time::sleep(self.delay).await;
+                Ok(self.grant.clone())
+            })
         }
     }
 
@@ -971,6 +1097,7 @@ mod tests {
         );
         let source = FixedProjectionSource {
             project_id,
+            head_position: position,
             snapshot: ControlRoomSnapshot {
                 project_id,
                 position,
@@ -1032,6 +1159,7 @@ mod tests {
         );
         let source = FixedProjectionSource {
             project_id,
+            head_position: position,
             snapshot: ControlRoomSnapshot {
                 project_id,
                 position,
@@ -1113,6 +1241,10 @@ mod tests {
         let checkpoint = checkpoint(wrong, 1);
         let source = FixedProjectionSource {
             project_id: requested,
+            head_position: StorePosition::new(
+                StoreEpoch::new(Uuid::from_bytes([7; 16])),
+                DurableChangeSequence::new(1),
+            ),
             snapshot: ControlRoomSnapshot {
                 project_id: wrong,
                 position: StorePosition::new(
@@ -1137,6 +1269,64 @@ mod tests {
             error.into_response().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn http_rejects_unverified_snapshot_digest_cursor_and_position() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let checkpoint = checkpoint(project_id, 1);
+        let epoch = StoreEpoch::new(Uuid::from_bytes([7; 16]));
+        let position = StorePosition::new(epoch, DurableChangeSequence::new(9));
+        let valid = ControlRoomSnapshot {
+            project_id,
+            position,
+            projection_version: 1,
+            source_digest: checkpoint.payload_digest,
+            source_cursor: checkpoint.cursor,
+            read_models: checkpoint.payload,
+        };
+        let mut bad_digest = valid.clone();
+        bad_digest.source_digest = Sha256Digest::of_bytes("not the JCS payload");
+        let unverified_etag = HeaderValue::from_str(&format!("\"{}\"", bad_digest.source_digest))
+            .expect("digest is a valid ETag");
+        let mut bad_cursor = valid.clone();
+        bad_cursor.source_cursor = ProjectionCursor::new(
+            bad_cursor.source_cursor.occurred_at,
+            EventId::from(Uuid::from_u128(99)),
+            bad_cursor.source_cursor.event_sequence,
+        );
+        let regressing_position = valid;
+
+        for (snapshot, head_position, conditional_etag) in [
+            (bad_digest, position, Some(unverified_etag)),
+            (bad_cursor, position, None),
+            (
+                regressing_position,
+                StorePosition::new(epoch, DurableChangeSequence::new(10)),
+                None,
+            ),
+        ] {
+            let state = test_state(
+                Arc::new(FixedProjectionSource {
+                    project_id,
+                    head_position,
+                    snapshot,
+                }),
+                CursorCodec::from_hex(&"11".repeat(32)).expect("valid key"),
+                Arc::new(TestAuthorizer::active()),
+            );
+            let mut headers = HeaderMap::new();
+            if let Some(etag) = conditional_etag {
+                headers.insert(header::IF_NONE_MATCH, etag);
+            }
+            let response =
+                mission_control(State(state), Path(project_id.to_string()), headers).await;
+            let error = response.expect_err("unverified snapshots must fail closed");
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
     }
 
     #[tokio::test]
@@ -1254,7 +1444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sse_rejects_inconsistent_subscription_scope_from_the_source() {
+    async fn sse_resets_on_inconsistent_subscription_scope_from_the_source() {
         let requested = project("018f0000-0000-7000-8000-000000000001");
         let wrong = project("018f0000-0000-7000-8000-000000000002");
         let position = StorePosition::new(
@@ -1284,15 +1474,69 @@ mod tests {
                 cursor: Some(cursor),
             }),
         )
-        .await;
-        let error = match response {
-            Ok(_) => panic!("wrong-project subscription must fail"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.into_response().status(),
-            StatusCode::SERVICE_UNAVAILABLE
+        .await
+        .expect("source contract failure is reported in-band")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("read finite reset stream");
+        let body = std::str::from_utf8(&body).expect("SSE is UTF-8");
+        assert!(body.contains("projection.reset"), "{body}");
+        assert!(body.contains("source_contract_failure"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn sse_resets_before_emitting_cross_scope_or_non_monotonic_changes() {
+        let requested = project("018f0000-0000-7000-8000-000000000001");
+        let wrong = project("018f0000-0000-7000-8000-000000000002");
+        let position = StorePosition::new(
+            StoreEpoch::new(Uuid::from_bytes([7; 16])),
+            DurableChangeSequence::new(4),
         );
+        let codec = CursorCodec::from_hex(&"11".repeat(32)).expect("valid key");
+        let authorizer = TestAuthorizer::active();
+        let cursor = codec.encode(
+            requested,
+            position,
+            &authorizer.grant(&ActorContext::local_reference(), requested),
+        );
+        let next = DurableChangeSequence::new(5);
+        let wrong_epoch = StoreEpoch::new(Uuid::from_bytes([8; 16]));
+        for (change_project_id, change_epoch, change_sequence) in [
+            (wrong, position.epoch, next),
+            (requested, wrong_epoch, next),
+            (requested, position.epoch, position.sequence),
+        ] {
+            let state = test_state(
+                Arc::new(MalformedChangeSource {
+                    position,
+                    change_project_id,
+                    change_epoch,
+                    change_sequence,
+                }),
+                codec.clone(),
+                Arc::new(authorizer.clone()),
+            );
+            let response = events(
+                State(state),
+                Path(requested.to_string()),
+                HeaderMap::new(),
+                Query(EventsQuery {
+                    cursor: Some(cursor.clone()),
+                }),
+            )
+            .await
+            .expect("source contract failure is reported in-band")
+            .into_response();
+            let body = to_bytes(response.into_body(), 1_024)
+                .await
+                .expect("read finite reset stream");
+            let body = std::str::from_utf8(&body).expect("SSE is UTF-8");
+            assert!(body.contains("projection.reset"), "{body}");
+            assert!(body.contains("source_contract_failure"), "{body}");
+            assert!(!body.contains("projection.invalidated"), "{body}");
+        }
     }
 
     #[tokio::test]
@@ -1301,13 +1545,44 @@ mod tests {
         let actor = ActorContext::local_reference();
         let authorizer = TestAuthorizer::active();
         let initial = authorizer.grant(&actor, project_id);
-        assert!(authorization_is_current(&authorizer, &actor, project_id, &initial).await);
+        assert!(
+            refresh_authorization(&authorizer, &actor, project_id, &initial)
+                .await
+                .is_some()
+        );
         authorizer.rotate_epoch();
-        assert!(!authorization_is_current(&authorizer, &actor, project_id, &initial).await);
+        assert!(
+            refresh_authorization(&authorizer, &actor, project_id, &initial)
+                .await
+                .is_none()
+        );
 
         let mut expired = initial;
         expired.expires_at = ServerInstant(OffsetDateTime::UNIX_EPOCH);
-        assert!(!authorization_is_current(&authorizer, &actor, project_id, &expired).await);
+        assert!(
+            refresh_authorization(&authorizer, &actor, project_id, &expired)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn authorization_expiring_during_authorizer_await_is_not_emitted() {
+        let project_id = project("018f0000-0000-7000-8000-000000000001");
+        let actor = ActorContext::local_reference();
+        let mut initial = TestAuthorizer::active().grant(&actor, project_id);
+        initial.expires_at = ServerInstant(server_now().0 + Duration::milliseconds(40));
+        assert!(initial.valid_for(&actor, project_id, server_now()));
+        let delayed = DelayedAuthorizer {
+            grant: initial.clone(),
+            delay: std::time::Duration::from_millis(80),
+        };
+
+        assert!(
+            refresh_authorization(&delayed, &actor, project_id, &initial)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
