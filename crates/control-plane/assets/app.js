@@ -12,6 +12,7 @@ const state = {
   etag: null,
   cursor: "",
   projectionDegraded: false,
+  projectionStale: false,
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -60,7 +61,9 @@ function isCurrentRefresh(projectId, projectEpoch, refreshGeneration) {
 }
 
 function setLiveConnection(label) {
-  setConnection(state.projectionDegraded ? "degraded" : "online", state.projectionDegraded ? "投影降级" : label);
+  const unhealthy = state.projectionDegraded || state.projectionStale;
+  const healthLabel = state.projectionDegraded ? "投影降级" : state.projectionStale ? "投影滞后" : label;
+  setConnection(unhealthy ? "degraded" : "online", healthLabel);
 }
 
 function showNotice(message) {
@@ -104,6 +107,7 @@ function renderProjectionHealth(data) {
   const host = $("#projection-health");
   if (!header) {
     state.projectionDegraded = false;
+    state.projectionStale = false;
     host.dataset.state = "empty";
     $("#projection-health-label").textContent = "尚未同步";
     $("#projection-as-of").textContent = "as_of —";
@@ -116,8 +120,13 @@ function renderProjectionHealth(data) {
   const degradedReason = header.degraded_reason || "";
   const staleness = Number(header.staleness_ms);
   state.projectionDegraded = Boolean(degradedReason);
-  host.dataset.state = state.projectionDegraded ? "degraded" : staleness > 0 ? "stale" : "healthy";
-  $("#projection-health-label").textContent = state.projectionDegraded ? "投影降级" : "投影健康";
+  state.projectionStale = Number.isFinite(staleness) && staleness > 0;
+  host.dataset.state = state.projectionDegraded ? "degraded" : state.projectionStale ? "stale" : "healthy";
+  $("#projection-health-label").textContent = state.projectionDegraded
+    ? "投影降级"
+    : state.projectionStale
+      ? "投影滞后"
+      : "投影健康";
   $("#projection-as-of").textContent = `as_of ${formatInstant(header.as_of)}`;
   $("#projection-staleness").textContent = `staleness ${formatStaleness(header.staleness_ms)}`;
   $("#projection-degraded").textContent = `degraded_reason ${degradedReason || "none"}`;
@@ -443,6 +452,7 @@ function switchProject(projectId) {
   state.cursor = "";
   state.sseFailures = 0;
   state.projectionDegraded = false;
+  state.projectionStale = false;
   $("#refresh").disabled = false;
   setConnection(projectId ? "connecting" : "offline", projectId ? "连接中" : "未选择项目");
   showNotice("");
