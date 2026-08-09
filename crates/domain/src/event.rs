@@ -15,7 +15,12 @@ use crate::{
     },
 };
 
-pub const EVENT_ENVELOPE_VERSION: u16 = 1;
+/// Historical envelope format whose payload digest used typed
+/// `serde_json::to_vec` bytes. It is read-only.
+pub const LEGACY_EVENT_ENVELOPE_VERSION: u16 = 1;
+/// Current envelope format. New events use JCS payload bytes so typed payloads
+/// and their JSON value representation have one stable digest.
+pub const EVENT_ENVELOPE_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,7 +131,7 @@ where
 {
     pub fn new(context: EventContext, payload: E) -> Result<Self, DomainError> {
         let aggregate_type = context.aggregate_id.aggregate_type();
-        let payload_digest = digest_payload(&payload)?;
+        let payload_digest = digest_payload_v2(&payload)?;
         let envelope = Self {
             envelope_version: EVENT_ENVELOPE_VERSION,
             event_id: context.event_id,
@@ -150,7 +155,12 @@ where
     }
 
     pub fn validate_payload_digest(&self) -> Result<(), DomainError> {
-        if digest_payload(&self.payload)? == self.payload_digest {
+        let actual = match self.envelope_version {
+            LEGACY_EVENT_ENVELOPE_VERSION => digest_payload_v1(&self.payload)?,
+            EVENT_ENVELOPE_VERSION => digest_payload_v2(&self.payload)?,
+            _ => return Err(DomainError::SchemaVersionUnsupported),
+        };
+        if actual == self.payload_digest {
             Ok(())
         } else {
             Err(DomainError::EvidenceInvalid)
@@ -163,7 +173,10 @@ where
         supported_semantics: &BTreeSet<String>,
     ) -> Result<(), DomainError> {
         self.validate_shape()?;
-        if self.schema_version > maximum_schema_version
+        // Historical v1 envelopes are accepted only by `from_json` for audit
+        // replay/upcast. They must never be appended as if newly emitted.
+        if self.envelope_version != EVENT_ENVELOPE_VERSION
+            || self.schema_version > maximum_schema_version
             || self
                 .required_semantics
                 .iter()
@@ -179,7 +192,10 @@ where
     }
 
     fn validate_shape(&self) -> Result<(), DomainError> {
-        if self.envelope_version != EVENT_ENVELOPE_VERSION {
+        if !matches!(
+            self.envelope_version,
+            LEGACY_EVENT_ENVELOPE_VERSION | EVENT_ENVELOPE_VERSION
+        ) {
             return Err(DomainError::SchemaVersionUnsupported);
         }
         if self.aggregate_type != self.aggregate_id.aggregate_type() {
@@ -226,8 +242,14 @@ where
     }
 }
 
-fn digest_payload<E: Serialize>(payload: &E) -> Result<Sha256Digest, DomainError> {
+fn digest_payload_v1<E: Serialize>(payload: &E) -> Result<Sha256Digest, DomainError> {
     serde_json::to_vec(payload)
+        .map(Sha256Digest::of_bytes)
+        .map_err(|_| DomainError::Internal)
+}
+
+fn digest_payload_v2<E: Serialize>(payload: &E) -> Result<Sha256Digest, DomainError> {
+    serde_json_canonicalizer::to_vec(payload)
         .map(Sha256Digest::of_bytes)
         .map_err(|_| DomainError::Internal)
 }
@@ -256,9 +278,12 @@ fn is_reserved_key(key: &str) -> bool {
 pub use crate::state::attempt::AttemptEvent;
 pub use crate::state::budget::BudgetReservationEvent;
 pub use crate::state::governance::{DecisionEvent, GovernanceCaseEvent};
-pub use crate::state::invocation::{InvocationIntentEvent, InvocationRunEvent};
+pub use crate::state::invocation::{
+    InvocationIntentEvent, InvocationRunEvent, InvocationRunEventV1, UpcastInvocationRunEventV1,
+};
 pub use crate::state::lease::LeaseEvent;
 pub use crate::state::policy::PolicyRevisionEvent;
+pub use crate::state::run_claim::RunClaimEvent;
 pub use crate::state::run_signal::RunSignalEvent;
 pub use crate::state::session::SessionCapsuleEvent;
 pub use crate::state::submission::SubmissionEvent;
@@ -266,6 +291,7 @@ pub use crate::state::work_package::WorkPackageEvent;
 
 #[cfg(test)]
 mod tests {
+    use serde::{Deserialize, Serialize};
     use time::macros::datetime;
     use uuid::Uuid;
 
@@ -293,6 +319,7 @@ mod tests {
             serde_json::json!({ "checkpoint": "sha256:test" }),
         )
         .expect("valid envelope");
+        assert_eq!(envelope.envelope_version, EVENT_ENVELOPE_VERSION);
         let bytes = envelope.to_json().expect("encode");
         let decoded: EventEnvelope<Value> = EventEnvelope::from_json(&bytes).expect("decode");
         assert_eq!(decoded.aggregate_id, envelope.aggregate_id);
@@ -301,6 +328,80 @@ mod tests {
         assert_eq!(decoded.correlation_id, envelope.correlation_id);
         assert_eq!(decoded.causation_id, envelope.causation_id);
         assert_eq!(decoded.payload_digest, envelope.payload_digest);
+    }
+
+    #[test]
+    fn payload_digest_is_canonical_across_typed_and_value_representations() {
+        #[derive(Serialize)]
+        struct TypedPayload {
+            zeta: u8,
+            alpha: u8,
+        }
+
+        let context = EventContext {
+            event_id: id(21),
+            aggregate_id: AggregateId::InvocationRun(id(22)),
+            aggregate_version: AggregateVersion::new(1),
+            aggregate_seq: 1,
+            event_type: "invocation_run.reserved".into(),
+            schema_version: 2,
+            actor_id: id(23),
+            correlation_id: id(24),
+            causation_id: None,
+            occurred_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+        };
+        let typed = EventEnvelope::new(context.clone(), TypedPayload { zeta: 1, alpha: 2 })
+            .expect("typed payload");
+        let value = EventEnvelope::new(context, serde_json::json!({"alpha": 2, "zeta": 1}))
+            .expect("value payload");
+
+        assert_eq!(typed.payload_digest, value.payload_digest);
+    }
+
+    #[test]
+    fn legacy_v1_digest_is_verified_with_original_bytes_but_cannot_be_reappended() {
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        struct LegacyTypedPayload {
+            zeta: u8,
+            alpha: u8,
+        }
+
+        let mut legacy = EventEnvelope::new(
+            EventContext {
+                event_id: id(31),
+                aggregate_id: AggregateId::InvocationRun(id(32)),
+                aggregate_version: AggregateVersion::new(1),
+                aggregate_seq: 1,
+                event_type: "invocation_run.reserved".into(),
+                schema_version: 1,
+                actor_id: id(33),
+                correlation_id: id(34),
+                causation_id: None,
+                occurred_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+            },
+            LegacyTypedPayload { zeta: 1, alpha: 2 },
+        )
+        .expect("current envelope");
+        legacy.envelope_version = LEGACY_EVENT_ENVELOPE_VERSION;
+        legacy.payload_digest = digest_payload_v1(&legacy.payload).expect("legacy digest");
+        let bytes = legacy.to_json().expect("legacy json");
+        let decoded: EventEnvelope<LegacyTypedPayload> =
+            EventEnvelope::from_json(&bytes).expect("verified historical envelope");
+
+        assert_eq!(decoded, legacy);
+        assert_eq!(
+            decoded.validate_for(1, &BTreeSet::new()),
+            Err(DomainError::SchemaVersionUnsupported)
+        );
+
+        let mut tampered: Value = serde_json::from_slice(&bytes).expect("json value");
+        tampered["payload"]["alpha"] = Value::from(9);
+        assert_eq!(
+            EventEnvelope::<LegacyTypedPayload>::from_json(
+                &serde_json::to_vec(&tampered).expect("tampered json")
+            ),
+            Err(DomainError::EvidenceInvalid)
+        );
     }
 
     #[test]

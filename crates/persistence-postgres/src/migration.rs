@@ -39,6 +39,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "m1_events_projections",
         sql: include_str!("../../../migrations/0003_m1_events_projections.sql"),
     },
+    Migration {
+        version: 4,
+        name: "m1_uow",
+        sql: include_str!("../../../migrations/0004_m1_uow.sql"),
+    },
 ];
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -236,7 +241,7 @@ mod tests {
     #[test]
     fn migration_manifest_is_contiguous_transactional_and_additive() {
         validate_manifest().expect("repository migration manifest must be valid");
-        assert_eq!(MIGRATIONS.len(), 3);
+        assert_eq!(MIGRATIONS.len(), 4);
         assert!(MIGRATIONS.iter().all(|migration| {
             let digest = migration.digest();
             digest.len() == 71 && digest.starts_with("sha256:")
@@ -284,5 +289,49 @@ mod tests {
         ] {
             assert!(sql.contains(required), "missing SQL invariant: {required}");
         }
+    }
+
+    #[test]
+    fn uow_event_head_receipt_and_fencing_constraints_are_present() {
+        let sql = MIGRATIONS[3].sql;
+        for required in [
+            "CREATE TABLE aggregate_event_heads",
+            "PRIMARY KEY (project_id, aggregate_type, aggregate_id)",
+            "LOCK TABLE domain_events IN ACCESS EXCLUSIVE MODE",
+            "bool_or(event_seq <> aggregate_version)",
+            "ADD COLUMN envelope_version smallint NOT NULL DEFAULT 1",
+            "CHECK (envelope_version IN (1, 2))",
+            "ALTER COLUMN envelope_version DROP DEFAULT",
+            "DROP CONSTRAINT domain_events_aggregate_type_aggregate_id_aggregate_version_key",
+            "LOCK TABLE outbox_messages IN ACCESS EXCLUSIVE MODE",
+            "claim_generation bigint NOT NULL DEFAULT 0",
+            "outbox_claim_generation_shape",
+            "outbox_messages_claim_recovery_idx",
+            "ADD COLUMN command_id uuid",
+            "ADD COLUMN resource_version bigint",
+            "ADD COLUMN response_digest bytea",
+            "command_receipts_phase1_shape",
+            "inbox_messages_are_immutable",
+        ] {
+            assert!(sql.contains(required), "missing SQL invariant: {required}");
+        }
+        let domain_events_lock = sql
+            .find("LOCK TABLE domain_events IN ACCESS EXCLUSIVE MODE")
+            .expect("domain event migration lock");
+        for protected_operation in [
+            "DO $$",
+            "INSERT INTO aggregate_event_heads",
+            "ADD COLUMN envelope_version",
+            "DROP CONSTRAINT domain_events_aggregate_type_aggregate_id_aggregate_version_key",
+        ] {
+            assert!(
+                domain_events_lock < sql.find(protected_operation).expect(protected_operation),
+                "domain_events must be locked before {protected_operation}"
+            );
+        }
+        assert!(
+            !sql.contains("aggregate_snapshots"),
+            "Phase 1 must not install a generic JSON aggregate authority"
+        );
     }
 }

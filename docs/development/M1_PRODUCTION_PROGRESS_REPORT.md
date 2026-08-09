@@ -25,10 +25,26 @@ Invocation、Governance、投影和 PostgreSQL schema 上补齐三个最小生�
 
 ### M1-PROD-02：PostgreSQL UoW Phase 1
 
-- receipt-first：相同 actor/key/hash 精确回放，不同 payload 返回稳定 reuse 错误；
-- aggregate version CAS、domain event 与 Outbox 在同一数据库事务提交；
-- Inbox 消费幂等；Outbox 使用有 generation/TTL 的 `SKIP LOCKED` claim；
-- 真实 PostgreSQL 测试覆盖并发 CAS、重复命令、回滚和至少一次投递。
+- receipt-first 明确区分 `Missing / Replay / Expired / Legacy`；scope/payload reuse
+  在 expiry 之前判冲突，到期或旧格式 tombstone 都不得重新执行；
+- `aggregate_event_heads` 只维护事件流 version/sequence head；同一 command version 可原子追加
+  多个连续事件，持久游标来自 PostgreSQL `global_sequence`，不得用 aggregate-local sequence 冒充；
+  `domain_events.envelope_version` 显式区分历史 v1 digest 与当前 JCS v2 digest；
+- `0004` 是需要协调 writer quiescence 的滚动发布边界：迁移在校验/派生事件历史前持有
+  `domain_events` 的 `ACCESS EXCLUSIVE` 锁直至提交；旧 writer 若在迁移后继续省略
+  `envelope_version` 会因默认值已删除而 fail closed。发布顺序必须是 quiesce legacy writers →
+  apply `0004` → deploy new writers → resume traffic，不支持旧/新 writer 无协调混跑；
+- Inbox 以 Outbox/broker message ID 去重；Outbox 使用 generation、TTL 和确定返回顺序的
+  `SKIP LOCKED` claim；所有语义写错误将 UoW 标为 rollback-only；
+- 本 Phase **不实现**通用 JSON `Repository<A>`，也不宣称 typed aggregate repository 已生产化。
+  `work_packages`、`run_claims` 等 canonical typed tables 的逐类型 repository/跨表不变量写入属于
+  M1-PROD-02 Phase 2；在它完成前，Phase 1 只能作为 event/receipt/outbox/inbox 事务基础设施；
+- Phase 1 的 `NoTls` factory 名称和构造器显式标记为 local-only，并拒绝非 Unix socket/loopback
+  地址（包括拒绝 `hostaddr` 覆盖到远端）；构造时必须给出 trusted schema，每个事务固定使用
+  `pg_catalog, trusted_schema, pg_temp`。可连接远端 PostgreSQL 的证书校验/TLS factory 属于
+  Phase 2，当前不得用于远端部署；
+- CI 的 PostgreSQL service job 必须同时运行 migration 与 UoW 条件合同；无数据库环境时的本地
+  skip 仅是可编译证据，不计作真实 PostgreSQL 验收通过。
 
 ### M1-PROD-03：Durable Control Plane Boundary
 
@@ -48,8 +64,8 @@ Invocation、Governance、投影和 PostgreSQL schema 上补齐三个最小生�
 
 | 检查点 | 状态 | 远端证据 |
 | --- | --- | --- |
-| M1-PROD-00 分支与执行账本 | 进行中 | 本文件提交后回填 |
-| M1-PROD-01 独立 RunClaim | 开发中 | 待回填 |
-| M1-PROD-02 PostgreSQL UoW | 开发中 | 待回填 |
-| M1-PROD-03 Durable control boundary | 开发中 | 待回填 |
-| M1-PROD-GATE 集成验收 | 未开始 | 三条线冻结后执行 |
+| M1-PROD-00 分支与执行账本 | 已保存，持续更新 | 远端 `404c23b` |
+| M1-PROD-01 独立 RunClaim | 初始检查点已保存，安全加固中 | 初始远端 `4cba219`；最终加固 SHA 待回填 |
+| M1-PROD-02 PostgreSQL UoW Phase 1 | 本地集成门禁通过，真实 PG 待 CI | 本地 PostgreSQL 测试因无数据库环境而 skip，不算真实 PG 证据；PGlite 仅作 migration 补充验证；Phase 2 typed repositories 未开始 |
+| M1-PROD-03 Durable control boundary | P0 修复已保存，P1 小修收口中 | 初始 `1cc715a`；P0 修复远端 `7e8102c`，GitHub Actions run #35 success；最终 SHA 待回填 |
+| M1-PROD-GATE 集成验收 | 本地全工作区门禁通过，远端 CI 待最终提交 | `fmt --check`、locked metadata/build/test、workspace boundary、strict Clippy、UI JS syntax 与 diff-check 全绿；真实 PostgreSQL 证据仍待 CI |
