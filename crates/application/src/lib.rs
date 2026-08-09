@@ -1,4 +1,28 @@
-//! Application use cases and infrastructure ports.
+//! Application use cases, infrastructure ports, and rebuildable read models.
+//!
+//! Domain aggregates remain authoritative.  The projection modules consume a
+//! deliberately normalized event input and only build disposable operator
+//! views; they never feed state back into an aggregate decision.
+
+pub mod error;
+pub mod ports;
+pub mod projection;
+pub mod read_models;
+
+pub use error::{ApplicationError, ApplicationResult};
+pub use ports::{
+    AppendEventsReceipt, Clock, EventAppendPort, EventRecord, IdGenerator, Isolation, PortError,
+    PortFuture, PortResult, Repository, StoredAggregate, UnitOfWork, UnitOfWorkFactory,
+};
+pub use projection::{
+    ActivityProjectionInput, AgentProjectionInput, ApplyBatchReceipt,
+    BudgetEnvelopeProjectionInput, BudgetIncidentProjectionInput, ControlRoomReducer,
+    GovernanceProjectionInput, InMemoryProjectionStore, LineageNodeProjectionInput,
+    NodeProjectionInput, PackageActionPathProjectionInput, PackageProjectionInput,
+    ProjectionCursor, ProjectionEnvelope, ProjectionEvent, ProjectionInput, ProjectionVersion,
+    RunProjectionInput, StoredProjection, WorkGraphNodeProjectionInput,
+};
+pub use read_models::*;
 
 /// Package name used by smoke tests.
 pub const CRATE_NAME: &str = "agentforge-application";
