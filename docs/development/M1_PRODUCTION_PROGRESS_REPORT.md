@@ -3,7 +3,8 @@
 - 启动日期：2026-08-10
 - 基线：`main@58ebbb674c57dd87320e8e0e4b3b23708b16be1b`
 - 开发分支：`agent/m1-production-vertical-slice`
-- 当前状态：三条互不阻塞的实现线并行开发中
+- 当前状态：三条 Phase 1 生产纵切已实现并通过本地与远端集成门禁；Phase 2 typed
+  repositories、远端 PostgreSQL TLS adapter 与真正的 durable projection adapter 尚未开始
 
 ## 1. 本轮目标
 
@@ -22,6 +23,17 @@ Invocation、Governance、投影和 PostgreSQL schema 上补齐三个最小生�
 - Grant/Renew/Release/Expire/Revoke/Supersede 使用纯 `decide -> event -> apply -> replay`；
 - InvocationRun 只持不可变且经过验证的 claim binding；
 - 旧 generation、错误 holder、过期授权、恶意 event/replay 与终态复活必须稳定失败。
+
+最终实现还包含以下恢复与兼容边界：
+
+- `InvocationRun` 的公开 transition 必须消费经过验证的独立 `RunClaim` witness；takeover 以
+  run-scoped current claim head 严格推进 generation，并支持服务器过期、撤销和治理抢占；
+- 终结 Run 与终结 Claim 只通过 crate 内不可拆分的组合 effect 产生，交给后续 application UoW
+  原子持久化；领域公共 API 不暴露只保存一侧的入口；
+- 当前 v2 事件采用 JCS digest；真实 main-v1 事件先按历史字节校验 digest，再显式 upcast。
+  `Running / Reconciling / terminal` 的 v1 snapshot 禁止猜测最后事件时间，只能借助已验证回放恢复；
+- 权威 aggregate 不能绕过 snapshot validator 直接反序列化；终态 Claim 的时间与结果摘要必须与
+  Completed、Failed 或 Cancelled Run 的终态事实严格对应。
 
 ### M1-PROD-02：PostgreSQL UoW Phase 1
 
@@ -65,7 +77,7 @@ Invocation、Governance、投影和 PostgreSQL schema 上补齐三个最小生�
 | 检查点 | 状态 | 远端证据 |
 | --- | --- | --- |
 | M1-PROD-00 分支与执行账本 | 已保存，持续更新 | 远端 `404c23b` |
-| M1-PROD-01 独立 RunClaim | 初始检查点已保存，安全加固中 | 初始远端 `4cba219`；最终加固 SHA 待回填 |
-| M1-PROD-02 PostgreSQL UoW Phase 1 | 本地集成门禁通过，真实 PG 待 CI | 本地 PostgreSQL 测试因无数据库环境而 skip，不算真实 PG 证据；PGlite 仅作 migration 补充验证；Phase 2 typed repositories 未开始 |
-| M1-PROD-03 Durable control boundary | P0 修复已保存，P1 小修收口中 | 初始 `1cc715a`；P0 修复远端 `7e8102c`，GitHub Actions run #35 success；最终 SHA 待回填 |
-| M1-PROD-GATE 集成验收 | 本地全工作区门禁通过，远端 CI 待最终提交 | `fmt --check`、locked metadata/build/test、workspace boundary、strict Clippy、UI JS syntax 与 diff-check 全绿；真实 PostgreSQL 证据仍待 CI |
+| M1-PROD-01 独立 RunClaim | Phase 1 完成，独立复核无 P0/P1 | 初始远端 `4cba219`；最终远端 `6900dcee`；domain 63 unit + 2 property + 12 contract + 1 compile-fail doctest 全绿；GitHub Actions run #41 success |
+| M1-PROD-02 PostgreSQL UoW Phase 1 | Phase 1 完成，真实 PostgreSQL 17 合同通过 | 远端 `d2c53bd`；run #41 的 `postgres-migrations` job 实际通过 migration 重复执行/约束检查和 transactional UoW 合同；Phase 2 typed repositories/TLS adapter 未开始 |
+| M1-PROD-03 Durable control boundary | Phase 1 完成，独立复核无 P0/P1 | 初始 `1cc715a`；最终远端 `8256a16`，GitHub Actions run #37 success；snapshot→SSE handoff、scope cursor、source contract reset 与移动端 inspector 合同全绿 |
+| M1-PROD-GATE 集成验收 | 本地与远端全绿 | 最终纵切远端 `6900dcee`，GitHub Actions run #41 success；本地 locked workspace tests、workspace strict Clippy、fmt、UI JS syntax 与 diff-check 全绿；真实 PostgreSQL 17 job 全绿 |
