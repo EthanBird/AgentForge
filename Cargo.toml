@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/application",
+  "crates/control-plane",
+  "crates/domain",
+  "crates/git-integration",
+  "crates/matcher",
+  "crates/obligation-engine",
+  "crates/outbox",
+  "crates/persistence-postgres",
+  "crates/protocol",
+  "crates/protocol-a2a",
+  "crates/test-support",
+  "crates/verification",
+  "crates/worker-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+repository = "https://github.com/EthanBird/AgentForge"
+authors = ["AgentForge Contributors"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+hex = "0.4"
+jsonschema = { version = "0.49.2", default-features = false }
+proptest = "1.7"
+rand = "0.9"
+rand_chacha = "0.9"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_json_canonicalizer = "0.3.2"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+uuid = { version = "1.24", features = ["serde", "v7"] }
+walkdir = "2.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+

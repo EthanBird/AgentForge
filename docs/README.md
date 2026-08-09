@@ -7,6 +7,7 @@
 3. 开发控制平面前阅读领域模型、AFWP 协议与控制平面实现文档。
 4. 开发节点前阅读 Worker/jcode、验收/Git Relay 与安全文档。
 5. 每个里程碑开始前，从[首批工单](development/09_MILESTONES_AND_WORK_PACKAGES.md)领取任务，并按[测试计划](development/08_TEST_AND_VALIDATION_PLAN.md)执行门禁。
+6. 当前实现状态、M0 验收证据与后续边界见 [M0 进度报告](development/M0_PROGRESS_REPORT.md)。
 
 ## 文档权威级别
 

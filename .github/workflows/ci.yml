@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check workspace metadata
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+      - name: Check repository and dependency boundaries
+        run: bash tests/contract/workspace_layout.sh
+      - name: Build workspace
+        run: cargo build --workspace --locked --all-targets
+      - name: Lint workspace
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --locked

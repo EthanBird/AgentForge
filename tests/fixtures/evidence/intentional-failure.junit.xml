@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="intentional-failure" tests="1" failures="1">
+  <properties>
+    <property name="argv" value="[&quot;fixture-fail&quot;,&quot;--case&quot;]"/>
+    <property name="exit_code" value="17"/>
+    <property name="seed" value="424242"/>
+    <property name="runner_fingerprint" value="sha256:923f0f4471f75a736b12da595afe67d122a1db75f3307058975a54187a5e6930"/>
+  </properties>
+  <testcase name="intentional-failure">
+    <failure message="command exited with 17"/>
+    <system-out>sha256:615ae2cf629d666c76776c73159a291fb431cb71b44a61bedfb60a08da46bbf8</system-out>
+    <system-err>sha256:0f1fcdc2382e33d879d9599701d948f391e53aeba24826b9d229233ab82d4937</system-err>
+  </testcase>
+</testsuite>

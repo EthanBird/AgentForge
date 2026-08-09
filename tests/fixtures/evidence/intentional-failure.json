@@ -1,0 +1,21 @@
+{
+  "schema_version": "agentforge.test-evidence/v1",
+  "case_name": "intentional-failure",
+  "argv": [
+    "fixture-fail",
+    "--case"
+  ],
+  "exit_code": 17,
+  "seed": 424242,
+  "runner_fingerprint": "sha256:923f0f4471f75a736b12da595afe67d122a1db75f3307058975a54187a5e6930",
+  "runner": {
+    "runner_id": "runner-fixture",
+    "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+    "operating_system": "linux",
+    "architecture": "x86_64"
+  },
+  "status": "FAIL",
+  "stdout_sha256": "sha256:615ae2cf629d666c76776c73159a291fb431cb71b44a61bedfb60a08da46bbf8",
+  "stderr_sha256": "sha256:0f1fcdc2382e33d879d9599701d948f391e53aeba24826b9d229233ab82d4937"
+}
