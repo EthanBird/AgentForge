@@ -7,5 +7,7 @@
 | [ADR-0003](ADR-0003-A2A-BOUNDARY.md) | A2A 是边界协议，AFWP 是内部执行契约 | Accepted |
 | [ADR-0004](ADR-0004-JCODE-SIDECAR.md) | jcode 通过受监督的 TypeScript sidecar 接入 | Accepted |
 | [ADR-0005](ADR-0005-GIT-RELAY.md) | 跨网络提交采用受验证的 Git Relay | Accepted |
+| [ADR-0006](ADR-0006-INVOCATION-ORCHESTRATION.md) | Agent 调用采用 Signal、Intent、InvocationRun 与原子预算编排 | Accepted |
+| [ADR-0007](ADR-0007-GOVERNANCE-DECISION-DESK.md) | 治理采用精确动作 Decision 与可重建 Control Room 投影 | Accepted |
 
 ADR 一经接受不得被普通任务包隐式修改。改变决定必须新增 ADR，并在 `Supersedes` 中引用被替代记录。

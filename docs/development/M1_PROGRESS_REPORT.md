@@ -4,7 +4,7 @@
 - 阶段：M1 控制平面与 Control Room
 - 基线提交：`90295a1be4acc1b018e0d927cd7ba3d851f96c2e`
 - 开发分支：`agent/m1-control-room`
-- 当前状态：已启动
+- 当前状态：M1-A 契约冻结；M1-B/M1-C/M1-D 并行实现中
 
 ## 1. 阶段目标
 
@@ -55,8 +55,11 @@ M1 在 M0 已冻结的 AFWP、Attempt、Lease、Candidate-first、receipt-first�
 | --- | --- | --- |
 | M0 远端恢复验证 | 完成 | 基线包含最终 97/97 测试报告及 early-failure stage-shape 修复 |
 | M1 分支与进度账本 | 完成 | 本文件与文档索引 |
-| M1-A 详细规格 | 进行中 | ADR-0006、ADR-0007 与开发规格待提交 |
-| M1-B 以后实现 | 未开始 | 将按检查点推进 |
+| M1-A 详细规格 | 完成 | ADR-0006、ADR-0007、开发规格 11/12 与 WP-M1-008..012 已冻结；链接、围栏、工单 ID 与 workspace layout 检查通过 |
+| M1-B Invocation 领域模型 | 进行中 | RunSignal、InvocationIntent/Run、RunClaim、SessionCapsule 与 BudgetReservation 正在实现 |
+| M1-C Governance 领域模型 | 进行中 | GovernanceCase、Decision 与 PolicyRevision 正在实现 |
+| M1-D Application/read models | 进行中 | Repository/UoW ports 与可重建 Control Room projections 正在实现 |
+| M1-E 以后实现 | 未开始 | 按独立门禁完成后逐检查点提交并推送 |
 
 ## 5. 当前风险与处理
 

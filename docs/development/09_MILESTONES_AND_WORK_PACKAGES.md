@@ -19,7 +19,7 @@ MVP 必须证明的不是“同时启动多个聊天”，而是以下闭环：
 9. Boss 会话结束后 Obligation Engine 仍能唤起后续规划与督办；
 10. 异构 Executor 路由和结算决策可解释、可重放。
 
-MVP 不做：公有悬赏市场与现金支付、多地域强一致控制面、任意第三方不可信代码的完全隔离、复杂 Kubernetes 调度、原生移动客户端、全功能项目管理 UI。先提供 API、CLI 和只读运维页面。
+MVP 不做：公有悬赏市场与现金支付、多地域强一致控制面、任意第三方不可信代码的完全隔离、复杂 Kubernetes 调度、原生移动客户端、全功能项目管理 UI。M1 提供 API、CLI 和只有受限 typed command 的 Thin Control Room，不提供可变 Ticket 或通用状态 PATCH。
 
 ## 2. 技术基线与仓库约定
 
@@ -107,11 +107,11 @@ flowchart TD
 | 里程碑 | 演示出口 | 建议规模 |
 | --- | --- | ---: |
 | M0 | Schema、hash、事件/错误、Linter、四状态机和故障模拟一致 | 10–15 Agent 日 |
-| M1 | PostgreSQL 事实源完成 publish/offer/claim/lease/fencing 闭环 | 15–22 Agent 日 |
-| M2 | Linux Worker + jcode 可恢复执行；三 Worker 并行和断线场景通过 | 18–25 Agent 日 |
+| M1 | PostgreSQL 事实源完成 lease/fencing、Invocation、预算、治理与 Thin Control Room 闭环 | 24–34 Agent 日 |
+| M2 | Linux Worker + jcode/AgentAdapter 可恢复执行；三 Worker 并行和断线场景通过 | 20–30 Agent 日 |
 | M3 | candidate/evidence/reviewer/clean reproduction 绑定同一 Commit | 15–22 Agent 日 |
 | M4 | 外部 Worker 通过 Git Bundle Relay，Merge Queue 在最新目标复验 | 10–16 Agent 日 |
-| M5 | Boss session 退出后 obligation 持续推进；基础异构路由可解释 | 20–30 Agent 日 |
+| M5 | Boss session 退出后 obligation 持续推进；路由、策略和治理决策可解释、可回滚 | 24–36 Agent 日 |
 | M6 | 备份恢复、观测、故障演练、24 小时 soak 与 `v0.1.0` 试点 | 15–25 Agent 日 |
 
 这些估算用于预算上界，不作为 Worker 自报工期。每个 Work Package 应控制在约 0.5–2 Agent 日；超过 2 日或触及三个以上公共组件时，Planner 必须重新拆分。
@@ -123,11 +123,11 @@ flowchart TD
 | 组件轨别名 | 所属权威里程碑 | 内容 |
 | --- | --- | --- |
 | Foundation / Protocol | M0 | workspace、测试支撑、AFWP/Submission、状态、hash、event/error、Linter |
-| Control Plane | M1 | PostgreSQL、WorkGraph、Offer/Bid、Lease/Gateway |
-| Worker | M2 | Node、Journal、jcode、Supervisor、local verifier、恢复 |
+| Control Plane | M1 | PostgreSQL、WorkGraph、Lease/Gateway、Invocation、预算、治理投影、Thin Control Room |
+| Worker | M2 | Node、Journal、jcode、Supervisor、AgentAdapter、SessionCapsule、local verifier、恢复 |
 | Verification | M3 | Candidate、Submission/Evidence、Clean Runner、Reviewer |
 | Git | M4 | Bundle Relay、Merge Queue 与 L5 |
-| Boss / Routing | M5 | Project Contract、Decomposition、Obligation、PlanPatch、Matcher |
+| Boss / Routing | M5 | Project Contract、Decomposition、Obligation、PlanPatch、Matcher、PolicyRevision、Decision Desk |
 | Operations / Pilot | M6 | telemetry、恢复、chaos、真实试点与发布 |
 
 ## 6. M0：工程基础工单
@@ -312,9 +312,78 @@ flowchart TD
 - AC-M1-007-C：Worker 客户端时间不能延迟到期；renew 与 expire 并发时由同一事务/CAS 决出唯一结果；hard
 - AC-M1-007-D：执行失败按持久 backoff 重试，达到上限产生可见告警而不丢义务；hard
 
+### WP-M1-008：Invocation 账本、Signal 合并与 RunClaim
+
+- 类型：specification + implementation；路由：`workflow.invocation-orchestration`；风险：critical；估算：2.0 Agent 日
+- 依赖：WP-M0-005、WP-M1-002、WP-M1-005
+- 规格：[11_INVOCATION_ORCHESTRATION.md](11_INVOCATION_ORCHESTRATION.md)
+- allowed paths：`crates/domain/src/invocation/**`、`crates/application/src/invocation/**`、`crates/persistence-postgres/**`、`migrations/**invocation*`、相关测试
+- 交付：`RunSignal -> InvocationIntent -> InvocationRun`；RunClaim generation；immutable binding；active intent dedup；Outbox dispatcher/reconciler 骨架；稳定错误码
+- AC-M1-008-A：同一 cause/binding Signal 并发重放 100 次只产生一个 active Intent、一个有效 Run 和完整 Signal 映射；hard
+- AC-M1-008-B：Package revision、Attempt/Lease generation、permission Decision、取消或 PolicyRevision 任一变化都产生独立 Intent，不与旧项合并；hard
+- AC-M1-008-C：一个 Attempt 可有多个 InvocationRun；任一 Run `COMPLETED/FAILED/CANCELLED` 都不能直接完成 Attempt、WorkPackage、VerificationRun 或 Submission；hard
+- AC-M1-008-D：32 个并发 Run claim 对同一 Run 只有一个 ACTIVE generation；旧 holder 的回写返回 `AF_INVOCATION_CLAIM_STALE`；hard
+- AC-M1-008-E：Run/binding/claim/outbox 在事务提交前 Adapter 调用数为零；commit 后丢响应可凭稳定 invocation key 恢复；hard
+- AC-M1-008-F：非幂等调用 outcome unknown 先进入 `RECONCILING` 并查询证据；无法证明时终结旧 Run、创建新 Signal，不复活或盲重发旧 Run；hard
+- AC-M1-008-G：Node heartbeat 不创建模型调用、不刷新语义进度；signal storm 有 active 上限、rate limit 和可见 GovernanceCase；hard
+
+### WP-M1-009：分层预算账户与原子 BudgetReservation
+
+- 类型：implementation；路由：`backend.transactional-budgeting`；风险：critical；估算：2.0 Agent 日
+- 依赖：WP-M1-004、WP-M1-005、WP-M1-008
+- allowed paths：`crates/domain/src/budget/**`、`crates/application/src/budget/**`、`crates/persistence-postgres/**`、`migrations/**budget*`、相关测试
+- 交付：Project/Package/Attempt 预算账户；AUTHOR/RUNNER/REVIEWER/ARTIFACT/INTEGRATION/RECOVERY pool；父子 Reservation；reserve/settle/release；usage receipt
+- AC-M1-009-A：32 路并发 reserve 在相同 account/parent 下永不使 `reserved + spent > limit`，余额不足的事务在外部调用前失败；hard
+- AC-M1-009-B：作者 Run 不能消费 Runner、Reviewer、Artifact 或 Integration 的保护额度；错误 category 稳定拒绝；hard
+- AC-M1-009-C：Claim/Run/child Reservation/Outbox 同事务；任一 commit point kill/restart 后无孤儿 Run、claim 或重复扣款；hard
+- AC-M1-009-D：相同 usage/settlement cause 重放 100 次只结算一次，account/parent/child 不出现负数或双计；hard
+- AC-M1-009-E：outcome unknown 的额度保持有界 HELD/ACTIVE，只有对账、显式取消或服务器时间上限后释放；hard
+- AC-M1-009-F：客户端时钟和 Adapter 自报价格不能改变 expiry/limit；预算追加走 GovernanceCase，不能直接 UPDATE account；hard
+
+### WP-M1-010：GovernanceCase、Decision 与精确动作执行
+
+- 类型：specification + implementation；路由：`governance.decision-workflow`；风险：critical；估算：2.0 Agent 日
+- 依赖：WP-M0-005、WP-M1-002、WP-M1-008
+- 规格：[12_GOVERNANCE_CONTROL_ROOM_UI.md](12_GOVERNANCE_CONTROL_ROOM_UI.md)
+- allowed paths：`crates/domain/src/governance/**`、`crates/application/src/governance/**`、`crates/control-plane/src/governance/**`、`crates/persistence-postgres/**`、`migrations/**governance*`、相关测试
+- 交付：GovernanceCase 状态机；append-only Decision；JCS action digest；ExecutionReceipt/claim；permission wake；typed Preview/Decide API
+- AC-M1-010-A：action 参数、subject/version、AFWP revision/hash、Attempt/Lease/Run generation、PolicyRevision 或 resource digest 任一变化使旧批准返回 `AF_GOVERNANCE_ACTION_STALE`；hard
+- AC-M1-010-B：同 actor/idempotency key/payload 重放 100 次只产生一条 Decision；同 key 不同 payload 稳定失败；hard
+- AC-M1-010-C：`APPROVE` 不等于 `APPLIED`；只有匹配 action digest 和 execution claim 的 Receipt/Event 才能终结 Case；ACK 丢失可对账；hard
+- AC-M1-010-D：critical Case 的 requester/author 不能成为唯一 approver；人工批准不放宽独立 Reviewer/Runner；hard
+- AC-M1-010-E：permission Decision 只满足绑定 Case/question 的 `WaitingInput + PermissionDecided`，不新增 `WAITING_PERMISSION` 状态且不唤醒其他 Attempt；hard
+- AC-M1-010-F：OperatorNote、附件和 `@mention` 不能修改 AFWP、capability、预算或 Lease；scope/AC 变化只能形成新 revision/PlanPatch；hard
+
+### WP-M1-011：Control Room Read Model、Query API 与 SSE
+
+- 类型：implementation；路由：`backend.projections-query`；风险：high；估算：2.0 Agent 日
+- 依赖：WP-M1-003、WP-M1-008、WP-M1-009、WP-M1-010
+- allowed paths：`crates/application/src/projection/**`、`crates/control-plane/src/query/**`、`crates/persistence-postgres/**`、`migrations/**projection*`、相关 contract/integration tests
+- 交付：Project、WorkGraph、InvocationRun、Governance inbox、Fleet、Budget、Lineage、Activity 八类投影；游标/ETag Query API；签名 cursor 稀疏 SSE；影子重建
+- AC-M1-011-A：固定 seed 的 100,000 个事件在线投影与从空表 replay 的八类 digest 完全一致；重复/乱序/handler crash 无重复计数；hard
+- AC-M1-011-B：删除或延迟投影不影响 Lease、RunClaim、Candidate、Submission 或 Decision 授权；command handler 只读权威表；hard
+- AC-M1-011-C：SSE 在 cursor 37 断线恢复后 snapshot + invalidation 无缺口；重复 invalidation 无副作用，过期 cursor 明确要求重拉；hard
+- AC-M1-011-D：游标签名绑定 actor/tenant/project；列表、计数、搜索、SSE 和错误 details 的 ACL 测试不泄漏跨租户对象；hard
+- AC-M1-011-E：投影/JSON/log/trace 不含 Secret、token、完整 Prompt、CoT 或 Capsule 正文；restricted 字段按 ACL 裁剪；hard
+- AC-M1-011-F：所有列表稳定游标分页、单页上限 200；summary 支持 ETag；低带宽模式没有每秒全量轮询或原始 event firehose；hard
+
+### WP-M1-012：Thin Control Room 与 Decision Desk
+
+- 类型：implementation + e2e；路由：`frontend.governance-control-room`；风险：high；估算：2.0 Agent 日
+- 依赖：WP-M1-006、WP-M1-011
+- allowed paths：`ui/**`、Control Room 静态资源/API adapter、`tests/e2e/control-room/**`、相关文档
+- 交付：Decision Desk 默认首页；Project Work/Run/Decision/Budget/Fleet/Lineage/Activity；详情 drawer；Preview/Confirm；受限 typed command；桌面/窄屏/a11y
+- AC-M1-012-A：操作者能从 Case 原因、Evidence、影响、超时结果进入 Preview/Approve/Deny，并且只在验证 Receipt 后显示 `APPLIED`；hard
+- AC-M1-012-B：Preview 后 action/version 变 stale 时 Confirm 显示结构化差异并拒绝；前端不能自动迁移旧批准；hard
+- AC-M1-012-C：UI 分开显示 Attempt、作者 Lease、InvocationRun、Candidate、Verification、Submission、Integration；Run 完成不得显示 Task Done；hard
+- AC-M1-012-D：PauseProjectDispatch、CancelInvocationRun、RevokeAuthorLease、DrainExecutor、QuarantineNode 有不同影响预览；不存在通用 Stop/PATCH status/直接改库路径；hard
+- AC-M1-012-E：普通评论只生成 OperatorNote，`@mention` 只生成去重 Signal；所有 mutation 可追到 typed command、actor、digest、Decision/receipt/event；hard
+- AC-M1-012-F：320 CSS px、200% zoom、键盘-only、screen reader、focus restore、reduced-motion 和 WCAG 2.2 AA 关键路径通过；hard
+- AC-M1-012-G：离线禁用 mutation且联网后不自动回放 Decision；XSS/SVG/link、CSRF、IDOR、Cookie、CSP 和 Secret scanning fixture 全通过；hard
+
 #### M1 退出门禁
 
-通过 API 发布 AFWP、报价、claim、激活/续期/过期；PostgreSQL 故障注入后状态可重建；到期义务可恢复；旧 generation 永远无法产生 checkpoint/artifact 等正式副作用。Submission 的完整证据登记留到 M3。
+通过 API 发布 AFWP、报价、claim、激活/续期/过期；Signal/Intent/Run、RunClaim 和预算在 PostgreSQL 中可恢复且不超卖；Governance Decision 绑定精确动作；八类投影可从空表重建；Thin Control Room 只能经 typed command 操作。旧 generation 永远无法产生 checkpoint/artifact 等正式副作用，Run 完成不能冒充 Candidate/验收完成。Submission 的完整证据登记留到 M3。
 
 ## 9. M2：Worker Runtime 与 jcode
 
@@ -394,12 +463,27 @@ flowchart TD
 - AC-M2-007-C：CPU、memory、pids、disk/timeout 上限可执行，超限产生结构化 failure dossier；hard
 - AC-M2-007-D：Agent 退出/取消/Worker 重启后无孤儿容器和子进程，工作区与 Journal 保留策略正确；hard
 
+### WP-M2-008：AgentAdapter、SessionCapsule 与中央 Run 恢复
+
+- 类型：implementation + integration；路由：`worker.agent-adapter`；风险：critical；估算：2.0 Agent 日
+- 依赖：WP-M1-008、WP-M1-009、WP-M1-010、WP-M2-003、WP-M2-004、WP-M2-006
+- 规格：[11_INVOCATION_ORCHESTRATION.md](11_INVOCATION_ORCHESTRATION.md)
+- allowed paths：`crates/application/src/agent_adapter/**`、`crates/worker-daemon/src/invocation/**`、`adapters/jcode-bridge/**`、相关 protocol/integration tests
+- 交付：`AgentAdapter` prepare/start/query/resume/interrupt/cancel/snapshot；jcode 实现；内容寻址 SessionCapsule；Run/Turn/Attempt 映射；outcome-unknown 对账
+- AC-M2-008-A：同一 Attempt 连续启动、Worker kill 和 session resume 形成多个不可逆 InvocationRun，旧 Run 不复活且 Workspace/Capsule/AFWP/fingerprint binding 全匹配；hard
+- AC-M2-008-B：一个 InvocationRun 内多个 jcode Turn 只写本地 Journal；`turn_done` 不能直接完成 Run、Attempt、Package 或 Candidate；hard
+- AC-M2-008-C：Adapter 已启动/完成但 ACK 丢失时，query/session marker 找回同一调用和结果；不会盲重发非幂等代码或外部副作用；hard
+- AC-M2-008-D：不支持 query 的 Adapter 只可接 `safe_to_repeat=true` 任务；否则 unknown 终结并创建诊断 Case；hard
+- AC-M2-008-E：Capsule 只含结构化 checkpoint/ref/digest；Secret、bearer、Git credential、完整 Prompt 和 chain-of-thought 扫描为零发现；hard
+- AC-M2-008-F：RunClaim 有效但作者 Lease 已过期时只允许只读收尾/salvage，正式 checkpoint/Artifact/Candidate 仍被 generation fencing；hard
+
 #### M2 退出门禁
 
 - 单 Worker 用 fake Executor 走到 WorkerPhase `AuthorComplete`（服务端 AttemptState 为 `Candidate`）；再用真实 jcode 完成一个低风险 fixture 的本地门禁；M2 可以用 fake Candidate Broker，正式 sealing/独立验收由 M3 实现；
 - 三 Worker 同时完成三个不冲突任务；
 - 强制 kill Worker、断网和 Lease 过期，恢复后 journal 一致；
-- Lease 丢失后 generation 3 的 Git、Artifact 和正式 Candidate 登记副作用立即停止；generation 4 可从新 Attempt 正常推进。
+- Lease 丢失后 generation 3 的 Git、Artifact 和正式 Candidate 登记副作用立即停止；generation 4 可从新 Attempt 正常推进；
+- jcode session 通过 Capsule/Adapter 对账恢复，Run、Turn、Attempt 边界和预算结算可审计。
 
 ## 10. M3：候选、证据与独立验收
 
@@ -586,18 +670,45 @@ Root Boss 为演示项目生成接口、CRUD、前端、Review、Integration 包
 - AC-M5-009-C：高返工低首价 fixture 中，expected total cost 路由选择更稳候选；hard
 - AC-M5-009-D：作者、Reviewer、Runner、integration reserve 总额不超 AFWP budget；hard
 
+### WP-M5-010：PolicyRevision 模拟、激活与回滚
+
+- 类型：implementation；路由：`governance.policy-lifecycle`；风险：critical；估算：2.0 Agent 日
+- 依赖：WP-M1-010、WP-M5-004、WP-M5-007
+- 规格：[12_GOVERNANCE_CONTROL_ROOM_UI.md](12_GOVERNANCE_CONTROL_ROOM_UI.md)
+- allowed paths：`crates/domain/src/policy/**`、`crates/application/src/policy/**`、`crates/control-plane/src/policy/**`、`crates/matcher/src/policy/**`、相关 migrations/tests
+- 交付：immutable PolicyRevision；Schema/Linter；deterministic simulation；impact report；CAS activation；显式 rollback；activation history
+- AC-M5-010-A：相同 revision/snapshot/engine/seed 的 simulation 输出字节一致并可重放到命中 rule、路由、预算、权限和受影响对象；hard
+- AC-M5-010-B：两个并发 activation 使用相同 current version 时只有一个成功；失败返回 `AF_POLICY_REVISION_STALE` 且没有部分生效；hard
+- AC-M5-010-C：action、impact snapshot 或 current PolicyRevision 变化使旧 Governance Decision 失效；不能把旧批准迁移到新 digest；hard
+- AC-M5-010-D：rollback 以新 activation event 重新选择已知 revision，保留被回滚文档、历史、actor、原因和影响报告；hard
+- AC-M5-010-E：激活/回滚不原地改写已有 Run、Attempt、Lease、AFWP 或 Candidate；影响只通过 Signal/Case 和显式 continue/drain/cancel/reassign/reverify 决策发生；hard
+- AC-M5-010-F：Policy document、simulation 与日志不含 Secret；restricted scope ACL 和审计 fixture 全通过；hard
+
+### WP-M5-011：完整 Governance Decision Desk
+
+- 类型：implementation + e2e；路由：`frontend.governance-operations`；风险：high；估算：2.0 Agent 日
+- 依赖：WP-M1-012、WP-M5-003、WP-M5-009、WP-M5-010
+- allowed paths：`ui/**`、`crates/control-plane/src/governance/**`、`crates/application/src/projection/**`、`tests/e2e/governance/**`
+- 交付：跨项目 Decision Desk；multi-approver quorum；同质 Case 批处理；Policy impact；route/budget/fleet explanations；移动关键路径
+- AC-M5-011-A：critical quorum 强制 requester/author/approver 角色独立；权限撤销或 expiry 后旧 Decision 不计 quorum；hard
+- AC-M5-011-B：每个路由 Case 先显示硬过滤拒绝码、fingerprint/qualification、decision snapshot、Pareto/score 和预算影响，不能只显示不透明 confidence；hard
+- AC-M5-011-C：策略激活前可比较 current/proposed simulation 和受影响 Run/Package；激活后 receipt、Signal 和 fallback 可追踪；hard
+- AC-M5-011-D：批处理只接受 action schema/risk/policy/timeout 相同的 Case，并逐项重算 digest；单项 stale 不得绕过或回滚已合法项；hard
+- AC-M5-011-E：320 px 可完成证据查看、批准/拒绝、策略安全回滚和 Executor quarantine；危险动作始终 Preview/Confirm且 WCAG 2.2 AA；hard
+- AC-M5-011-F：评论、线程、附件和组织图不取代 immutable AFWP、capability/fingerprint 路由、Candidate-first 或独立验收；不存在 mutable Ticket 真相；hard
+
 #### M5 退出门禁
 
-配置四类异构 Executor bootstrap 先验，运行标准基准和至少 10 个 low-risk Canary；所有选择可解释到硬过滤、后验、Pareto 和 policy；新模型升级不会继承 TRUSTED 状态。
+配置四类异构 Executor bootstrap 先验，运行标准基准和至少 10 个 low-risk Canary；所有选择可解释到硬过滤、后验、Pareto 和 PolicyRevision；策略可模拟、CAS 激活和回滚；critical Decision 满足独立 quorum；新模型升级不会继承 TRUSTED 状态。
 
 ## 14. M6：硬化、试点与灾难恢复
 
-### WP-M6-001：指标、追踪与操作看板
+### WP-M6-001：生产观测与 Control Room 硬化
 
 - 类型：implementation；路由：`operations.observability`；风险：medium；估算：2.0 Agent 日
-- 依赖：WP-M1-006、WP-M2-004、WP-M4-002、WP-M5-007
-- allowed paths：`crates/**/telemetry/**`、`deploy/observability/**`、只读 console
-- 交付：OpenTelemetry；task/attempt/lease/submission timeline；route explanation；告警
+- 依赖：WP-M1-012、WP-M2-004、WP-M4-002、WP-M5-007
+- allowed paths：`crates/**/telemetry/**`、`deploy/observability/**`、`ui/**`
+- 交付：OpenTelemetry；task/attempt/lease/run/submission timeline；route explanation；生产告警与 Control Room degraded 状态
 - AC-M6-001-A：从单个 trace 可关联 package revision、attempt、lease generation、submission 和 integration；hard
 - AC-M6-001-B：指标/日志不含 token、Secret、私有 prompt；hard
 - AC-M6-001-C：stale write、deadlock suspicion、outbox lag、lease expiry storm 有告警 fixture；hard
@@ -680,8 +791,10 @@ Root Boss 为演示项目生成接口、CRUD、前端、Review、Integration 包
 | W6 | WP-M1-003、WP-M2-003、WP-M2-007 | WorkGraph；jcode；sandbox |
 | W7 | WP-M1-004、WP-M2-004 | Offer/Bid；Supervisor |
 | W8 | WP-M1-005、WP-M2-005 | fencing；local verifier |
-| W9a | WP-M1-006、WP-M1-007 → M1 Review Package | Gateway/timer 完成，M1 退出 |
-| W9b | WP-M2-006 → M2 Review Package | recovery/salvage 完成，M2 退出 |
+| W9a | WP-M1-006、WP-M1-007、WP-M1-008 | Gateway/timer 与 Invocation 账本 |
+| W9b | WP-M1-009、WP-M1-010、WP-M2-006 | 原子预算、治理领域与 Worker recovery |
+| W9c | WP-M1-011 → WP-M1-012 → M1 Review Package | 投影与 Thin Control Room，M1 退出 |
+| W9d | WP-M2-008 → M2 Review Package | Adapter/Capsule 对账恢复，M2 退出 |
 | W10 | WP-M3-001 | candidate sealing |
 | W11 | WP-M3-002 | Submission/Evidence |
 | W12 | WP-M3-003 | clean reproduction |
@@ -691,7 +804,9 @@ Root Boss 为演示项目生成接口、CRUD、前端、Review、Integration 包
 | W16 | WP-M5-001、WP-M5-006 | Boss/Profile 基础 |
 | W17 | WP-M5-002、WP-M5-003、WP-M5-007 | 分解、义务、基础 route |
 | W18 | WP-M5-004、WP-M5-008 | 动态图、保守统计/Canary |
-| W19 | WP-M5-005、WP-M5-009 → M5 Review Package | Tournament、预算/结算，M5 退出 |
+| W19a | WP-M5-005、WP-M5-009 | Tournament、预算/结算 |
+| W19b | WP-M5-010 | PolicyRevision 模拟、激活与回滚 |
+| W19c | WP-M5-011 → M5 Review Package | 完整 Decision Desk，M5 退出 |
 | W20a | WP-M6-001、WP-M6-002 | 观测与恢复基线完成 |
 | W20b | WP-M6-005 | 依赖 W20a 的安全控制闭环 |
 | W21 | WP-M6-003 | chaos gate |
@@ -729,11 +844,11 @@ af-cli graph validate <project-graph.json>
 | Gate | Reviewer 重点 | 反例/故障 |
 | --- | --- | --- |
 | M0 Review | hash、Schema、状态、event/error 与语义 Linter | 重复键、环、未覆盖 MUST、乱序 |
-| M1 Review | DB 事务、fencing、幂等、到期 timer | 双 claim、commit 丢响应、时钟偏移 |
-| M2 Review | jcode 监督、Journal、sandbox、越界 | Agent 早停、无进展、kill、磁盘满 |
+| M1 Review | DB/fencing、Invocation/预算、Governance、投影与 typed UI | 双 claim、超卖、stale approval、commit 丢响应、SSE 断线 |
+| M2 Review | jcode 监督、Journal、Adapter/Capsule、sandbox、越界 | Agent 早停、outcome unknown、kill、磁盘满、旧 Lease |
 | M3 Review | candidate/evidence/reviewer/provenance | amend、篡改、未跟踪文件、同源审查 |
 | M4 Review | Relay、Merge Queue 与 L5 | Bundle 重放、越权 ref、目标前移、冲突 |
-| M5 Review | Boss 权限、义务、路由冷启动 | 会话退出、无限拆包、旧 graph patch、零候选 |
+| M5 Review | Boss 权限、义务、路由、PolicyRevision 与 Decision quorum | 会话退出、旧 graph/policy、零候选、自批、回滚 |
 | M6 Review | 安全、恢复、发布 | DB/Worker/Git/网络组合故障与 24h soak |
 
 Review finding 必须引用 requirement/AC、精确位置、复现和证据。Reviewer 不得直接修作者候选；修复创建 rework Attempt。
