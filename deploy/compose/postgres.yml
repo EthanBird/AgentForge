@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+    restart: "no"
+    environment:
+      POSTGRES_DB: ${AGENTFORGE_POSTGRES_DB:?set an ephemeral database name}
+      POSTGRES_USER: ${AGENTFORGE_POSTGRES_USER:?set an ephemeral database user}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    ports:
+      - "127.0.0.1:${AGENTFORGE_POSTGRES_PORT:?set a free local port}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data:rw,noexec,nosuid,size=512m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 2s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+
+secrets:
+  postgres_password:
+    file: ${AGENTFORGE_POSTGRES_PASSWORD_FILE:?set an ephemeral password file}
