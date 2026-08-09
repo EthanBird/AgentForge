@@ -10,7 +10,8 @@ use crate::{
     ids::{
         ActorId, AggregateVersion, AttemptId, BudgetReservationId, CorrelationId, DecisionId,
         EventId, GovernanceCaseId, InvocationIntentId, InvocationRunId, LeaseId, PackageId,
-        PolicyRevisionId, RunSignalId, ServerInstant, SessionCapsuleId, Sha256Digest, SubmissionId,
+        PolicyRevisionId, RunClaimId, RunSignalId, ServerInstant, SessionCapsuleId, Sha256Digest,
+        SubmissionId,
     },
 };
 
@@ -26,6 +27,7 @@ pub enum AggregateType {
     RunSignal,
     InvocationIntent,
     InvocationRun,
+    RunClaim,
     SessionCapsule,
     BudgetReservation,
     GovernanceCase,
@@ -43,6 +45,7 @@ pub enum AggregateId {
     RunSignal(RunSignalId),
     InvocationIntent(InvocationIntentId),
     InvocationRun(InvocationRunId),
+    RunClaim(RunClaimId),
     SessionCapsule(SessionCapsuleId),
     BudgetReservation(BudgetReservationId),
     GovernanceCase(GovernanceCaseId),
@@ -61,6 +64,7 @@ impl AggregateId {
             Self::RunSignal(_) => AggregateType::RunSignal,
             Self::InvocationIntent(_) => AggregateType::InvocationIntent,
             Self::InvocationRun(_) => AggregateType::InvocationRun,
+            Self::RunClaim(_) => AggregateType::RunClaim,
             Self::SessionCapsule(_) => AggregateType::SessionCapsule,
             Self::BudgetReservation(_) => AggregateType::BudgetReservation,
             Self::GovernanceCase(_) => AggregateType::GovernanceCase,

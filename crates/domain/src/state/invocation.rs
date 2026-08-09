@@ -1,4 +1,4 @@
-//! Invocation intent scheduling, run claims, and immutable activation windows.
+//! Invocation intent scheduling and immutable activation windows.
 
 use std::collections::BTreeSet;
 
@@ -17,6 +17,10 @@ use crate::{
         session::{SessionCapsuleRef, TokenUsage},
     },
 };
+
+// Preserve the established public import path while ownership lives in the
+// independent run_claim module.
+pub use crate::state::run_claim::{RunClaim, RunClaimBinding, RunClaimProof, RunClaimState};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct InvocationSignalRef {
@@ -531,58 +535,6 @@ fn validate_intent_signal(signal: &InvocationSignalRef) -> Result<(), DomainErro
     signal.binding.validate_for(signal.subject)
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunClaimState {
-    Active,
-    Completed,
-    Expired,
-    Revoked,
-    Superseded,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RunClaim {
-    pub id: RunClaimId,
-    pub run_id: InvocationRunId,
-    pub claim_generation: RunClaimToken,
-    pub holder_node_id: NodeId,
-    pub state: RunClaimState,
-    pub granted_at: ServerInstant,
-    pub expires_at: ServerInstant,
-}
-
-impl RunClaim {
-    fn validate_active(&self, run_id: InvocationRunId) -> Result<(), DomainError> {
-        if self.run_id != run_id || self.state != RunClaimState::Active {
-            return Err(DomainError::InvocationClaimStale);
-        }
-        if self.granted_at >= self.expires_at {
-            return Err(DomainError::InvalidArgument {
-                field: "run_claim_window".into(),
-                reason: "must satisfy granted_at < expires_at".into(),
-            });
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RunClaimProof {
-    pub claim_id: RunClaimId,
-    pub claim_generation: RunClaimToken,
-    pub holder_node_id: NodeId,
-}
-
-impl RunClaimProof {
-    fn validate_shape(self) -> Result<(), DomainError> {
-        if self.claim_id.as_uuid().is_nil() || self.holder_node_id.as_uuid().is_nil() {
-            return Err(DomainError::InvocationClaimStale);
-        }
-        Ok(())
-    }
-}
-
 /// Authorization for a non-governance cancellation.
 ///
 /// A dedicated wrapper keeps cancellation authorization explicit in commands
@@ -691,18 +643,17 @@ impl InvocationSubject {
 pub struct ReserveInvocationRun {
     pub id: InvocationRunId,
     pub start_context: InvocationStartContext,
-    pub run_claim: RunClaim,
+    pub run_claim_binding: RunClaimBinding,
     pub reserved_at: ServerInstant,
 }
 
 impl ReserveInvocationRun {
     fn validate(&self) -> Result<(), DomainError> {
         self.start_context.validate()?;
-        self.run_claim.validate_active(self.id)?;
-        if self.run_claim.id != self.start_context.material.run_claim_id
-            || self.run_claim.claim_generation != self.start_context.material.run_claim_generation
-            || self.reserved_at < self.run_claim.granted_at
-            || self.reserved_at >= self.run_claim.expires_at
+        self.run_claim_binding.validate()?;
+        if self.run_claim_binding.claim_id != self.start_context.material.run_claim_id
+            || self.run_claim_binding.claim_generation
+                != self.start_context.material.run_claim_generation
         {
             return Err(DomainError::InvocationClaimStale);
         }
@@ -874,10 +825,12 @@ impl InvocationRunCommand {
 pub enum InvocationRunEvent {
     Reserved(Box<ReserveInvocationRun>),
     DispatchStarted {
+        proof: RunClaimProof,
         outbox_dispatch_id: ProtocolKey,
         started_at: ServerInstant,
     },
     AdapterStarted {
+        proof: RunClaimProof,
         external_invocation_key: ProtocolKey,
         session_proof_digest: Sha256Digest,
         observed_at: ServerInstant,
@@ -916,7 +869,8 @@ pub struct InvocationRun {
     /// Creation-time binding; no later event can replace it.
     pub start_context: InvocationStartContext,
     pub state: InvocationRunState,
-    pub current_claim: RunClaim,
+    /// Immutable identity only. Liveness and expiry live in RunClaim.
+    pub run_claim_binding: RunClaimBinding,
     pub outbox_dispatch_id: Option<ProtocolKey>,
     pub session_proof_digest: Option<Sha256Digest>,
     pub output_capsule: Option<SessionCapsuleRef>,
@@ -970,8 +924,10 @@ impl InvocationRun {
                         started_at,
                         ..
                     } if run.state == InvocationRunState::Reserved => {
-                        run.authorize(*proof, *started_at)?;
+                        run.validate_claim_binding(*proof)?;
+                        run.validate_time(*started_at)?;
                         Ok(InvocationRunEvent::DispatchStarted {
+                            proof: *proof,
                             outbox_dispatch_id: outbox_dispatch_id.clone(),
                             started_at: *started_at,
                         })
@@ -983,13 +939,15 @@ impl InvocationRun {
                         observed_at,
                         ..
                     } if run.state == InvocationRunState::Starting => {
-                        run.authorize(*proof, *observed_at)?;
+                        run.validate_claim_binding(*proof)?;
+                        run.validate_time(*observed_at)?;
                         if external_invocation_key
                             != &run.start_context.material.external_invocation_key
                         {
                             return Err(DomainError::EvidenceInvalid);
                         }
                         Ok(InvocationRunEvent::AdapterStarted {
+                            proof: *proof,
                             external_invocation_key: external_invocation_key.clone(),
                             session_proof_digest: *session_proof_digest,
                             observed_at: *observed_at,
@@ -1025,7 +983,7 @@ impl InvocationRun {
                     ) && *budget_settled
                         && *outcome != InvocationOutcome::OutcomeUnknown =>
                     {
-                        run.authorize(*proof, *completed_at)?;
+                        run.validate_claim_binding(*proof)?;
                         run.validate_time(*completed_at)?;
                         Ok(InvocationRunEvent::Completed {
                             proof: *proof,
@@ -1049,7 +1007,7 @@ impl InvocationRun {
                         failed_at,
                         ..
                     } if valid_reason(reason_code) && *budget_settled => {
-                        run.authorize(*proof, *failed_at)?;
+                        run.validate_claim_binding(*proof)?;
                         run.validate_time(*failed_at)?;
                         Ok(InvocationRunEvent::Failed {
                             proof: *proof,
@@ -1068,7 +1026,7 @@ impl InvocationRun {
                     } if valid_reason(reason_code)
                         && *stop_or_reconciliation_obligation_created =>
                     {
-                        run.authorize_cancellation(*authorization, *cancelled_at)?;
+                        run.validate_cancellation_binding(*authorization)?;
                         run.validate_time(*cancelled_at)?;
                         Ok(InvocationRunEvent::Cancelled {
                             authorization: *authorization,
@@ -1095,7 +1053,7 @@ impl InvocationRun {
                     id: reserve.id,
                     start_context: reserve.start_context.clone(),
                     state: InvocationRunState::Reserved,
-                    current_claim: reserve.run_claim.clone(),
+                    run_claim_binding: reserve.run_claim_binding,
                     outbox_dispatch_id: None,
                     session_proof_digest: None,
                     output_capsule: None,
@@ -1117,13 +1075,12 @@ impl InvocationRun {
             (
                 Some(run),
                 InvocationRunEvent::DispatchStarted {
+                    proof,
                     outbox_dispatch_id,
                     started_at,
                 },
-            ) if run.state == InvocationRunState::Reserved
-                && *started_at >= run.reserved_at
-                && *started_at < run.current_claim.expires_at =>
-            {
+            ) if run.state == InvocationRunState::Reserved && *started_at >= run.reserved_at => {
+                run.validate_claim_binding(*proof)?;
                 let mut next = run.with_state(InvocationRunState::Starting)?;
                 next.outbox_dispatch_id = Some(outbox_dispatch_id.clone());
                 next.started_at = Some(*started_at);
@@ -1132,6 +1089,7 @@ impl InvocationRun {
             (
                 Some(run),
                 InvocationRunEvent::AdapterStarted {
+                    proof,
                     external_invocation_key,
                     session_proof_digest,
                     observed_at,
@@ -1141,6 +1099,7 @@ impl InvocationRun {
                     == &run.start_context.material.external_invocation_key
                 && run.time_valid(*observed_at) =>
             {
+                run.validate_claim_binding(*proof)?;
                 let mut next = run.with_state(InvocationRunState::Running)?;
                 next.session_proof_digest = Some(*session_proof_digest);
                 Ok(next)
@@ -1177,7 +1136,7 @@ impl InvocationRun {
                 && *budget_settled
                 && run.time_valid(*completed_at) =>
             {
-                run.authorize(*proof, *completed_at)?;
+                run.validate_claim_binding(*proof)?;
                 let mut next = run.terminalize(InvocationRunState::Completed, *completed_at)?;
                 next.outcome = Some(*outcome);
                 next.outcome_digest = Some(*outcome_digest);
@@ -1195,7 +1154,7 @@ impl InvocationRun {
                     failed_at,
                 },
             ) if valid_reason(reason_code) && *budget_settled && run.time_valid(*failed_at) => {
-                run.authorize(*proof, *failed_at)?;
+                run.validate_claim_binding(*proof)?;
                 let mut next = run.terminalize(InvocationRunState::Failed, *failed_at)?;
                 next.terminal_reason = Some(reason_code.clone());
                 next.terminal_evidence_digest = Some(*evidence_digest);
@@ -1213,7 +1172,7 @@ impl InvocationRun {
                 && *stop_or_reconciliation_obligation_created
                 && run.time_valid(*cancelled_at) =>
             {
-                run.authorize_cancellation(*authorization, *cancelled_at)?;
+                run.validate_cancellation_binding(*authorization)?;
                 let mut next = run.terminalize(InvocationRunState::Cancelled, *cancelled_at)?;
                 next.terminal_reason = Some(reason_code.clone());
                 next.outcome = Some(InvocationOutcome::Cancelled);
@@ -1233,32 +1192,29 @@ impl InvocationRun {
         })
     }
 
-    fn authorize_identity(&self, proof: RunClaimProof) -> Result<(), DomainError> {
-        proof.validate_shape()?;
-        if proof.claim_id != self.current_claim.id
-            || proof.claim_generation != self.current_claim.claim_generation
-            || proof.holder_node_id != self.current_claim.holder_node_id
-            || self.current_claim.state != RunClaimState::Active
-        {
-            return Err(DomainError::InvocationClaimStale);
-        }
-        Ok(())
+    pub fn validate_claim_binding(&self, proof: RunClaimProof) -> Result<(), DomainError> {
+        self.run_claim_binding.validate_proof(proof)
     }
 
-    fn authorize_cancellation(
+    fn validate_cancellation_binding(
         &self,
         authorization: CancellationAuthorization,
-        now: ServerInstant,
     ) -> Result<(), DomainError> {
-        self.authorize(authorization.current_claim, now)
+        self.validate_claim_binding(authorization.current_claim)
     }
 
-    fn authorize(&self, proof: RunClaimProof, now: ServerInstant) -> Result<(), DomainError> {
-        self.authorize_identity(proof)?;
-        if now >= self.current_claim.expires_at {
-            return Err(DomainError::InvocationClaimStale);
-        }
-        Ok(())
+    /// Cross-aggregate authorization used by application command handlers.
+    ///
+    /// The immutable run binding and the current independent claim must both
+    /// agree. The application persists both transitions in one transaction.
+    pub fn authorize_claim(
+        &self,
+        claim: &RunClaim,
+        proof: RunClaimProof,
+        now: ServerInstant,
+    ) -> Result<(), DomainError> {
+        self.validate_claim_binding(proof)?;
+        claim.authorize_for_run(self.id, proof, now)
     }
 
     fn validate_time(&self, time: ServerInstant) -> Result<(), DomainError> {
@@ -1294,7 +1250,6 @@ impl InvocationRun {
             });
         }
         let mut next = self.with_state(state)?;
-        next.current_claim.state = RunClaimState::Completed;
         next.terminal_at = Some(terminal_at);
         Ok(next)
     }
@@ -1367,8 +1322,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::ids::{
-        AttemptId, FencingToken, GitObjectId, PackageId, PackageRevisionId, PolicyRevisionId,
+    use crate::{
+        ids::{
+            AttemptId, FencingToken, GitObjectId, PackageId, PackageRevisionId, PolicyRevisionId,
+        },
+        state::run_claim::{GrantRunClaim, RunClaimCommand},
     };
 
     fn id<T: From<Uuid>>(byte: u8) -> T {
@@ -1421,14 +1379,10 @@ mod tests {
         ReserveInvocationRun {
             id: id(13),
             start_context: start_context(),
-            run_claim: RunClaim {
-                id: id(12),
-                run_id: id(13),
+            run_claim_binding: RunClaimBinding {
+                claim_id: id(12),
                 claim_generation: RunClaimToken::new(1).expect("generation"),
                 holder_node_id: id(14),
-                state: RunClaimState::Active,
-                granted_at: at(0),
-                expires_at: at(100),
             },
             reserved_at: at(0),
         }
@@ -1440,6 +1394,23 @@ mod tests {
             claim_generation: RunClaimToken::new(1).expect("generation"),
             holder_node_id: id(14),
         }
+    }
+
+    fn independent_claim() -> RunClaim {
+        RunClaim::transition(
+            None,
+            &RunClaimCommand::Grant(GrantRunClaim {
+                id: id(12),
+                run_id: id(13),
+                previous_generation: None,
+                claim_generation: RunClaimToken::new(1).expect("generation"),
+                holder_node_id: id(14),
+                granted_at: at(0),
+                expires_at: at(100),
+            }),
+        )
+        .expect("grant independent claim")
+        .aggregate
     }
 
     fn running_run_with_events() -> (InvocationRun, Vec<InvocationRunEvent>) {
@@ -1645,6 +1616,16 @@ mod tests {
         let reserved =
             InvocationRun::transition(None, &InvocationRunCommand::Reserve(Box::new(reserve())))
                 .expect("reserve");
+        let claim = independent_claim();
+        let immutable_binding = reserved.aggregate.run_claim_binding;
+        reserved
+            .aggregate
+            .authorize_claim(&claim, proof(), at(1))
+            .expect("cross aggregate authorization");
+        assert_eq!(
+            reserved.aggregate.authorize_claim(&claim, proof(), at(100)),
+            Err(DomainError::InvocationClaimStale)
+        );
         assert_ne!(
             reserved
                 .aggregate
@@ -1652,7 +1633,7 @@ mod tests {
                 .material
                 .author_lease_id
                 .map(|id| id.into_uuid()),
-            Some(reserved.aggregate.current_claim.id.into_uuid())
+            Some(reserved.aggregate.run_claim_binding.claim_id.into_uuid())
         );
         let cancelled = InvocationRun::transition(
             Some(&reserved.aggregate),
@@ -1668,6 +1649,8 @@ mod tests {
         )
         .expect("cancel")
         .aggregate;
+        assert_eq!(cancelled.run_claim_binding, immutable_binding);
+        assert_eq!(claim.state, RunClaimState::Active);
         assert!(matches!(
             InvocationRun::decide(
                 Some(&cancelled),
@@ -1686,6 +1669,26 @@ mod tests {
 
     #[test]
     fn malicious_terminal_events_cannot_bypass_claim_budget_or_stop_obligation() {
+        let reserved =
+            InvocationRun::transition(None, &InvocationRunCommand::Reserve(Box::new(reserve())))
+                .expect("reserve");
+        let wrong_dispatch = InvocationRunEvent::DispatchStarted {
+            proof: RunClaimProof {
+                holder_node_id: id(99),
+                ..proof()
+            },
+            outbox_dispatch_id: ProtocolKey::new("forged-dispatch").expect("key"),
+            started_at: at(1),
+        };
+        assert_eq!(
+            InvocationRun::apply_event(Some(&reserved.aggregate), &wrong_dispatch),
+            Err(DomainError::InvocationClaimStale)
+        );
+        assert_eq!(
+            InvocationRun::replay(&[reserved.events[0].clone(), wrong_dispatch]),
+            Err(DomainError::InvocationClaimStale)
+        );
+
         let (running, prefix) = running_run_with_events();
         let wrong_claim = RunClaimProof {
             holder_node_id: id(99),
