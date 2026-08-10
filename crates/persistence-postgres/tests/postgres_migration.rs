@@ -439,8 +439,8 @@ async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
                version, event_seq)
             VALUES
               ('{verification_run}', '{project}', '{candidate}', repeat('b',40), 'QUEUED',
-               clock_timestamp() - interval '5 seconds',
-               clock_timestamp() - interval '5 seconds', 1, 1);
+               transaction_timestamp() - interval '5 seconds',
+               transaction_timestamp() - interval '5 seconds', 1, 1);
             INSERT INTO aggregate_event_heads
               (project_id, aggregate_type, aggregate_id, aggregate_version, last_event_seq)
             VALUES

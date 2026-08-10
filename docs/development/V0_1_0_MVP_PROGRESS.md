@@ -390,8 +390,10 @@ upload intent、`RecordCandidate + VerificationRun::Queued` 仍未接通，不�
 
 ## MVP-03 / Checkpoint M：Candidate Artifact HTTP 与 Worker adapter
 
-状态：实现完成，application/control-plane/worker 定点门禁通过；等待本检查点推送后的全工作区与
-PostgreSQL 17 CI。
+状态：实现完成，全工作区门禁与 CI #78 Rust job 通过。CI #78 的 PostgreSQL migration job 继续发现
+同类正向 fixture 问题：VerificationRun 初态要求 `queued_at == updated_at`，测试却分别调用两次 volatile
+`clock_timestamp()`；已在 Checkpoint M.1 改用同一 transaction timestamp，等待修复推送后的 PostgreSQL
+17 复验。
 
 当前完成：
 
@@ -409,6 +411,8 @@ PostgreSQL 17 CI。
   领域错误保持一致；
 - CI #76 暴露的 Candidate migration 正向 fixture 时间不稳定已修：同一初始 Artifact 的
   `created_at/updated_at` 改用相同 transaction timestamp，避免测试数据偶然违反真实数据库不变量。
+- CI #78 进一步证明 VerificationRun fixture 存在相同缺陷；`queued_at/updated_at` 也已改用相同
+  transaction timestamp。两处都是测试数据修复，数据库的 fail-closed 时间不变量保持不变。
 
 本地证据：
 
