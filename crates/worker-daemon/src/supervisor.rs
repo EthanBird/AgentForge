@@ -754,6 +754,7 @@ impl LocalVerifier for FakeVerifier {
 
 #[cfg(test)]
 mod tests {
+    use agentforge_application::PackageExecutionSnapshot;
     use agentforge_domain::{FencingToken, LeaseId, PackageId, PackageRevision};
     use tempfile::TempDir;
     use time::macros::datetime;
@@ -796,12 +797,21 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut journal = Journal::open(directory.path().join("journal.sqlite3")).expect("journal");
         let actor_id = id(9);
+        let canonical_document = serde_json::json!({"package": "fixture"});
+        let execution = PackageExecutionSnapshot {
+            revision: PackageRevision::new(1).expect("revision"),
+            package_hash: digest(&canonical_document).expect("package hash"),
+            base_commit: GitObjectId::new("1".repeat(40)).expect("commit"),
+            git_object_format: "sha1".to_owned(),
+            canonical_document,
+            input_snapshot: serde_json::json!({"fixtures": []}),
+        };
         let grant = AttemptGrant {
             attempt_id: id(1),
             package_id: PackageId::from_uuid(Uuid::from_bytes([2; 16])),
             package_revision: PackageRevision::new(1).expect("revision"),
-            package_hash: Sha256Digest::of_bytes("package"),
-            base_commit: GitObjectId::new("1".repeat(40)).expect("commit"),
+            package_hash: execution.package_hash,
+            base_commit: execution.base_commit.clone(),
             lease_id: LeaseId::from_uuid(Uuid::from_bytes([3; 16])),
             lease_generation: FencingToken::new(4).expect("generation"),
             lease_expires_at: at(100),
@@ -812,7 +822,7 @@ mod tests {
                 message_id: Uuid::from_bytes([10; 16]),
                 actor_id,
                 idempotency_key: IdempotencyKey::new("grant").expect("key"),
-                command: JournalCommand::Grant { grant },
+                command: JournalCommand::Grant { grant, execution },
             })
             .expect("grant")
             .state()

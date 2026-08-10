@@ -14,8 +14,8 @@ pub use error::{ApplicationError, ApplicationResult};
 pub use mvp::{
     ClaimPackageInput, ClaimedWork, CreateProjectInput, LeaseReconciliationReport, LeaseView,
     ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane, MvpError, MvpFuture,
-    MvpResult, OfferView, ProjectView, PublishPackageInput, PublishedPackage,
-    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput,
+    MvpResult, OfferView, PackageExecutionSnapshot, ProjectView, PublishPackageInput,
+    PublishedPackage, ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput,
 };
 pub use ports::{
     AppendEventsReceipt, Clock, EventAppendPort, EventRecord, IdGenerator, Isolation, PortError,

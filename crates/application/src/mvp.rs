@@ -162,6 +162,18 @@ pub struct ClaimPackageInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageExecutionSnapshot {
+    pub revision: PackageRevision,
+    pub package_hash: Sha256Digest,
+    pub base_commit: GitObjectId,
+    pub git_object_format: String,
+    pub canonical_document: Value,
+    pub input_snapshot: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimedWork {
     pub project_id: ProjectId,
     pub package_id: PackageId,
@@ -169,10 +181,13 @@ pub struct ClaimedWork {
     pub attempt_id: AttemptId,
     pub lease_id: LeaseId,
     pub fencing_token: FencingToken,
+    pub granted_at: ServerInstant,
     pub expires_at: ServerInstant,
+    pub max_expires_at: ServerInstant,
     pub package_version: AggregateVersion,
     pub attempt_version: AggregateVersion,
     pub lease_version: AggregateVersion,
+    pub execution: PackageExecutionSnapshot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -205,6 +220,7 @@ pub struct LeaseView {
     pub granted_at: ServerInstant,
     pub expires_at: ServerInstant,
     pub max_expires_at: ServerInstant,
+    pub updated_at: ServerInstant,
     pub version: AggregateVersion,
 }
 

@@ -45,6 +45,12 @@ HTTP actor 从已经验证的 request actor/Project grant 派生，客户端不�
 | `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/renew` | fencing Renew |
 | `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/release` | fencing Release |
 
+Claim 成功响应除 Attempt/Lease/CAS 版本外，还包含 `granted_at`、`expires_at`、`max_expires_at` 与
+`execution`。`execution` 固定 revision、JCS package hash、base commit、Git object format、canonical
+AFWP 和 input snapshot；控制面在事务内从 typed revision 行读取并重算摘要，Worker 必须在落本地
+Journal 前再次验证。这个内联快照只用于受控 MVP（请求/响应仍受 1 MiB 上限）；大任务后续改为内容
+寻址 artifact URI，但字段绑定和摘要语义不变。
+
 路径与 JSON 中重复的 Project/Package/Lease ID 必须完全相同。错误响应固定为：
 
 ```json

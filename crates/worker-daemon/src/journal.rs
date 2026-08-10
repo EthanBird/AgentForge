@@ -6,6 +6,7 @@
 
 use std::{path::Path, str::FromStr};
 
+use agentforge_application::PackageExecutionSnapshot;
 use agentforge_domain::{
     ActorId, AttemptId, IdempotencyKey, ProtocolKey, ServerInstant, Sha256Digest,
 };
@@ -19,8 +20,9 @@ use crate::runtime::{
     AttemptGrant, WorkerAttemptState, WorkerCommandEnvelope, WorkerError, WorkerFact, grant_fact,
 };
 
-const JOURNAL_SCHEMA_VERSION: i64 = 1;
+const JOURNAL_SCHEMA_VERSION: i64 = 2;
 const OUTBOX_DESTINATION: &str = "control-plane.worker-events";
+const MAX_INLINE_EXECUTION_BYTES: usize = 1_048_576;
 
 const SCHEMA: &str = r#"
 CREATE TABLE attempts (
@@ -54,6 +56,16 @@ CREATE TABLE journal_entries (
   entry_digest TEXT NOT NULL UNIQUE,
   occurred_at TEXT NOT NULL,
   PRIMARY KEY (attempt_id, seq)
+);
+
+CREATE TABLE execution_snapshots (
+  attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+  revision INTEGER NOT NULL CHECK (revision > 0),
+  package_hash TEXT NOT NULL,
+  base_commit TEXT NOT NULL,
+  git_object_format TEXT NOT NULL CHECK (git_object_format IN ('sha1', 'sha256')),
+  execution_json TEXT NOT NULL,
+  snapshot_digest TEXT NOT NULL
 );
 
 CREATE TABLE inbox (
@@ -125,6 +137,18 @@ CREATE TRIGGER journal_entries_are_immutable
 BEFORE UPDATE ON journal_entries
 BEGIN
   SELECT RAISE(ABORT, 'journal entries are immutable');
+END;
+
+CREATE TRIGGER execution_snapshots_are_immutable
+BEFORE UPDATE ON execution_snapshots
+BEGIN
+  SELECT RAISE(ABORT, 'execution snapshots are immutable');
+END;
+
+CREATE TRIGGER execution_snapshots_cannot_be_deleted
+BEFORE DELETE ON execution_snapshots
+BEGIN
+  SELECT RAISE(ABORT, 'execution snapshots cannot be deleted');
 END;
 
 CREATE TRIGGER journal_entries_cannot_be_deleted
@@ -200,6 +224,7 @@ END;
 pub enum JournalCommand {
     Grant {
         grant: AttemptGrant,
+        execution: PackageExecutionSnapshot,
     },
     Apply {
         attempt_id: AttemptId,
@@ -629,6 +654,13 @@ impl Journal {
         load_state(&self.connection, attempt_id)
     }
 
+    pub fn load_execution_snapshot(
+        &self,
+        attempt_id: AttemptId,
+    ) -> JournalResult<Option<PackageExecutionSnapshot>> {
+        load_execution_snapshot(&self.connection, attempt_id)
+    }
+
     pub fn recover_nonterminal(&self) -> JournalResult<Vec<WorkerAttemptState>> {
         let mut statement = self.connection.prepare(
             "SELECT attempt_id FROM attempts \
@@ -751,6 +783,8 @@ impl Journal {
         if replayed != stored {
             return Err(JournalError::Integrity);
         }
+        self.load_execution_snapshot(attempt_id)?
+            .ok_or(JournalError::Integrity)?;
         Ok(stored)
     }
 
@@ -804,7 +838,7 @@ impl Journal {
         }
 
         let request_attempt_id = match &request.command {
-            JournalCommand::Grant { grant } => grant.attempt_id,
+            JournalCommand::Grant { grant, .. } => grant.attempt_id,
             JournalCommand::Apply { attempt_id, .. } => *attempt_id,
         };
         if let Some(completion) = completion {
@@ -812,13 +846,15 @@ impl Journal {
         }
 
         let (state, fact, initial) = match &request.command {
-            JournalCommand::Grant { grant } => {
+            JournalCommand::Grant { grant, execution } => {
                 if load_state(&transaction, grant.attempt_id)?.is_some() {
                     return Err(JournalError::Runtime(WorkerError::InvalidTransition));
                 }
+                validate_execution_binding(grant, execution)?;
                 let fact = grant_fact(grant.clone())?;
                 let state = WorkerAttemptState::replay(std::slice::from_ref(&fact))?;
                 insert_attempt(&transaction, &state)?;
+                insert_execution_snapshot(&transaction, grant.attempt_id, execution)?;
                 (state, fact, true)
             }
             JournalCommand::Apply {
@@ -870,6 +906,44 @@ impl Journal {
     }
 }
 
+fn validate_execution_binding(
+    grant: &AttemptGrant,
+    execution: &PackageExecutionSnapshot,
+) -> JournalResult<()> {
+    validate_execution_shape(execution)?;
+    if execution.revision != grant.package_revision
+        || execution.package_hash != grant.package_hash
+        || execution.base_commit != grant.base_commit
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(())
+}
+
+fn validate_execution_shape(execution: &PackageExecutionSnapshot) -> JournalResult<()> {
+    let expected_format = if execution.base_commit.as_str().len() == 40 {
+        "sha1"
+    } else {
+        "sha256"
+    };
+    let canonical_bytes = serde_json_canonicalizer::to_vec(&execution.canonical_document)
+        .map_err(|_| JournalError::Serialization)?;
+    let input_bytes = serde_json_canonicalizer::to_vec(&execution.input_snapshot)
+        .map_err(|_| JournalError::Serialization)?;
+    if execution.git_object_format != expected_format
+        || !execution.canonical_document.is_object()
+        || !execution.input_snapshot.is_object()
+        || canonical_bytes
+            .len()
+            .checked_add(input_bytes.len())
+            .is_none_or(|size| size > MAX_INLINE_EXECUTION_BYTES)
+        || Sha256Digest::of_bytes(canonical_bytes) != execution.package_hash
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(())
+}
+
 fn insert_attempt(transaction: &Transaction<'_>, state: &WorkerAttemptState) -> JournalResult<()> {
     let state_json = encode(state)?;
     let state_digest = digest_json(state)?;
@@ -899,6 +973,70 @@ fn insert_attempt(transaction: &Transaction<'_>, state: &WorkerAttemptState) -> 
     } else {
         Err(JournalError::Integrity)
     }
+}
+
+fn insert_execution_snapshot(
+    transaction: &Transaction<'_>,
+    attempt_id: AttemptId,
+    execution: &PackageExecutionSnapshot,
+) -> JournalResult<()> {
+    let changed = transaction.execute(
+        "INSERT INTO execution_snapshots \
+         (attempt_id, revision, package_hash, base_commit, git_object_format, execution_json, \
+          snapshot_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            attempt_id.to_string(),
+            i64::from(execution.revision.get()),
+            execution.package_hash.to_string(),
+            execution.base_commit.as_str(),
+            &execution.git_object_format,
+            encode(execution)?,
+            digest_json(execution)?.to_string(),
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(JournalError::Integrity)
+    }
+}
+
+fn load_execution_snapshot(
+    connection: &Connection,
+    attempt_id: AttemptId,
+) -> JournalResult<Option<PackageExecutionSnapshot>> {
+    let row = connection
+        .query_row(
+            "SELECT revision, package_hash, base_commit, git_object_format, execution_json, \
+                    snapshot_digest FROM execution_snapshots WHERE attempt_id = ?1",
+            [attempt_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((revision, package_hash, base_commit, object_format, json, stored_digest)) = row
+    else {
+        return Ok(None);
+    };
+    let execution: PackageExecutionSnapshot = decode_stored(&json)?;
+    if i64::from(execution.revision.get()) != revision
+        || execution.package_hash.to_string() != package_hash
+        || execution.base_commit.as_str() != base_commit
+        || execution.git_object_format != object_format
+        || digest_json(&execution)?.to_string() != stored_digest
+    {
+        return Err(JournalError::Integrity);
+    }
+    validate_execution_shape(&execution)?;
+    Ok(Some(execution))
 }
 
 fn update_attempt(transaction: &Transaction<'_>, state: &WorkerAttemptState) -> JournalResult<()> {
@@ -1172,13 +1310,26 @@ mod tests {
         (directory, journal)
     }
 
+    fn execution() -> PackageExecutionSnapshot {
+        let canonical_document = serde_json::json!({"package": "fixture"});
+        PackageExecutionSnapshot {
+            revision: PackageRevision::new(1).expect("revision"),
+            package_hash: digest_json(&canonical_document).expect("package hash"),
+            base_commit: GitObjectId::new("1".repeat(40)).expect("commit"),
+            git_object_format: "sha1".to_owned(),
+            canonical_document,
+            input_snapshot: serde_json::json!({"fixtures": []}),
+        }
+    }
+
     fn grant() -> AttemptGrant {
+        let execution = execution();
         AttemptGrant {
             attempt_id: id(1),
             package_id: PackageId::from_uuid(Uuid::from_bytes([2; 16])),
             package_revision: PackageRevision::new(1).expect("revision"),
-            package_hash: Sha256Digest::of_bytes("package"),
-            base_commit: GitObjectId::new("1".repeat(40)).expect("commit"),
+            package_hash: execution.package_hash,
+            base_commit: execution.base_commit,
             lease_id: LeaseId::from_uuid(Uuid::from_bytes([3; 16])),
             lease_generation: FencingToken::new(4).expect("generation"),
             lease_expires_at: at(60),
@@ -1196,7 +1347,14 @@ mod tests {
     }
 
     fn grant_request() -> JournalRequest {
-        request("grant-1", 10, JournalCommand::Grant { grant: grant() })
+        request(
+            "grant-1",
+            10,
+            JournalCommand::Grant {
+                grant: grant(),
+                execution: execution(),
+            },
+        )
     }
 
     fn apply_request(
@@ -1269,6 +1427,13 @@ mod tests {
     fn journal_is_wal_full_hash_chained_and_receipt_first() {
         let (_directory, mut journal) = fixture();
         let request = grant_request();
+        assert_eq!(
+            journal
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            2
+        );
         let applied = journal.handle(&request).expect("grant applied");
         assert!(matches!(applied, JournalDisposition::Applied(_)));
         assert_eq!(applied.state().phase, WorkerPhase::Granted);
@@ -1277,6 +1442,12 @@ mod tests {
             JournalDisposition::Replay(_)
         ));
         assert_eq!(journal.pending_outbox(10).expect("outbox").len(), 1);
+        assert_eq!(
+            journal
+                .load_execution_snapshot(grant().attempt_id)
+                .expect("execution snapshot"),
+            Some(execution())
+        );
         assert_eq!(
             journal
                 .verify_attempt(grant().attempt_id)
@@ -1291,6 +1462,7 @@ mod tests {
                 lease_expires_at: at(61),
                 ..grant()
             },
+            execution: execution(),
         };
         assert_eq!(
             journal
@@ -1507,6 +1679,15 @@ mod tests {
                 .connection
                 .execute(
                     "UPDATE journal_entries SET fact_json = '{}' WHERE attempt_id = ?1",
+                    [state.attempt_id.to_string()],
+                )
+                .is_err()
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "UPDATE execution_snapshots SET execution_json = '{}' WHERE attempt_id = ?1",
                     [state.attempt_id.to_string()],
                 )
                 .is_err()

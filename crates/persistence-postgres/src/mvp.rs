@@ -3,8 +3,9 @@
 use agentforge_application::{
     ClaimPackageInput, ClaimedWork, CreateProjectInput, EventAppendPort, EventRecord, Isolation,
     LeaseReconciliationReport, LeaseView, ListOffersQuery, MvpCommand, MvpControlPlane, MvpError,
-    MvpFuture, MvpResult, OfferView, ProjectView, PublishPackageInput, PublishedPackage,
-    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, UnitOfWork, UnitOfWorkFactory,
+    MvpFuture, MvpResult, OfferView, PackageExecutionSnapshot, ProjectView, PublishPackageInput,
+    PublishedPackage, ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, UnitOfWork,
+    UnitOfWorkFactory,
 };
 use agentforge_domain::{
     ActorId, AggregateId, AggregateVersion, Attempt, AttemptId, CommandId, CommandMetadata,
@@ -33,6 +34,7 @@ use crate::uow::{
 const RECEIPT_REPLAY_HOURS: i64 = 24;
 const EVENT_SCHEMA_VERSION: u16 = 1;
 const DOMAIN_EVENT_TOPIC: &str = "agentforge.domain.v1";
+const MAX_INLINE_EXECUTION_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Copy, Debug)]
 enum LeaseTermination {
@@ -474,10 +476,13 @@ impl PostgresMvpControlPlane {
                 attempt_id,
                 lease_id,
                 fencing_token,
+                granted_at: now,
                 expires_at,
+                max_expires_at,
                 package_version: package_transition.aggregate.version,
                 attempt_version: attempt_transition.aggregate.version,
                 lease_version: lease_transition.aggregate.version,
+                execution: loaded.execution.clone(),
             };
             let effect = effect_digest(&json!({
                 "package_id": response.package_id,
@@ -650,7 +655,7 @@ impl PostgresMvpControlPlane {
             ])
             .await?;
 
-            let response = lease_view(project_id, &lease_transition.aggregate);
+            let response = lease_view(project_id, &lease_transition.aggregate, now);
             store_receipt(
                 &mut uow,
                 scope,
@@ -713,7 +718,7 @@ impl PostgresMvpControlPlane {
                 .await?;
             uow.enqueue_outbox(&[event.outbox(now, lease_id.to_string())])
                 .await?;
-            let response = lease_view(project_id, &transition.aggregate);
+            let response = lease_view(project_id, &transition.aggregate, now);
             store_receipt(
                 &mut uow,
                 scope,
@@ -741,7 +746,7 @@ impl PostgresMvpControlPlane {
         let uow = self.factory.begin(Isolation::ReadCommitted).await?;
         let result = async {
             let loaded = load_lease(&uow, project_id, lease_id, false).await?;
-            Ok(lease_view(project_id, &loaded.lease))
+            Ok(lease_view(project_id, &loaded.lease, loaded.updated_at))
         }
         .await;
         finish(uow, result).await
@@ -1030,8 +1035,50 @@ fn validate_publish_input(input: &PublishPackageInput) -> MvpResult<()> {
     }
     let canonical_bytes = serde_json_canonicalizer::to_vec(&input.canonical_document)
         .map_err(|_| agentforge_application::PortError::Serialization)?;
+    let input_bytes = serde_json_canonicalizer::to_vec(&input.input_snapshot)
+        .map_err(|_| agentforge_application::PortError::Serialization)?;
+    if canonical_bytes
+        .len()
+        .checked_add(input_bytes.len())
+        .is_none_or(|size| size > MAX_INLINE_EXECUTION_BYTES)
+    {
+        return Err(agentforge_domain::DomainError::InvalidArgument {
+            field: "package".into(),
+            reason: "inline AFWP and input snapshot exceed the 1 MiB MVP limit".into(),
+        }
+        .into());
+    }
     if Sha256Digest::of_bytes(canonical_bytes) != input.package_hash {
         return Err(agentforge_domain::DomainError::PackageHashMismatch.into());
+    }
+    Ok(())
+}
+
+fn validate_execution_snapshot(snapshot: &PackageExecutionSnapshot) -> MvpResult<()> {
+    let expected_format = if snapshot.base_commit.as_str().len() == 40 {
+        "sha1"
+    } else {
+        "sha256"
+    };
+    let canonical_bytes = serde_json_canonicalizer::to_vec(&snapshot.canonical_document)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let input_bytes = serde_json_canonicalizer::to_vec(&snapshot.input_snapshot)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    if snapshot.git_object_format != expected_format
+        || !snapshot.canonical_document.is_object()
+        || !snapshot.input_snapshot.is_object()
+        || snapshot
+            .package_hash
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        || canonical_bytes
+            .len()
+            .checked_add(input_bytes.len())
+            .is_none_or(|size| size > MAX_INLINE_EXECUTION_BYTES)
+        || Sha256Digest::of_bytes(canonical_bytes) != snapshot.package_hash
+    {
+        return Err(agentforge_application::PortError::Integrity.into());
     }
     Ok(())
 }
@@ -1058,6 +1105,7 @@ fn validate_claim_input(input: &ClaimPackageInput) -> MvpResult<()> {
 struct LoadedPackage {
     package: WorkPackage,
     base_commit: GitObjectId,
+    execution: PackageExecutionSnapshot,
     event_seq: u64,
     dependencies_satisfied: bool,
 }
@@ -1185,7 +1233,8 @@ async fn load_package_for_update(
                     w.priority, w.max_attempts, w.attempts_started, w.next_fencing_token, \
                     w.active_attempt_id, a.lease_id, a.fencing_token, w.accepted_submission_id, \
                     w.integrated_integration_id, w.integrated_commit, w.version, w.event_seq, \
-                    r.base_commit, \
+                    r.base_commit, r.package_hash, r.git_object_format, r.canonical_document, \
+                    r.input_snapshot, \
                     NOT EXISTS ( \
                         SELECT 1 FROM package_edges e \
                         JOIN work_packages dependency ON dependency.id = e.from_package_id \
@@ -1288,8 +1337,32 @@ async fn load_package_for_update(
         row.try_get::<_, String>(16)
             .map_err(|_| agentforge_application::PortError::Integrity)?,
     )?;
+    let package_hash = Sha256Digest::from_bytes(
+        row.try_get::<_, Vec<u8>>(17)
+            .map_err(|_| agentforge_application::PortError::Integrity)?
+            .try_into()
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+    );
+    let git_object_format = row
+        .try_get::<_, String>(18)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let Json(canonical_document) = row
+        .try_get::<_, Json<Value>>(19)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let Json(input_snapshot) = row
+        .try_get::<_, Json<Value>>(20)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let execution = PackageExecutionSnapshot {
+        revision,
+        package_hash,
+        base_commit: base_commit.clone(),
+        git_object_format,
+        canonical_document,
+        input_snapshot,
+    };
+    validate_execution_snapshot(&execution)?;
     let dependencies_satisfied = row
-        .try_get(17)
+        .try_get(21)
         .map_err(|_| agentforge_application::PortError::Integrity)?;
     Ok(LoadedPackage {
         package: WorkPackage {
@@ -1315,6 +1388,7 @@ async fn load_package_for_update(
             version,
         },
         base_commit,
+        execution,
         event_seq,
         dependencies_satisfied,
     })
@@ -1525,6 +1599,7 @@ async fn update_package_after_loss(
 struct LoadedLease {
     lease: Lease,
     event_seq: u64,
+    updated_at: ServerInstant,
 }
 
 async fn load_lease(
@@ -1537,7 +1612,7 @@ async fn load_lease(
     let sql = format!(
         "SELECT l.package_id, l.revision_id, l.attempt_id, l.holder_node_id, \
                 l.fencing_token, l.state, l.granted_at, l.expires_at, l.max_expires_at, \
-                l.version, l.event_seq \
+                l.version, l.event_seq, l.updated_at \
          FROM leases l JOIN work_packages w ON w.id = l.package_id \
          WHERE l.id = $1 AND w.project_id = $2{lock}"
     );
@@ -1567,6 +1642,10 @@ async fn load_lease(
             .map_err(|_| agentforge_application::PortError::Integrity)?,
     )
     .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let updated_at = ServerInstant(
+        row.try_get(11)
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+    );
     Ok(LoadedLease {
         lease: Lease {
             id: lease_id,
@@ -1603,6 +1682,7 @@ async fn load_lease(
             version,
         },
         event_seq,
+        updated_at,
     })
 }
 
@@ -1646,7 +1726,7 @@ async fn update_lease(
     Ok(())
 }
 
-fn lease_view(project_id: ProjectId, lease: &Lease) -> LeaseView {
+fn lease_view(project_id: ProjectId, lease: &Lease, updated_at: ServerInstant) -> LeaseView {
     LeaseView {
         project_id,
         package_id: lease.package_id,
@@ -1659,6 +1739,7 @@ fn lease_view(project_id: ProjectId, lease: &Lease) -> LeaseView {
         granted_at: lease.granted_at,
         expires_at: lease.expires_at,
         max_expires_at: lease.max_expires_at,
+        updated_at,
         version: lease.version,
     }
 }

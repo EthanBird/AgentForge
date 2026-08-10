@@ -331,6 +331,16 @@ impl WorkerAttemptState {
     }
 
     #[must_use]
+    pub const fn package_id(&self) -> PackageId {
+        self.package_id
+    }
+
+    #[must_use]
+    pub const fn lease_id(&self) -> LeaseId {
+        self.lease_id
+    }
+
+    #[must_use]
     pub const fn phase(&self) -> WorkerPhase {
         self.phase
     }
@@ -368,6 +378,11 @@ impl WorkerAttemptState {
     #[must_use]
     pub const fn turns_completed(&self) -> u32 {
         self.turns_completed
+    }
+
+    #[must_use]
+    pub const fn updated_at(&self) -> ServerInstant {
+        self.updated_at
     }
 }
 
@@ -409,6 +424,10 @@ pub enum WorkerCommandKind {
     ConfirmCandidateHandoff {
         candidate_id: ProtocolKey,
         observed_generation: FencingToken,
+    },
+    RenewLease {
+        observed_generation: FencingToken,
+        new_expires_at: ServerInstant,
     },
     LoseLease {
         reason: LeaseLossReason,
@@ -484,6 +503,11 @@ pub enum WorkerFactKind {
     CandidateHandoffConfirmed {
         candidate_id: ProtocolKey,
         lease_generation: FencingToken,
+    },
+    LeaseRenewed {
+        lease_generation: FencingToken,
+        previous_expires_at: ServerInstant,
+        new_expires_at: ServerInstant,
     },
     LeaseLost {
         reason: LeaseLossReason,
@@ -701,6 +725,23 @@ fn decide(state: &WorkerAttemptState, command: &WorkerCommandEnvelope) -> Worker
                 lease_generation: *observed_generation,
             }
         }
+        WorkerCommandKind::RenewLease {
+            observed_generation,
+            new_expires_at,
+        } if state.phase != WorkerPhase::Salvaging => {
+            require_generation(state, *observed_generation)?;
+            if command.observed_at >= state.lease_expires_at
+                || *new_expires_at <= state.lease_expires_at
+                || *new_expires_at <= command.observed_at
+            {
+                return Err(WorkerError::InvalidArgument("lease_renewal"));
+            }
+            WorkerFactKind::LeaseRenewed {
+                lease_generation: *observed_generation,
+                previous_expires_at: state.lease_expires_at,
+                new_expires_at: *new_expires_at,
+            }
+        }
         WorkerCommandKind::LoseLease {
             reason,
             observed_generation,
@@ -837,6 +878,21 @@ pub fn apply(state: &mut WorkerAttemptState, fact: &WorkerFact) -> WorkerResult<
             }
             state.candidate_id = Some(candidate_id.clone());
             state.phase = WorkerPhase::AuthorComplete;
+        }
+        WorkerFactKind::LeaseRenewed {
+            lease_generation,
+            previous_expires_at,
+            new_expires_at,
+        } if state.phase != WorkerPhase::Salvaging => {
+            require_generation(state, *lease_generation)?;
+            if *previous_expires_at != state.lease_expires_at
+                || fact.observed_at >= state.lease_expires_at
+                || *new_expires_at <= state.lease_expires_at
+                || *new_expires_at <= fact.observed_at
+            {
+                return Err(WorkerError::HistoryMalformed);
+            }
+            state.lease_expires_at = *new_expires_at;
         }
         WorkerFactKind::LeaseLost {
             reason,
@@ -1162,6 +1218,63 @@ mod tests {
                 ))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn lease_renewal_is_generation_fenced_monotonic_and_replay_safe() {
+        let state = from_grant(&grant()).expect("grant");
+        let transition = state
+            .transition(&command(
+                &state,
+                10,
+                WorkerCommandKind::RenewLease {
+                    observed_generation: state.lease_generation,
+                    new_expires_at: at(80),
+                },
+            ))
+            .expect("renew");
+        assert_eq!(transition.aggregate.lease_expires_at, at(80));
+
+        let stale_generation =
+            FencingToken::new(state.lease_generation.get() + 1).expect("stale generation fixture");
+        assert_eq!(
+            state
+                .transition(&command(
+                    &state,
+                    10,
+                    WorkerCommandKind::RenewLease {
+                        observed_generation: stale_generation,
+                        new_expires_at: at(80),
+                    },
+                ))
+                .expect_err("wrong generation")
+                .code(),
+            "AF_LEASE_STALE"
+        );
+        assert!(
+            state
+                .transition(&command(
+                    &state,
+                    60,
+                    WorkerCommandKind::RenewLease {
+                        observed_generation: state.lease_generation,
+                        new_expires_at: at(80),
+                    },
+                ))
+                .is_err(),
+            "an expired local Lease cannot be renewed"
+        );
+
+        let mut forged = transition.fact;
+        let WorkerFactKind::LeaseRenewed {
+            previous_expires_at,
+            ..
+        } = &mut forged.kind
+        else {
+            panic!("renewal fact")
+        };
+        *previous_expires_at = at(59);
+        assert!(apply(&mut state.clone(), &forged).is_err());
     }
 
     #[test]

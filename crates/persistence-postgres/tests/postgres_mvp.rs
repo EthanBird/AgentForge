@@ -110,6 +110,8 @@ async fn exercise_mvp(
         "title": "Compile the MVP fixture"
     });
     let canonical_bytes = serde_json_canonicalizer::to_vec(&canonical_document)?;
+    let package_hash = Sha256Digest::of_bytes(&canonical_bytes);
+    let input_snapshot = json!({"fixtures": []});
     let publish_command = MvpCommand {
         context: context("package-publish", None),
         input: PublishPackageInput {
@@ -119,11 +121,11 @@ async fn exercise_mvp(
             revision_id,
             revision: PackageRevision::new(1)?,
             schema_version: "afwp-1.0".into(),
-            canonical_document,
-            package_hash: Sha256Digest::of_bytes(canonical_bytes),
+            canonical_document: canonical_document.clone(),
+            package_hash,
             base_commit: GitObjectId::new("1".repeat(40))?,
             git_object_format: "sha1".into(),
-            input_snapshot: json!({"fixtures": []}),
+            input_snapshot: input_snapshot.clone(),
             created_by: ActorId::from_uuid(Uuid::now_v7()),
             graph_version: 0,
             priority: 75,
@@ -191,6 +193,14 @@ async fn exercise_mvp(
     assert_eq!(rejected, 19);
     let (winning_command, claimed) = winner.expect("one claim succeeds");
     assert_eq!(control.claim_package(&winning_command).await?, claimed);
+    assert_eq!(claimed.execution.revision, PackageRevision::new(1)?);
+    assert_eq!(claimed.execution.package_hash, package_hash);
+    assert_eq!(claimed.execution.canonical_document, canonical_document);
+    assert_eq!(claimed.execution.input_snapshot, input_snapshot);
+    assert_eq!(claimed.execution.base_commit.as_str(), "1".repeat(40));
+    assert_eq!(claimed.execution.git_object_format, "sha1");
+    assert!(claimed.granted_at < claimed.expires_at);
+    assert!(claimed.expires_at <= claimed.max_expires_at);
     assert!(
         control
             .list_offers(ListOffersQuery {

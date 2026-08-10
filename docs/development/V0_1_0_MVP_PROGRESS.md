@@ -77,7 +77,12 @@ HTTP handler 合同测试、API/CLI 使用说明、本地完整 workspace 门禁
 
 ## MVP-02 / Checkpoint C：可恢复 Journal 与 Turn Pump
 
-状态：本地实现和定点门禁完成；等待本次远端检查点与 CI。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端提交：`287d5b340de30f8b91f5a6f577b4e0fbd844b915`
+- GitHub Actions：CI #55 / run `31347134282`
+- Rust job：bundled SQLite build、format、workspace boundary、Clippy、全部测试通过
+- PostgreSQL 17 job：migration、UoW 与 MVP market/Lease 合同通过
 
 当前完成：
 
@@ -99,3 +104,22 @@ HTTP handler 合同测试、API/CLI 使用说明、本地完整 workspace 门禁
 - `worker-daemon` 二进制仍是组合根骨架。
 
 详细实现与恢复契约见 [14_MVP_RECOVERABLE_WORKER.md](14_MVP_RECOVERABLE_WORKER.md)。
+
+## MVP-02 / Checkpoint D：Claim 执行快照与启动 Lease 对账
+
+状态：本地实现和定点门禁完成；等待本次远端检查点与 CI。
+
+当前完成：
+
+- Claim 响应增加 `PackageExecutionSnapshot`、权威 grant/max expiry；PostgreSQL 从 typed revision 行读取
+  canonical AFWP/input/base/hash 并在返回前重算 JCS hash；
+- Worker 再次核对 Offer/Claim/执行快照绑定，并把 Grant 与执行快照原子写入 Journal schema v2；
+- 引入 transport-independent `WorkerControlPlane`，提供确定性 Offer poll 与持久化后可 exact retry 的
+  `ClaimIntent`；
+- 启动 reconciliation 校验 Project/Package/Attempt/Lease/node/generation，能导入漏收的 Renew，或在
+  Expire/Revoke/authority mismatch 后进入 `Salvaging`；
+- 本地 Lease renewal 事实强制 generation、旧/新 expiry、服务器更新时间和 replay shape；
+- Worker 定点测试增至 18 项；application、storage 和 Worker 严格 Clippy/测试通过。
+
+仍待：HTTP/mTLS transport、Claim intent 节点级预登记、自动 Renew/Release 调度、enrollment、sandbox
+与 jcode bridge。

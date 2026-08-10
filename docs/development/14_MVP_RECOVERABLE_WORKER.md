@@ -14,11 +14,14 @@
   放在同一 `BEGIN IMMEDIATE` 事务中；
 - `supervisor.rs`：确定性 Turn Pump。模型声明完成不会绕过本地 hard criteria；每次 Turn 后必须执行
   Local Verification；
+- `lifecycle.rs`：Offer 选择、稳定 Claim intent、Claim 响应校验、本地 Grant handoff 与启动 Lease
+  reconciliation；
 - `FakeTurnExecutor` / `FakeVerifier`：MVP 的确定性执行和故障注入边界，后续 jcode adapter 实现相同
   trait。
 
-本检查点没有宣称完成 Offer poll、远端 Claim/Renew、Worker enrollment、workspace sandbox 或 jcode
-进程桥接；这些属于 MVP-02 后续纵切。
+本检查点已经提供 transport-independent 的 Offer/Claim/Lease 端口和轮询函数，但没有宣称完成
+HTTP/mTLS adapter、自动 Renew 调度、Worker enrollment、workspace sandbox 或 jcode 进程桥接；这些
+属于 MVP-02 后续纵切。
 
 ## 2. 状态机边界
 
@@ -44,7 +47,7 @@ Granted -> Preparing -> Baseline -> Planning -> Implementing
 
 ## 3. SQLite Journal
 
-首次打开 Journal 会创建 schema version 1，并强制：
+首次打开 Journal 会创建 schema version 2，并强制：
 
 ```text
 PRAGMA journal_mode = WAL
@@ -59,6 +62,7 @@ PRAGMA quick_check = ok
 | --- | --- | --- |
 | `attempts` | 当前物化状态 | immutable binding、`version = journal_seq`、JCS digest |
 | `journal_entries` | 不可变事实链 | `(attempt_id, seq)`、event ID 唯一、previous digest 链 |
+| `execution_snapshots` | Claim 时固定的 AFWP/输入 | revision/hash/base 绑定、JCS digest、不可修改/删除 |
 | `inbox` | 本地命令回执 | `(actor_id, idempotency_key)` 唯一、不可修改/删除 |
 | `outbox` | 待发控制面事件 | destination + semantic key 唯一、payload 不可变 |
 | `operations` | 外部副作用账本 | 先计划后执行、request immutable、Pending 只能单向完成 |
@@ -75,7 +79,31 @@ PRAGMA quick_check = ok
 Journal 在恢复时重算每条事实的 JCS SHA-256、整条 previous-digest 链和物化状态摘要；任一不一致均
 fail closed 为 `AF_WORKER_JOURNAL_INTEGRITY`。
 
-## 4. 外部副作用与重启恢复
+Schema version 1 是尚未携带执行快照的预发布开发格式，无法安全补造 AFWP/input；version 2 会明确
+拒绝打开旧格式，而不是在缺少冻结输入时继续执行。正式 `v0.1.0-mvp` 发布后，Journal 变更必须提供
+可验证迁移或显式导出/重新 Claim 流程。
+
+## 4. Claim handoff 与 Lease reconciliation
+
+控制面 Claim 响应现在携带不可变 `PackageExecutionSnapshot`：revision、package hash、base commit、
+Git object format、canonical AFWP 和 input snapshot。PostgreSQL adapter 从 canonical typed rows 读取并
+重新验证 JCS hash；Worker 再次复核响应与已选择 Offer、Git object format 和 hash，之后才把 Grant
+与执行快照写入一个本地事务。
+
+`ClaimIntent` 固定 Package、command/correlation ID、idempotency key、Lease window 和本地 message
+ID。生产 daemon 必须在远端 Claim 前持久化该 intent；ACK 丢失时用同一个 intent 重放，不能重新从
+Offer 列表挑选另一个 Package。
+
+启动 reconciliation 对每个非终态 Attempt 查询服务器 Lease，并核对 Project、Package、Attempt、
+Lease、holder node 和 generation：
+
+- 完全一致且 expiry 相同：继续；
+- 服务器显示一个此前漏收的合法 Renew：使用服务器 `updated_at` 和新 expiry 追加本地
+  `LeaseRenewed`；
+- Expired、Revoked、holder/generation 不匹配：追加 `LeaseLost` 并进入 `Salvaging`；
+- 响应绑定错误、expiry 回退或时间形状异常：`AF_WORKER_CONTROL_RESPONSE_INVALID`，不启动副作用。
+
+## 5. 外部副作用与重启恢复
 
 模型 Turn 属于 `NON_REPEATABLE`：
 
@@ -90,7 +118,7 @@ Local Verification 标记为 `IDEMPOTENT`。重启后使用原 operation ID 和�
 事务中完成 operation 与验证事实。Pending operation 与当前 Attempt phase、kind、class、semantic key、
 request digest 或 deadline 任一不一致时，稳定返回 `AF_WORKER_RECOVERY_CONFLICT`。
 
-## 5. 当前验证证据
+## 6. 当前验证证据
 
 本地定点门禁：
 
@@ -110,14 +138,15 @@ cargo fmt --all -- --check
 - 外部 operation 先计划后执行、completion 原子性和 completion ACK-loss；
 - 模型提前声称完成但 hard criterion 失败时继续下一 Turn；
 - Worker 重启后查询原非幂等 Turn，并恢复 Pending Verification；
+- Claim 响应执行快照的双端摘要校验、本地 exact replay、漏收 Renew 导入和 Revoke 停止；
 - Turn budget 与 Lease expiry 在启动 Executor 前阻止新副作用。
 
-## 6. 下一纵切
+## 7. 下一纵切
 
 MVP-02 的下一检查点按顺序接入：
 
-1. Worker enrollment、本地节点身份与控制面 `/api/v1` 客户端；
-2. Offer poll、Claim、Renew、Release 和启动恢复时的服务器 Lease reconciliation；
+1. Worker enrollment、本地节点身份与 loopback HTTP / LAN mTLS 控制面 adapter；
+2. Claim intent 的节点级持久化、自动 Renew 调度和 Release；
 3. workspace/日志/凭据目录隔离与受控命令执行；
 4. jcode bridge 版本握手、能力探测、operation query 与 sanitized transcript；
 5. Candidate Artifact 上传及 `RecordCandidate` handoff。
