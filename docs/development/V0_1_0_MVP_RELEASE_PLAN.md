@@ -5,6 +5,7 @@
 - 开发分支：`agent/v0.1.0-mvp`
 - 发布标签：`v0.1.0-mvp`
 - 当前状态：实施中
+- 最新进度：[V0_1_0_MVP_PROGRESS.md](V0_1_0_MVP_PROGRESS.md)
 
 ## 1. 发布定义
 

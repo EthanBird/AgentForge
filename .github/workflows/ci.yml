@@ -64,3 +64,7 @@ jobs:
         run: >-
           cargo test --locked -p agentforge-storage-postgres
           --test postgres_uow -- --nocapture
+      - name: Exercise the MVP market and Lease contract
+        run: >-
+          cargo test --locked -p agentforge-storage-postgres
+          --test postgres_mvp -- --nocapture

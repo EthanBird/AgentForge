@@ -128,7 +128,7 @@ pub struct PostgresUnitOfWork {
 }
 
 impl PostgresUnitOfWork {
-    fn client(&self) -> PortResult<&Client> {
+    pub(crate) fn client(&self) -> PortResult<&Client> {
         self.client.as_ref().ok_or(PortError::Integrity)
     }
 
@@ -1164,7 +1164,7 @@ where
     row.try_get(index).map_err(|_| PortError::Integrity)
 }
 
-fn map_database_error(error: tokio_postgres::Error) -> PortError {
+pub(crate) fn map_database_error(error: tokio_postgres::Error) -> PortError {
     match error.as_db_error().map(|error| error.code()) {
         Some(&SqlState::UNIQUE_VIOLATION)
         | Some(&SqlState::T_R_SERIALIZATION_FAILURE)

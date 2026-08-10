@@ -5,11 +5,17 @@
 //! views; they never feed state back into an aggregate decision.
 
 pub mod error;
+pub mod mvp;
 pub mod ports;
 pub mod projection;
 pub mod read_models;
 
 pub use error::{ApplicationError, ApplicationResult};
+pub use mvp::{
+    ClaimPackageInput, ClaimedWork, CreateProjectInput, LeaseView, ListOffersQuery, MvpCommand,
+    MvpCommandContext, MvpControlPlane, MvpError, MvpFuture, MvpResult, OfferView, ProjectView,
+    PublishPackageInput, PublishedPackage, ReleaseLeaseInput, RenewLeaseInput,
+};
 pub use ports::{
     AppendEventsReceipt, Clock, EventAppendPort, EventRecord, IdGenerator, Isolation, PortError,
     PortFuture, PortResult, Repository, StoredAggregate, UnitOfWork, UnitOfWorkFactory,
