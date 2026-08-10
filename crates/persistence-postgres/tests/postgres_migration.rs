@@ -419,9 +419,9 @@ async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
                    bundle_uri='artifact://candidate-artifacts/bundle',
                    bundle_digest=expected_bundle_digest,
                    bundle_size_bytes=expected_bundle_size_bytes,
-                   completed_at=clock_timestamp() - interval '20 seconds',
+                   completed_at=transaction_timestamp() - interval '20 seconds',
                    version=3, event_seq=3,
-                   updated_at=clock_timestamp() - interval '20 seconds'
+                   updated_at=transaction_timestamp() - interval '20 seconds'
              WHERE id='{artifact}';
             INSERT INTO candidates
               (id, project_id, attempt_id, package_id, revision_id, package_hash, lease_id,
