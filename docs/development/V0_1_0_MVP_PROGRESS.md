@@ -622,3 +622,41 @@ cargo fmt --all -- --check / git diff --check                          PASS
 明确边界：P.2 只交付 wire/adapter，尚未把 Progress intent 写入 SQLite，也没有让 daemon 自动执行四阶段。
 P.3 必须新增 additive Journal schema 与 pending-first replay；Artifact Init 仍不能直接使用旧 Claim response
 里的 Attempt version。
+
+## MVP-03 / Checkpoint P.3：Attempt Progress Journal v7
+
+状态：实现完成，Worker Journal/lifecycle 定点测试与全工作区门禁通过；等待本检查点推送后的 CI。
+
+当前完成：
+
+- SQLite Journal schema v7 新增不可变 `attempt_progress_command_intents`，按 Attempt/stage 唯一保存四步
+  Progress 的完整 typed command、actor/key、JCS digest、pending/completed 状态、完整 typed response 与完成
+  时间；请求字段不可改、状态只能单向完成、账本不可删除；
+- v2 至 v6 都在原有独占迁移事务内逐级升级到 v7，新增 v6→v7 定点迁移测试并确认既有 Attempt 不被重写；
+- 注册命令必须证明完整 Claim 回执、当前本地 Lease/fencing/actor/node/Project 绑定与未过期窗口；阶段固定为
+  Preparing、Planning、Implementing、LocalVerify，前序必须完成且 expected version 必须来自 Claim 或上一条
+  受验证回执；
+- 回执逐字段核对中心 Attempt state、semantic sequence、Package/Lease/fencing、服务端时间以及每步 `+2`
+  version；ACK 丢失后 exact replay 返回既有完成，不会发明新 key/body 或改写完成时间；
+- lifecycle executor 统一执行“先注册 SQLite → 调 HTTP → 验证并完成 SQLite”。故障注入测试证明中心命令
+  已成功但响应丢失时，重启只恢复原 pending command，服务端 mutation 计数保持一次；
+- Journal 合同覆盖跳阶段拒绝、同 key 改 evidence 拒绝、pending 重启恢复、四阶段完整历史、请求/删除篡改
+  触发器拒绝及 completion ACK-loss replay。
+
+定点证据：
+
+```text
+cargo test -p agentforge-worker-daemon attempt_progress --locked --offline  PASS (2 tests)
+cargo test -p agentforge-worker-daemon --locked --offline                   PASS (45 tests)
+bash tests/contract/workspace_layout.sh                                     PASS
+cargo build --workspace --locked --all-targets --offline                    PASS
+cargo test --workspace --locked --offline                                   PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                   PASS
+node --check crates/control-plane/assets/app.js                              PASS
+cargo fmt --all -- --check / git diff --check                               PASS
+```
+
+明确边界：P.3 交付 durable command ledger 与通用 executor，但 daemon 尚未自动规划/执行四阶段，Artifact Init
+也尚未改为使用最终 `LOCAL_VERIFY` response version。P.4 必须把 pending Progress 恢复置于 Artifact 之前，
+逐步驱动中心 Attempt，并只用第四条受验证回执的 version 初始化 Artifact。

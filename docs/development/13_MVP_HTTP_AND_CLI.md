@@ -98,10 +98,21 @@ Complete 的 `If-Match` 是当前 Artifact version。服务端按声明顺序读
 
 CAS 过期固定返回 `AF_VERSION_STALE/412`，不得使用旧拼写 `AF_STALE_VERSION`。
 
-### 2.3 Worker Artifact upload Journal
+### 2.3 Worker Progress 与 Artifact command Journal
 
 Worker SQLite Journal schema v5 增加 `candidate_artifact_command_intents`；schema v6 进一步把首次成功的
 完整 `ClaimedWork`（含 Package/Attempt/Lease CAS version 与 execution snapshot）保存进原 Claim intent。
+schema v7 增加 `attempt_progress_command_intents`，把四个中心 Attempt 进度命令的完整 typed body、actor、
+idempotency key、stage、请求摘要与创建时间先于 HTTP 调用写入 WAL/FULL SQLite。每个 Attempt/stage 只能有
+一条不可变记录；下一阶段只有在前一阶段已有受验证的成功回执后才能注册，expected version 从完整 Claim
+回执或前一 Progress 回执推导，不能猜测或跳步。
+
+Progress 成功回执必须逐字段绑定 Project、Package、Attempt、Lease/fencing、目标状态、semantic sequence、
+服务端时间和 `expected_version + 2`。ACK 丢失时 executor 只重放原 actor/key/body；服务端返回首次成功 view
+后，Journal 用由请求创建时间和响应 `updated_at` 确定的完成时间落账，因此重试时钟不能改写历史。请求、
+回执与 pending→completed 转换受触发器保护且不可删除。schema v7 已提供 executor 与 pending 查询；daemon
+自动规划四阶段属于下一纵切，当前不会悄悄在 Artifact adapter 内补报进度。
+
 Init、每个 Chunk、Complete 都以
 完整 typed command、actor、idempotency key、Attempt binding、请求摘要和创建时间先于 HTTP 调用提交；
 成功后再以一个 SQLite 事务写入 typed response、响应摘要和完成时间。请求字段、完成回执和状态转换由
@@ -113,7 +124,7 @@ key、chunk 内容或 Bundle binding。即使 ACK 丢失后本地 Worker 已观�
 Init 回执固定 `UPLOADING/version=1`，Chunk 回执必须逐字段匹配声明和内容摘要，Complete 回执必须与 Init 的
 Candidate/Artifact/Bundle lineage 完全一致且为 `COMPLETE/version=3`。
 
-v2、v3、v4、v5 Journal 在独占 SQLite 迁移事务内逐级升级到 v6；未知版本 fail closed。v5 以前已经完成
+v2、v3、v4、v5、v6 Journal 在独占 SQLite 迁移事务内逐级升级到 v7；未知版本 fail closed。v5 以前已经完成
 的 Claim 没有可证明的中央 Attempt version，迁移会保留该历史行，但 Artifact workflow 返回“缺少可验证
 Claim 回执”，不得猜测常量 version。
 

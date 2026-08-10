@@ -7,15 +7,16 @@
 use std::{path::Path, str::FromStr};
 
 use agentforge_application::{
-    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
-    CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, MvpCommand, OfferView,
-    PackageExecutionSnapshot, ReleaseLeaseInput, RenewLeaseInput,
+    AttemptProgressStage, AttemptProgressView, CandidateArtifactChunkReceipt,
+    CandidateArtifactView, ClaimPackageInput, ClaimedWork, CompleteCandidateArtifactInput,
+    InitCandidateArtifactInput, LeaseView, MvpCommand, OfferView, PackageExecutionSnapshot,
+    ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
     UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, AttemptId, CandidateArtifactId, CandidateArtifactState, CommandId, CorrelationId,
     ExecutorId, IdempotencyKey, LeaseId, NodeId, ProjectId, ProtocolKey, ServerInstant,
-    Sha256Digest, work_package::WorkPackageState,
+    Sha256Digest, attempt::AttemptState, work_package::WorkPackageState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -28,7 +29,7 @@ use crate::runtime::{
     grant_fact,
 };
 
-const JOURNAL_SCHEMA_VERSION: i64 = 6;
+const JOURNAL_SCHEMA_VERSION: i64 = 7;
 const OUTBOX_DESTINATION: &str = "control-plane.worker-events";
 const MAX_INLINE_EXECUTION_BYTES: usize = 1_048_576;
 
@@ -161,6 +162,29 @@ CREATE TABLE lease_command_intents (
           AND completed_at IS NOT NULL))
 );
 
+CREATE TABLE attempt_progress_command_intents (
+  intent_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  stage TEXT NOT NULL CHECK (stage IN (
+    'preparing', 'planning', 'implementing', 'local_verify'
+  )),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  response_json TEXT,
+  response_digest TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  UNIQUE (attempt_id, stage),
+  CHECK ((state = 'pending' AND response_json IS NULL AND response_digest IS NULL
+          AND completed_at IS NULL)
+      OR (state = 'completed' AND response_json IS NOT NULL AND response_digest IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
 CREATE TABLE candidate_artifact_command_intents (
   intent_id TEXT PRIMARY KEY,
   attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
@@ -195,6 +219,10 @@ CREATE INDEX claim_intents_pending_idx
 
 CREATE INDEX lease_command_intents_pending_idx
   ON lease_command_intents (created_at, intent_id)
+  WHERE state = 'pending';
+
+CREATE INDEX attempt_progress_command_intents_pending_idx
+  ON attempt_progress_command_intents (created_at, intent_id)
   WHERE state = 'pending';
 
 CREATE INDEX candidate_artifact_command_intents_pending_idx
@@ -359,6 +387,37 @@ CREATE TRIGGER lease_command_intents_cannot_be_deleted
 BEFORE DELETE ON lease_command_intents
 BEGIN
   SELECT RAISE(ABORT, 'lease command intents cannot be deleted');
+END;
+
+CREATE TRIGGER attempt_progress_command_intents_request_is_immutable
+BEFORE UPDATE ON attempt_progress_command_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.attempt_id <> OLD.attempt_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.stage <> OLD.stage
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'attempt progress command intent request is immutable');
+END;
+
+CREATE TRIGGER attempt_progress_command_intents_state_is_monotonic
+BEFORE UPDATE ON attempt_progress_command_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'attempt progress command intent state is monotonic');
+END;
+
+CREATE TRIGGER attempt_progress_command_intents_cannot_be_deleted
+BEFORE DELETE ON attempt_progress_command_intents
+BEGIN
+  SELECT RAISE(ABORT, 'attempt progress command intents cannot be deleted');
 END;
 
 CREATE TRIGGER candidate_artifact_command_intents_request_is_immutable
@@ -599,6 +658,66 @@ BEGIN
 END;
 "#;
 
+const MIGRATE_V6_TO_V7: &str = r#"
+CREATE TABLE attempt_progress_command_intents (
+  intent_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  stage TEXT NOT NULL CHECK (stage IN (
+    'preparing', 'planning', 'implementing', 'local_verify'
+  )),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  response_json TEXT,
+  response_digest TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  UNIQUE (attempt_id, stage),
+  CHECK ((state = 'pending' AND response_json IS NULL AND response_digest IS NULL
+          AND completed_at IS NULL)
+      OR (state = 'completed' AND response_json IS NOT NULL AND response_digest IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
+CREATE INDEX attempt_progress_command_intents_pending_idx
+  ON attempt_progress_command_intents (created_at, intent_id)
+  WHERE state = 'pending';
+
+CREATE TRIGGER attempt_progress_command_intents_request_is_immutable
+BEFORE UPDATE ON attempt_progress_command_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.attempt_id <> OLD.attempt_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.stage <> OLD.stage
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'attempt progress command intent request is immutable');
+END;
+
+CREATE TRIGGER attempt_progress_command_intents_state_is_monotonic
+BEFORE UPDATE ON attempt_progress_command_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'attempt progress command intent state is monotonic');
+END;
+
+CREATE TRIGGER attempt_progress_command_intents_cannot_be_deleted
+BEFORE DELETE ON attempt_progress_command_intents
+BEGIN
+  SELECT RAISE(ABORT, 'attempt progress command intents cannot be deleted');
+END;
+"#;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JournalCommand {
@@ -830,6 +949,71 @@ pub enum LeaseCommandRegistration {
 pub enum LeaseCommandCompletion {
     Completed,
     Existing,
+}
+
+/// Durable one-step central Attempt phase report. The exact actor/key/body is
+/// committed before HTTP so ACK loss can only replay the original mutation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptProgressCommandIntentRecord {
+    pub intent_id: Uuid,
+    pub attempt_id: AttemptId,
+    pub command: MvpCommand<ReportAttemptProgressInput>,
+    pub created_at: ServerInstant,
+}
+
+impl AttemptProgressCommandIntentRecord {
+    fn validate(&self) -> JournalResult<()> {
+        let context = &self.command.context;
+        let input = &self.command.input;
+        if self.intent_id.is_nil()
+            || self.attempt_id.as_uuid().is_nil()
+            || input.attempt_id != self.attempt_id
+            || input.project_id.as_uuid().is_nil()
+            || input.lease_id.as_uuid().is_nil()
+            || input.node_id.as_uuid().is_nil()
+            || context.command_id.as_uuid().is_nil()
+            || context.actor_id.as_uuid().is_nil()
+            || context.correlation_id.as_uuid().is_nil()
+            || context.expected_version.is_none()
+            || digest_is_zero(&input.evidence_digest)
+        {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "attempt_progress_command_intent",
+            )));
+        }
+        Ok(())
+    }
+
+    const fn stage(&self) -> AttemptProgressStage {
+        self.command.input.stage
+    }
+
+    const fn actor_id(&self) -> ActorId {
+        self.command.context.actor_id
+    }
+
+    fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.command.context.idempotency_key
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptProgressCommandRegistration {
+    Registered,
+    Existing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttemptProgressCommandCompletion {
+    Completed,
+    Existing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptProgressCommandHistoryEntry {
+    pub record: AttemptProgressCommandIntentRecord,
+    pub response: Option<AttemptProgressView>,
 }
 
 /// Durable author-side Candidate Artifact mutation. Each command is written to
@@ -1742,6 +1926,169 @@ fn decode_candidate_artifact_command(
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptProgressCommandState {
+    Pending,
+    Completed,
+}
+
+impl AttemptProgressCommandState {
+    fn parse(value: &str) -> JournalResult<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            _ => Err(JournalError::Integrity),
+        }
+    }
+}
+
+struct StoredAttemptProgressCommand {
+    record: AttemptProgressCommandIntentRecord,
+    state: AttemptProgressCommandState,
+    response: Option<AttemptProgressView>,
+    completed_at: Option<ServerInstant>,
+}
+
+struct RawAttemptProgressCommand {
+    intent_id: String,
+    attempt_id: String,
+    actor_id: String,
+    idempotency_key: String,
+    stage: String,
+    state: String,
+    intent_json: String,
+    intent_digest: String,
+    created_at: String,
+    response_json: Option<String>,
+    response_digest: Option<String>,
+    completed_at: Option<String>,
+}
+
+fn raw_attempt_progress_command_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawAttemptProgressCommand> {
+    Ok(RawAttemptProgressCommand {
+        intent_id: row.get(0)?,
+        attempt_id: row.get(1)?,
+        actor_id: row.get(2)?,
+        idempotency_key: row.get(3)?,
+        stage: row.get(4)?,
+        state: row.get(5)?,
+        intent_json: row.get(6)?,
+        intent_digest: row.get(7)?,
+        created_at: row.get(8)?,
+        response_json: row.get(9)?,
+        response_digest: row.get(10)?,
+        completed_at: row.get(11)?,
+    })
+}
+
+fn decode_attempt_progress_command(
+    raw: RawAttemptProgressCommand,
+) -> JournalResult<StoredAttemptProgressCommand> {
+    let record: AttemptProgressCommandIntentRecord = decode_stored(&raw.intent_json)?;
+    record.validate()?;
+    let state = AttemptProgressCommandState::parse(&raw.state)?;
+    let response = raw
+        .response_json
+        .as_deref()
+        .map(decode_stored::<AttemptProgressView>)
+        .transpose()?;
+    let completed_at = raw
+        .completed_at
+        .map(|value| parse_instant(&value))
+        .transpose()?;
+    let completion_shape_is_valid = match state {
+        AttemptProgressCommandState::Pending => {
+            response.is_none() && raw.response_digest.is_none() && completed_at.is_none()
+        }
+        AttemptProgressCommandState::Completed => {
+            response.is_some() && raw.response_digest.is_some() && completed_at.is_some()
+        }
+    };
+    if let Some(response) = &response {
+        validate_attempt_progress_response_shape(&record, response)?;
+    }
+    if record.intent_id.to_string() != raw.intent_id
+        || record.attempt_id.to_string() != raw.attempt_id
+        || record.actor_id().to_string() != raw.actor_id
+        || record.idempotency_key().as_str() != raw.idempotency_key
+        || attempt_progress_stage_label(record.stage()) != raw.stage
+        || instant_text(record.created_at) != raw.created_at
+        || digest_json(&record)?.to_string() != raw.intent_digest
+        || response
+            .as_ref()
+            .zip(raw.response_digest.as_deref())
+            .is_some_and(|(value, digest)| {
+                digest_json(value).map(|d| d.to_string()).ok().as_deref() != Some(digest)
+            })
+        || !completion_shape_is_valid
+        || completed_at.is_some_and(|instant| instant < record.created_at)
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(StoredAttemptProgressCommand {
+        record,
+        state,
+        response,
+        completed_at,
+    })
+}
+
+fn load_attempt_progress_command_by_id(
+    connection: &Connection,
+    intent_id: Uuid,
+) -> JournalResult<Option<StoredAttemptProgressCommand>> {
+    connection
+        .query_row(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, stage, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM attempt_progress_command_intents WHERE intent_id = ?1",
+            [intent_id.to_string()],
+            raw_attempt_progress_command_row,
+        )
+        .optional()?
+        .map(decode_attempt_progress_command)
+        .transpose()
+}
+
+fn load_attempt_progress_command_by_key(
+    connection: &Connection,
+    actor_id: ActorId,
+    idempotency_key: &IdempotencyKey,
+) -> JournalResult<Option<StoredAttemptProgressCommand>> {
+    connection
+        .query_row(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, stage, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM attempt_progress_command_intents \
+             WHERE actor_id = ?1 AND idempotency_key = ?2",
+            params![actor_id.to_string(), idempotency_key.as_str()],
+            raw_attempt_progress_command_row,
+        )
+        .optional()?
+        .map(decode_attempt_progress_command)
+        .transpose()
+}
+
+fn load_attempt_progress_command_by_stage(
+    connection: &Connection,
+    attempt_id: AttemptId,
+    stage: AttemptProgressStage,
+) -> JournalResult<Option<StoredAttemptProgressCommand>> {
+    connection
+        .query_row(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, stage, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM attempt_progress_command_intents WHERE attempt_id = ?1 AND stage = ?2",
+            params![attempt_id.to_string(), attempt_progress_stage_label(stage)],
+            raw_attempt_progress_command_row,
+        )
+        .optional()?
+        .map(decode_attempt_progress_command)
+        .transpose()
+}
+
 fn load_candidate_artifact_command_by_id(
     connection: &Connection,
     intent_id: Uuid,
@@ -1870,6 +2217,143 @@ fn load_completed_claim_for_attempt(
         })),
         _ => Err(JournalError::Integrity),
     }
+}
+
+const fn attempt_progress_stage_label(stage: AttemptProgressStage) -> &'static str {
+    match stage {
+        AttemptProgressStage::Preparing => "preparing",
+        AttemptProgressStage::Planning => "planning",
+        AttemptProgressStage::Implementing => "implementing",
+        AttemptProgressStage::LocalVerify => "local_verify",
+    }
+}
+
+const fn attempt_progress_stage_contract(stage: AttemptProgressStage) -> (usize, AttemptState) {
+    match stage {
+        AttemptProgressStage::Preparing => (0, AttemptState::Preparing),
+        AttemptProgressStage::Planning => (1, AttemptState::Planning),
+        AttemptProgressStage::Implementing => (2, AttemptState::Implementing),
+        AttemptProgressStage::LocalVerify => (3, AttemptState::LocalVerify),
+    }
+}
+
+fn load_attempt_progress_history(
+    connection: &Connection,
+    attempt_id: AttemptId,
+) -> JournalResult<Vec<StoredAttemptProgressCommand>> {
+    let mut statement = connection.prepare(
+        "SELECT intent_id, attempt_id, actor_id, idempotency_key, stage, state, intent_json, \
+                intent_digest, created_at, response_json, response_digest, completed_at \
+         FROM attempt_progress_command_intents WHERE attempt_id = ?1 \
+         ORDER BY CASE stage \
+           WHEN 'preparing' THEN 1 WHEN 'planning' THEN 2 \
+           WHEN 'implementing' THEN 3 WHEN 'local_verify' THEN 4 END",
+    )?;
+    let rows = statement.query_map([attempt_id.to_string()], raw_attempt_progress_command_row)?;
+    rows.map(|row| decode_attempt_progress_command(row?))
+        .collect()
+}
+
+fn validate_attempt_progress_response_shape(
+    record: &AttemptProgressCommandIntentRecord,
+    response: &AttemptProgressView,
+) -> JournalResult<()> {
+    let (index, expected_state) = attempt_progress_stage_contract(record.stage());
+    let expected_version = record
+        .command
+        .context
+        .expected_version
+        .ok_or(JournalError::Integrity)?
+        .get()
+        .checked_add(2)
+        .ok_or(JournalError::Integrity)?;
+    if response.project_id != record.command.input.project_id
+        || response.attempt_id != record.attempt_id
+        || response.lease_id != record.command.input.lease_id
+        || response.fencing_token != record.command.input.fencing_token
+        || response.state != expected_state
+        || response.semantic_progress_seq
+            != u64::try_from(index + 1).map_err(|_| JournalError::Integrity)?
+        || response.version.get() != expected_version
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(())
+}
+
+fn validate_attempt_progress_command_against_attempt(
+    connection: &Connection,
+    record: &AttemptProgressCommandIntentRecord,
+    state: &WorkerAttemptState,
+) -> JournalResult<()> {
+    if !matches!(
+        state.phase(),
+        WorkerPhase::HandingOffCandidate | WorkerPhase::AuthorComplete
+    ) || record.attempt_id != state.attempt_id()
+    {
+        return Err(JournalError::Runtime(WorkerError::InvalidTransition));
+    }
+    let claim = load_completed_claim_for_attempt(connection, record.attempt_id)?
+        .ok_or(JournalError::Integrity)?;
+    let claimed = claim.response.as_ref().ok_or(JournalError::Integrity)?;
+    if record.actor_id() != claim.record.actor_id()
+        || record.command.input.project_id != claimed.project_id
+        || record.command.input.lease_id != state.lease_id()
+        || record.command.input.node_id != claim.record.node_id()
+        || record.command.input.fencing_token != state.lease_generation()
+        || record.created_at >= state.lease_expires_at()
+    {
+        return Err(JournalError::Runtime(WorkerError::LeaseStale));
+    }
+
+    let history = load_attempt_progress_history(connection, record.attempt_id)?;
+    let (wanted_index, _) = attempt_progress_stage_contract(record.stage());
+    if history.len() != wanted_index
+        || history.iter().enumerate().any(|(index, stored)| {
+            let (actual_index, _) = attempt_progress_stage_contract(stored.record.stage());
+            index != actual_index
+                || stored.state != AttemptProgressCommandState::Completed
+                || stored.response.is_none()
+        })
+    {
+        return Err(JournalError::Runtime(WorkerError::InvalidTransition));
+    }
+    let expected_version = history
+        .last()
+        .and_then(|stored| stored.response.as_ref())
+        .map_or(claimed.attempt_version, |response| response.version);
+    if record.command.context.expected_version != Some(expected_version) {
+        return Err(JournalError::Runtime(WorkerError::StaleVersion));
+    }
+    Ok(())
+}
+
+fn validate_attempt_progress_response(
+    connection: &Connection,
+    record: &AttemptProgressCommandIntentRecord,
+    state: &WorkerAttemptState,
+    response: &AttemptProgressView,
+) -> JournalResult<()> {
+    validate_attempt_progress_response_shape(record, response)?;
+    let claim = load_completed_claim_for_attempt(connection, record.attempt_id)?
+        .ok_or(JournalError::Integrity)?;
+    let claimed = claim.response.as_ref().ok_or(JournalError::Integrity)?;
+    if record.actor_id() != claim.record.actor_id()
+        || record.command.input.project_id != claimed.project_id
+        || record.command.input.node_id != claim.record.node_id()
+        || record.command.input.lease_id != claim.lease_id
+        || claimed.attempt_id != state.attempt_id()
+        || claimed.lease_id != state.lease_id()
+        || claimed.fencing_token != state.lease_generation()
+        || response.package_id != claimed.package_id
+        || response.updated_at < record.created_at
+        || response.updated_at >= state.lease_expires_at()
+        || record.command.input.lease_id != state.lease_id()
+        || record.command.input.fencing_token != state.lease_generation()
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(())
 }
 
 fn validate_candidate_artifact_binding(
@@ -2224,6 +2708,7 @@ impl Journal {
                     .and_then(|()| connection.execute_batch(MIGRATE_V3_TO_V4))
                     .and_then(|()| connection.execute_batch(MIGRATE_V4_TO_V5))
                     .and_then(|()| connection.execute_batch(MIGRATE_V5_TO_V6))
+                    .and_then(|()| connection.execute_batch(MIGRATE_V6_TO_V7))
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -2239,6 +2724,7 @@ impl Journal {
                     .execute_batch(MIGRATE_V3_TO_V4)
                     .and_then(|()| connection.execute_batch(MIGRATE_V4_TO_V5))
                     .and_then(|()| connection.execute_batch(MIGRATE_V5_TO_V6))
+                    .and_then(|()| connection.execute_batch(MIGRATE_V6_TO_V7))
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -2253,6 +2739,7 @@ impl Journal {
                 let migrated = connection
                     .execute_batch(MIGRATE_V4_TO_V5)
                     .and_then(|()| connection.execute_batch(MIGRATE_V5_TO_V6))
+                    .and_then(|()| connection.execute_batch(MIGRATE_V6_TO_V7))
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -2266,6 +2753,20 @@ impl Journal {
                 connection.execute_batch("BEGIN IMMEDIATE")?;
                 let migrated = connection
                     .execute_batch(MIGRATE_V5_TO_V6)
+                    .and_then(|()| connection.execute_batch(MIGRATE_V6_TO_V7))
+                    .and_then(|()| {
+                        connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
+                    })
+                    .and_then(|()| connection.execute_batch("COMMIT"));
+                if let Err(error) = migrated {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
+            6 => {
+                connection.execute_batch("BEGIN IMMEDIATE")?;
+                let migrated = connection
+                    .execute_batch(MIGRATE_V6_TO_V7)
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -2530,6 +3031,167 @@ impl Journal {
         }
         transaction.commit()?;
         Ok(LeaseCommandCompletion::Completed)
+    }
+
+    pub fn register_attempt_progress_command_intent(
+        &mut self,
+        intent: &AttemptProgressCommandIntentRecord,
+    ) -> JournalResult<AttemptProgressCommandRegistration> {
+        intent.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = load_attempt_progress_command_by_id(&transaction, intent.intent_id)?
+        {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(AttemptProgressCommandRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        if let Some(existing) = load_attempt_progress_command_by_key(
+            &transaction,
+            intent.actor_id(),
+            intent.idempotency_key(),
+        )? {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(AttemptProgressCommandRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        if let Some(existing) =
+            load_attempt_progress_command_by_stage(&transaction, intent.attempt_id, intent.stage())?
+        {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(AttemptProgressCommandRegistration::Existing);
+            }
+            return Err(JournalError::Runtime(WorkerError::InvalidTransition));
+        }
+        let state = load_state(&transaction, intent.attempt_id)?
+            .ok_or(JournalError::Runtime(WorkerError::HistoryEmpty))?;
+        validate_attempt_progress_command_against_attempt(&transaction, intent, &state)?;
+        transaction.execute(
+            "INSERT INTO attempt_progress_command_intents \
+             (intent_id, attempt_id, actor_id, idempotency_key, stage, state, intent_json, \
+              intent_digest, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8)",
+            params![
+                intent.intent_id.to_string(),
+                intent.attempt_id.to_string(),
+                intent.actor_id().to_string(),
+                intent.idempotency_key().as_str(),
+                attempt_progress_stage_label(intent.stage()),
+                encode(intent)?,
+                digest_json(intent)?.to_string(),
+                instant_text(intent.created_at),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(AttemptProgressCommandRegistration::Registered)
+    }
+
+    pub fn pending_attempt_progress_command_intents(
+        &self,
+    ) -> JournalResult<Vec<AttemptProgressCommandIntentRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, stage, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM attempt_progress_command_intents \
+             WHERE state = 'pending' ORDER BY created_at, intent_id",
+        )?;
+        let rows = statement.query_map([], raw_attempt_progress_command_row)?;
+        rows.map(|row| decode_attempt_progress_command(row?).map(|stored| stored.record))
+            .collect()
+    }
+
+    pub fn attempt_progress_command_history(
+        &self,
+        attempt_id: AttemptId,
+    ) -> JournalResult<Vec<AttemptProgressCommandHistoryEntry>> {
+        if attempt_id.as_uuid().is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "attempt_progress_command_history",
+            )));
+        }
+        let state = self
+            .load_attempt(attempt_id)?
+            .ok_or(JournalError::Runtime(WorkerError::HistoryEmpty))?;
+        let history = load_attempt_progress_history(&self.connection, attempt_id)?;
+        for (index, stored) in history.iter().enumerate() {
+            let (actual_index, _) = attempt_progress_stage_contract(stored.record.stage());
+            if index != actual_index
+                || (stored.state == AttemptProgressCommandState::Pending
+                    && index + 1 != history.len())
+            {
+                return Err(JournalError::Integrity);
+            }
+            if let Some(response) = &stored.response {
+                validate_attempt_progress_response(
+                    &self.connection,
+                    &stored.record,
+                    &state,
+                    response,
+                )?;
+            }
+        }
+        Ok(history
+            .into_iter()
+            .map(|stored| AttemptProgressCommandHistoryEntry {
+                record: stored.record,
+                response: stored.response,
+            })
+            .collect())
+    }
+
+    pub fn complete_attempt_progress_command_intent(
+        &mut self,
+        intent_id: Uuid,
+        response: &AttemptProgressView,
+        completed_at: ServerInstant,
+    ) -> JournalResult<AttemptProgressCommandCompletion> {
+        if intent_id.is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "attempt_progress_command_completion",
+            )));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = load_attempt_progress_command_by_id(&transaction, intent_id)?
+            .ok_or(JournalError::Integrity)?;
+        let state =
+            load_state(&transaction, stored.record.attempt_id)?.ok_or(JournalError::Integrity)?;
+        validate_attempt_progress_response(&transaction, &stored.record, &state, response)?;
+        if stored.state == AttemptProgressCommandState::Completed {
+            if stored.response.as_ref() == Some(response)
+                && stored.completed_at == Some(completed_at)
+            {
+                transaction.commit()?;
+                return Ok(AttemptProgressCommandCompletion::Existing);
+            }
+            return Err(JournalError::Integrity);
+        }
+        if completed_at < stored.record.created_at || completed_at < response.updated_at {
+            return Err(JournalError::Runtime(WorkerError::TimeRegressed));
+        }
+        let changed = transaction.execute(
+            "UPDATE attempt_progress_command_intents \
+             SET state = 'completed', response_json = ?2, response_digest = ?3, completed_at = ?4 \
+             WHERE intent_id = ?1 AND state = 'pending'",
+            params![
+                intent_id.to_string(),
+                encode(response)?,
+                digest_json(response)?.to_string(),
+                instant_text(completed_at),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::Integrity);
+        }
+        transaction.commit()?;
+        Ok(AttemptProgressCommandCompletion::Completed)
     }
 
     pub fn register_candidate_artifact_command_intent(
@@ -3819,6 +4481,67 @@ mod tests {
         state
     }
 
+    fn attempt_progress_intent(
+        state: &WorkerAttemptState,
+        stage: AttemptProgressStage,
+        ordinal: u8,
+        expected_version: AggregateVersion,
+    ) -> AttemptProgressCommandIntentRecord {
+        AttemptProgressCommandIntentRecord {
+            intent_id: Uuid::from_bytes([80 + ordinal; 16]),
+            attempt_id: state.attempt_id(),
+            command: MvpCommand {
+                context: MvpCommandContext {
+                    command_id: id(90 + ordinal),
+                    actor_id: id(9),
+                    idempotency_key: IdempotencyKey::new(format!("attempt-progress-{ordinal}"))
+                        .expect("progress idempotency key"),
+                    correlation_id: id(100 + ordinal),
+                    causation_id: None,
+                    expected_version: Some(expected_version),
+                },
+                input: ReportAttemptProgressInput {
+                    project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+                    attempt_id: state.attempt_id(),
+                    lease_id: state.lease_id(),
+                    node_id: id(46),
+                    fencing_token: state.lease_generation(),
+                    stage,
+                    evidence_digest: Sha256Digest::of_bytes(format!(
+                        "attempt-progress-evidence-{ordinal}"
+                    )),
+                },
+            },
+            created_at: at(8 + i64::from(ordinal)),
+        }
+    }
+
+    fn attempt_progress_response(
+        intent: &AttemptProgressCommandIntentRecord,
+        ordinal: u8,
+    ) -> AttemptProgressView {
+        let (_, state) = attempt_progress_stage_contract(intent.stage());
+        AttemptProgressView {
+            project_id: intent.command.input.project_id,
+            package_id: grant().package_id,
+            attempt_id: intent.attempt_id,
+            lease_id: intent.command.input.lease_id,
+            fencing_token: intent.command.input.fencing_token,
+            state,
+            semantic_progress_seq: u64::from(ordinal),
+            updated_at: at(12 + i64::from(ordinal)),
+            version: AggregateVersion::new(
+                intent
+                    .command
+                    .context
+                    .expected_version
+                    .expect("expected version")
+                    .get()
+                    + 2,
+            ),
+        }
+    }
+
     fn artifact_bundle() -> Vec<u8> {
         b"fixture-candidate-bundle".to_vec()
     }
@@ -4297,6 +5020,149 @@ mod tests {
     }
 
     #[test]
+    fn attempt_progress_intents_are_ordered_durable_and_exactly_replayable() {
+        let (directory, mut journal) = fixture();
+        let state = bring_to_candidate_handoff(&mut journal);
+        let stages = [
+            AttemptProgressStage::Preparing,
+            AttemptProgressStage::Planning,
+            AttemptProgressStage::Implementing,
+            AttemptProgressStage::LocalVerify,
+        ];
+
+        let skipped = attempt_progress_intent(
+            &state,
+            AttemptProgressStage::Planning,
+            2,
+            claimed_work().attempt_version,
+        );
+        assert_eq!(
+            journal
+                .register_attempt_progress_command_intent(&skipped)
+                .expect_err("central Attempt stages cannot be skipped")
+                .code(),
+            "AF_TRANSITION_INVALID"
+        );
+
+        let mut expected_version = claimed_work().attempt_version;
+        for (index, stage) in stages.into_iter().enumerate() {
+            let ordinal = u8::try_from(index + 1).expect("four stages");
+            let intent = attempt_progress_intent(&state, stage, ordinal, expected_version);
+            assert_eq!(
+                journal
+                    .register_attempt_progress_command_intent(&intent)
+                    .expect("register progress intent"),
+                AttemptProgressCommandRegistration::Registered
+            );
+            assert_eq!(
+                journal
+                    .register_attempt_progress_command_intent(&intent)
+                    .expect("exact intent replay"),
+                AttemptProgressCommandRegistration::Existing
+            );
+            assert_eq!(
+                journal
+                    .pending_attempt_progress_command_intents()
+                    .expect("one pending progress intent"),
+                vec![intent.clone()]
+            );
+
+            if stage == AttemptProgressStage::Planning {
+                drop(journal);
+                journal = Journal::open(directory.path().join("worker.sqlite3"))
+                    .expect("pending progress intent survives restart");
+                assert_eq!(
+                    journal
+                        .pending_attempt_progress_command_intents()
+                        .expect("recovered pending progress intent"),
+                    vec![intent.clone()]
+                );
+            }
+
+            let response = attempt_progress_response(&intent, ordinal);
+            assert_eq!(
+                journal
+                    .complete_attempt_progress_command_intent(
+                        intent.intent_id,
+                        &response,
+                        response.updated_at,
+                    )
+                    .expect("complete progress intent"),
+                AttemptProgressCommandCompletion::Completed
+            );
+            assert_eq!(
+                journal
+                    .complete_attempt_progress_command_intent(
+                        intent.intent_id,
+                        &response,
+                        response.updated_at,
+                    )
+                    .expect("ACK-loss completion replay"),
+                AttemptProgressCommandCompletion::Existing
+            );
+            if stage == AttemptProgressStage::Preparing {
+                let mut changed = intent.clone();
+                changed.command.input.evidence_digest = Sha256Digest::of_bytes("changed evidence");
+                assert_eq!(
+                    journal
+                        .register_attempt_progress_command_intent(&changed)
+                        .expect_err("same actor/key with changed body is rejected")
+                        .code(),
+                    "AF_IDEMPOTENCY_KEY_REUSED"
+                );
+            }
+            expected_version = response.version;
+        }
+
+        assert!(
+            journal
+                .pending_attempt_progress_command_intents()
+                .expect("no pending progress intents")
+                .is_empty()
+        );
+        let history = journal
+            .attempt_progress_command_history(state.attempt_id())
+            .expect("complete progress history");
+        assert_eq!(history.len(), 4);
+        assert!(history.iter().all(|entry| entry.response.is_some()));
+        assert_eq!(
+            history.last().and_then(|entry| entry.response.as_ref()),
+            Some(&AttemptProgressView {
+                project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+                package_id: grant().package_id,
+                attempt_id: state.attempt_id(),
+                lease_id: state.lease_id(),
+                fencing_token: state.lease_generation(),
+                state: AttemptState::LocalVerify,
+                semantic_progress_seq: 4,
+                updated_at: at(16),
+                version: AggregateVersion::new(10),
+            })
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "UPDATE attempt_progress_command_intents SET intent_json = '{}' \
+                     WHERE attempt_id = ?1",
+                    [state.attempt_id().to_string()],
+                )
+                .is_err(),
+            "request payloads are immutable"
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "DELETE FROM attempt_progress_command_intents WHERE attempt_id = ?1",
+                    [state.attempt_id().to_string()],
+                )
+                .is_err(),
+            "progress command receipts are append-only"
+        );
+    }
+
+    #[test]
     fn schema_v2_is_upgraded_without_losing_existing_attempts() {
         let (directory, mut journal) = fixture();
         let state = journal
@@ -4322,19 +5188,24 @@ mod tests {
                  DROP TRIGGER candidate_artifact_command_intents_cannot_be_deleted;
                  DROP INDEX candidate_artifact_command_intents_pending_idx;
                  DROP TABLE candidate_artifact_command_intents;
+                 DROP TRIGGER attempt_progress_command_intents_request_is_immutable;
+                 DROP TRIGGER attempt_progress_command_intents_state_is_monotonic;
+                 DROP TRIGGER attempt_progress_command_intents_cannot_be_deleted;
+                 DROP INDEX attempt_progress_command_intents_pending_idx;
+                 DROP TABLE attempt_progress_command_intents;
                  PRAGMA user_version = 2;",
             )
             .expect("downgrade fixture to the exact v2 delta");
         drop(journal);
 
         let mut reopened =
-            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v6");
+            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v7");
         assert_eq!(
             reopened
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            6
+            7
         );
         assert_eq!(
             reopened
@@ -4397,13 +5268,13 @@ mod tests {
             .expect("v5 marker");
         drop(connection);
 
-        let journal = Journal::open(&path).expect("migrate v5 to v6");
+        let journal = Journal::open(&path).expect("migrate v5 to v7");
         assert_eq!(
             journal
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            6
+            7
         );
         let legacy_response: (Option<String>, Option<String>) = journal
             .connection
@@ -4471,6 +5342,55 @@ mod tests {
     }
 
     #[test]
+    fn schema_v6_adds_the_progress_ledger_without_rewriting_attempts() {
+        let (directory, mut journal) = fixture();
+        let state = journal
+            .handle(&grant_request())
+            .expect("grant before v6 migration fixture")
+            .state()
+            .clone();
+        journal
+            .connection
+            .execute_batch(
+                "DROP TRIGGER attempt_progress_command_intents_request_is_immutable;
+                 DROP TRIGGER attempt_progress_command_intents_state_is_monotonic;
+                 DROP TRIGGER attempt_progress_command_intents_cannot_be_deleted;
+                 DROP INDEX attempt_progress_command_intents_pending_idx;
+                 DROP TABLE attempt_progress_command_intents;
+                 PRAGMA user_version = 6;",
+            )
+            .expect("construct exact v6 schema");
+        drop(journal);
+
+        let reopened =
+            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v6 to v7");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            7
+        );
+        assert_eq!(
+            reopened
+                .verify_attempt(state.attempt_id())
+                .expect("existing attempt survives"),
+            state
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM attempt_progress_command_intents",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("progress ledger exists"),
+            0
+        );
+    }
+
+    #[test]
     fn journal_is_wal_full_hash_chained_and_receipt_first() {
         let (_directory, mut journal) = fixture();
         let request = grant_request();
@@ -4479,7 +5399,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            6
+            7
         );
         let applied = journal.handle(&request).expect("grant applied");
         assert!(matches!(applied, JournalDisposition::Applied(_)));

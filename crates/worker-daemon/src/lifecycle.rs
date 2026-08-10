@@ -16,9 +16,10 @@ use uuid::Uuid;
 
 use crate::{
     journal::{
-        CandidateArtifactCommandIntentRecord, CandidateArtifactCommandResponse,
-        CandidateArtifactControlCommand, ClaimIntentRecord, Journal, JournalCommand, JournalError,
-        JournalRequest, LeaseCommandIntentRecord, LeaseControlCommand,
+        AttemptProgressCommandIntentRecord, CandidateArtifactCommandIntentRecord,
+        CandidateArtifactCommandResponse, CandidateArtifactControlCommand, ClaimIntentRecord,
+        Journal, JournalCommand, JournalError, JournalRequest, LeaseCommandIntentRecord,
+        LeaseControlCommand,
     },
     runtime::{
         AttemptGrant, LeaseLossReason, WorkerAttemptState, WorkerCommandEnvelope,
@@ -687,6 +688,25 @@ pub async fn resume_lease_command_intent(
     execute_lease_command(control, journal, record).await
 }
 
+/// Executes a newly planned or recovered central Attempt phase report. The
+/// immutable command is committed before HTTP; completion uses only server
+/// response time and the original creation time, so an ACK-loss replay cannot
+/// rewrite local completion history with a later retry clock.
+pub async fn execute_attempt_progress_command_intent(
+    control: &dyn WorkerControlPlane,
+    journal: &mut Journal,
+    record: &AttemptProgressCommandIntentRecord,
+) -> LifecycleResult<AttemptProgressView> {
+    journal.register_attempt_progress_command_intent(record)?;
+    let response = control.report_attempt_progress(&record.command).await?;
+    journal.complete_attempt_progress_command_intent(
+        record.intent_id,
+        &response,
+        max_instant(record.created_at, response.updated_at),
+    )?;
+    Ok(response)
+}
+
 /// Executes a newly planned or recovered Candidate Artifact command. The
 /// immutable command is always present in SQLite before the remote effect; a
 /// lost ACK therefore leaves the exact actor/key/body tuple pending for the
@@ -882,9 +902,10 @@ fn next_message_id(value: Uuid) -> Uuid {
 mod tests {
     use std::sync::Mutex;
 
-    use agentforge_application::PortError;
+    use agentforge_application::{AttemptProgressStage, PortError};
     use agentforge_domain::{
         AggregateVersion, FencingToken, GitObjectId, LeaseId, PackageRevision, ProtocolKey,
+        attempt::AttemptState,
     };
     use tempfile::TempDir;
     use time::macros::datetime;
@@ -970,6 +991,9 @@ mod tests {
         lease: Mutex<LeaseView>,
         claims: Mutex<u32>,
         fail_next_claim: Mutex<bool>,
+        progress_receipts: Mutex<Vec<(IdempotencyKey, AttemptProgressView)>>,
+        fail_after_progress: Mutex<bool>,
+        progress_reports: Mutex<u32>,
         renew_receipt: Mutex<Option<(IdempotencyKey, LeaseView)>>,
         release_receipt: Mutex<Option<(IdempotencyKey, LeaseView)>>,
         fail_after_renew: Mutex<bool>,
@@ -997,9 +1021,51 @@ mod tests {
 
         fn report_attempt_progress<'a>(
             &'a self,
-            _command: &'a MvpCommand<ReportAttemptProgressInput>,
+            command: &'a MvpCommand<ReportAttemptProgressInput>,
         ) -> MvpFuture<'a, AttemptProgressView> {
-            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+            if let Some((_, response)) = self
+                .progress_receipts
+                .lock()
+                .expect("progress receipts")
+                .iter()
+                .find(|(key, _)| key == &command.context.idempotency_key)
+            {
+                let response = *response;
+                return Box::pin(async move { Ok(response) });
+            }
+            let (state, semantic_progress_seq) = match command.input.stage {
+                AttemptProgressStage::Preparing => (AttemptState::Preparing, 1),
+                AttemptProgressStage::Planning => (AttemptState::Planning, 2),
+                AttemptProgressStage::Implementing => (AttemptState::Implementing, 3),
+                AttemptProgressStage::LocalVerify => (AttemptState::LocalVerify, 4),
+            };
+            let response = AttemptProgressView {
+                project_id: command.input.project_id,
+                package_id: self.claimed.package_id,
+                attempt_id: command.input.attempt_id,
+                lease_id: command.input.lease_id,
+                fencing_token: command.input.fencing_token,
+                state,
+                semantic_progress_seq,
+                updated_at: at(20 + i64::try_from(semantic_progress_seq).expect("small sequence")),
+                version: AggregateVersion::new(
+                    command
+                        .context
+                        .expected_version
+                        .expect("progress expected version")
+                        .get()
+                        + 2,
+                ),
+            };
+            self.progress_receipts
+                .lock()
+                .expect("progress receipts")
+                .push((command.context.idempotency_key.clone(), response));
+            *self.progress_reports.lock().expect("progress reports") += 1;
+            if std::mem::take(&mut *self.fail_after_progress.lock().expect("progress failure")) {
+                return Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) });
+            }
+            Box::pin(async move { Ok(response) })
         }
 
         fn init_candidate_artifact<'a>(
@@ -1135,6 +1201,9 @@ mod tests {
             lease: Mutex::new(lease(LeaseState::Active, at(60), at(0))),
             claims: Mutex::new(0),
             fail_next_claim: Mutex::new(false),
+            progress_receipts: Mutex::new(Vec::new()),
+            fail_after_progress: Mutex::new(false),
+            progress_reports: Mutex::new(0),
             renew_receipt: Mutex::new(None),
             release_receipt: Mutex::new(None),
             fail_after_renew: Mutex::new(false),
@@ -1142,6 +1211,119 @@ mod tests {
             releases: Mutex::new(0),
         };
         (directory, journal, control)
+    }
+
+    fn bring_to_candidate_handoff(
+        journal: &mut Journal,
+        mut state: WorkerAttemptState,
+    ) -> WorkerAttemptState {
+        for (byte, second, key, command) in [
+            (
+                80,
+                1,
+                "progress-local-prepare",
+                WorkerCommandKind::BeginPreparation,
+            ),
+            (
+                81,
+                2,
+                "progress-local-workspace",
+                WorkerCommandKind::WorkspacePrepared {
+                    workspace_digest: Sha256Digest::of_bytes("workspace"),
+                },
+            ),
+            (
+                82,
+                3,
+                "progress-local-baseline",
+                WorkerCommandKind::BaselineFinished {
+                    passed: true,
+                    evidence_digest: Sha256Digest::of_bytes("baseline"),
+                    failure_code: None,
+                },
+            ),
+            (
+                83,
+                4,
+                "progress-local-plan",
+                WorkerCommandKind::PlanAccepted {
+                    plan_digest: Sha256Digest::of_bytes("plan"),
+                },
+            ),
+            (
+                84,
+                5,
+                "progress-local-turn",
+                WorkerCommandKind::TurnProducedChanges {
+                    turn_id: ProtocolKey::new("progress-local-turn").expect("turn"),
+                    tree: GitObjectId::new("2".repeat(40)).expect("tree"),
+                    model_claimed_done: true,
+                },
+            ),
+            (
+                85,
+                6,
+                "progress-local-verify",
+                WorkerCommandKind::VerificationFinished {
+                    passed: true,
+                    evidence_digest: Sha256Digest::of_bytes("verification"),
+                    failure_code: None,
+                },
+            ),
+            (
+                86,
+                7,
+                "progress-local-seal",
+                WorkerCommandKind::SealCandidate {
+                    candidate: crate::runtime::CandidateSnapshot {
+                        commit: GitObjectId::new("3".repeat(40)).expect("commit"),
+                        tree: GitObjectId::new("2".repeat(40)).expect("tree"),
+                        author_evidence_digest: Sha256Digest::of_bytes("author evidence"),
+                    },
+                    observed_generation: state.lease_generation(),
+                },
+            ),
+        ] {
+            state = apply_local(
+                journal,
+                identity().actor_id,
+                Uuid::from_bytes([byte; 16]),
+                &state,
+                at(second),
+                key.to_owned(),
+                command,
+            )
+            .expect("advance local Attempt");
+        }
+        assert_eq!(state.phase(), WorkerPhase::HandingOffCandidate);
+        state
+    }
+
+    fn progress_intent(state: &WorkerAttemptState) -> AttemptProgressCommandIntentRecord {
+        AttemptProgressCommandIntentRecord {
+            intent_id: Uuid::from_bytes([90; 16]),
+            attempt_id: state.attempt_id(),
+            command: MvpCommand {
+                context: MvpCommandContext {
+                    command_id: id(91),
+                    actor_id: identity().actor_id,
+                    idempotency_key: IdempotencyKey::new("progress-preparing-v1").expect("key"),
+                    correlation_id: id(92),
+                    causation_id: None,
+                    expected_version: Some(claimed().attempt_version),
+                },
+                input: ReportAttemptProgressInput {
+                    project_id: claimed().project_id,
+                    attempt_id: state.attempt_id(),
+                    lease_id: state.lease_id(),
+                    node_id: identity().node_id,
+                    fencing_token: state.lease_generation(),
+                    stage: AttemptProgressStage::Preparing,
+                    evidence_digest: Sha256Digest::of_bytes("preparing evidence"),
+                },
+            },
+            created_at: at(8),
+        }
     }
 
     #[tokio::test]
@@ -1192,6 +1374,54 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(*control.claims.lock().expect("claims"), 2);
+    }
+
+    #[tokio::test]
+    async fn attempt_progress_executor_recovers_a_lost_ack_without_a_second_mutation() {
+        let (directory, mut journal, control) = fixture();
+        let claimed_attempt = claim_offer(&control, &mut journal, identity(), &intent())
+            .await
+            .expect("claim");
+        let state = bring_to_candidate_handoff(&mut journal, claimed_attempt.state);
+        let record = progress_intent(&state);
+        *control
+            .fail_after_progress
+            .lock()
+            .expect("progress failure") = true;
+        let error = execute_attempt_progress_command_intent(&control, &mut journal, &record)
+            .await
+            .expect_err("response is lost after the central mutation");
+        assert_eq!(error.code(), "AF_UNAVAILABLE");
+        assert_eq!(
+            journal
+                .pending_attempt_progress_command_intents()
+                .expect("durable pending progress command"),
+            vec![record.clone()]
+        );
+        assert_eq!(*control.progress_reports.lock().expect("reports"), 1);
+        drop(journal);
+
+        let mut reopened =
+            Journal::open(directory.path().join("worker.sqlite3")).expect("reopen journal");
+        let response = execute_attempt_progress_command_intent(&control, &mut reopened, &record)
+            .await
+            .expect("recover remote receipt with the exact command");
+        assert_eq!(response.state, AttemptState::Preparing);
+        assert_eq!(response.version, AggregateVersion::new(4));
+        assert_eq!(*control.progress_reports.lock().expect("reports"), 1);
+        assert!(
+            reopened
+                .pending_attempt_progress_command_intents()
+                .expect("progress command completed")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .attempt_progress_command_history(state.attempt_id())
+                .expect("progress history")[0]
+                .response,
+            Some(response)
+        );
     }
 
     #[tokio::test]
