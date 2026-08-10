@@ -7,7 +7,7 @@
 use std::{path::Path, str::FromStr};
 
 use agentforge_application::{
-    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
+    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
     CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, MvpCommand, OfferView,
     PackageExecutionSnapshot, ReleaseLeaseInput, RenewLeaseInput,
     UploadCandidateArtifactChunkInput,
@@ -28,7 +28,7 @@ use crate::runtime::{
     grant_fact,
 };
 
-const JOURNAL_SCHEMA_VERSION: i64 = 5;
+const JOURNAL_SCHEMA_VERSION: i64 = 6;
 const OUTBOX_DESTINATION: &str = "control-plane.worker-events";
 const MAX_INLINE_EXECUTION_BYTES: usize = 1_048_576;
 
@@ -130,10 +130,14 @@ CREATE TABLE claim_intents (
   created_at TEXT NOT NULL,
   attempt_id TEXT REFERENCES attempts(attempt_id),
   lease_id TEXT,
+  response_json TEXT,
+  response_digest TEXT,
   completed_at TEXT,
   UNIQUE (actor_id, idempotency_key),
-  CHECK ((state = 'pending' AND attempt_id IS NULL AND lease_id IS NULL AND completed_at IS NULL)
+  CHECK ((state = 'pending' AND attempt_id IS NULL AND lease_id IS NULL
+          AND response_json IS NULL AND response_digest IS NULL AND completed_at IS NULL)
       OR (state = 'completed' AND attempt_id IS NOT NULL AND lease_id IS NOT NULL
+          AND response_json IS NOT NULL AND response_digest IS NOT NULL
           AND completed_at IS NOT NULL))
 );
 
@@ -313,6 +317,8 @@ WHEN OLD.state <> 'pending'
   OR NEW.state <> 'completed'
   OR NEW.attempt_id IS NULL
   OR NEW.lease_id IS NULL
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
   OR NEW.completed_at IS NULL
 BEGIN
   SELECT RAISE(ABORT, 'claim intent state is monotonic');
@@ -550,6 +556,46 @@ CREATE TRIGGER candidate_artifact_command_intents_cannot_be_deleted
 BEFORE DELETE ON candidate_artifact_command_intents
 BEGIN
   SELECT RAISE(ABORT, 'candidate artifact command intents cannot be deleted');
+END;
+"#;
+
+const MIGRATE_V5_TO_V6: &str = r#"
+ALTER TABLE claim_intents ADD COLUMN response_json TEXT;
+ALTER TABLE claim_intents ADD COLUMN response_digest TEXT;
+
+DROP TRIGGER claim_intents_request_is_immutable;
+DROP TRIGGER claim_intents_state_is_monotonic;
+DROP TRIGGER claim_intents_cannot_be_deleted;
+
+CREATE TRIGGER claim_intents_request_is_immutable
+BEFORE UPDATE ON claim_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'claim intent request is immutable');
+END;
+
+CREATE TRIGGER claim_intents_state_is_monotonic
+BEFORE UPDATE ON claim_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.attempt_id IS NULL
+  OR NEW.lease_id IS NULL
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'claim intent state is monotonic');
+END;
+
+CREATE TRIGGER claim_intents_cannot_be_deleted
+BEFORE DELETE ON claim_intents
+BEGIN
+  SELECT RAISE(ABORT, 'claim intents cannot be deleted');
 END;
 "#;
 
@@ -1261,6 +1307,7 @@ struct StoredClaimIntent {
     state: ClaimIntentState,
     attempt_id: Option<AttemptId>,
     lease_id: Option<LeaseId>,
+    response: Option<ClaimedWork>,
     completed_at: Option<ServerInstant>,
 }
 
@@ -1274,6 +1321,8 @@ struct RawClaimIntent {
     created_at: String,
     attempt_id: Option<String>,
     lease_id: Option<String>,
+    response_json: Option<String>,
+    response_digest: Option<String>,
     completed_at: Option<String>,
 }
 
@@ -1288,7 +1337,9 @@ fn raw_claim_intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawClaimInt
         created_at: row.get(6)?,
         attempt_id: row.get(7)?,
         lease_id: row.get(8)?,
-        completed_at: row.get(9)?,
+        response_json: row.get(9)?,
+        response_digest: row.get(10)?,
+        completed_at: row.get(11)?,
     })
 }
 
@@ -1304,23 +1355,47 @@ fn decode_claim_intent(raw: RawClaimIntent) -> JournalResult<StoredClaimIntent> 
         .lease_id
         .map(|value| LeaseId::from_str(&value).map_err(|_| JournalError::Integrity))
         .transpose()?;
+    let response = raw
+        .response_json
+        .as_deref()
+        .map(decode_stored::<ClaimedWork>)
+        .transpose()?;
     let completed_at = raw
         .completed_at
         .map(|value| parse_instant(&value))
         .transpose()?;
     let completion_shape_is_valid = match state {
         ClaimIntentState::Pending => {
-            attempt_id.is_none() && lease_id.is_none() && completed_at.is_none()
+            attempt_id.is_none()
+                && lease_id.is_none()
+                && response.is_none()
+                && raw.response_digest.is_none()
+                && completed_at.is_none()
         }
         ClaimIntentState::Completed => {
-            attempt_id.is_some() && lease_id.is_some() && completed_at.is_some()
+            attempt_id.is_some()
+                && lease_id.is_some()
+                && (response.is_some() == raw.response_digest.is_some())
+                && completed_at.is_some()
         }
     };
+    if let Some(response) = &response {
+        validate_claimed_work_response_shape(&record, response)?;
+    }
     if record.intent_id.to_string() != raw.intent_id
         || record.actor_id().to_string() != raw.actor_id
         || record.command.context.idempotency_key.as_str() != raw.idempotency_key
         || instant_text(record.created_at) != raw.created_at
         || digest_json(&record)?.to_string() != raw.intent_digest
+        || response
+            .as_ref()
+            .zip(raw.response_digest.as_deref())
+            .is_some_and(|(value, digest)| {
+                digest_json(value).map(|d| d.to_string()).ok().as_deref() != Some(digest)
+            })
+        || response.as_ref().is_some_and(|response| {
+            Some(response.attempt_id) != attempt_id || Some(response.lease_id) != lease_id
+        })
         || !completion_shape_is_valid
         || completed_at.is_some_and(|instant| instant < record.created_at)
     {
@@ -1331,8 +1406,47 @@ fn decode_claim_intent(raw: RawClaimIntent) -> JournalResult<StoredClaimIntent> 
         state,
         attempt_id,
         lease_id,
+        response,
         completed_at,
     })
+}
+
+fn validate_claimed_work_response_shape(
+    record: &ClaimIntentRecord,
+    response: &ClaimedWork,
+) -> JournalResult<()> {
+    let execution_bytes = serde_json_canonicalizer::to_vec(&response.execution.canonical_document)
+        .map_err(|_| JournalError::Integrity)?;
+    let input_bytes = serde_json_canonicalizer::to_vec(&response.execution.input_snapshot)
+        .map_err(|_| JournalError::Integrity)?;
+    let expected_object_format = if response.execution.base_commit.as_str().len() == 40 {
+        "sha1"
+    } else {
+        "sha256"
+    };
+    if response.project_id != record.offer.project_id
+        || response.project_id != record.command.input.project_id
+        || response.package_id != record.offer.package_id
+        || response.package_id != record.command.input.package_id
+        || response.revision_id != record.offer.revision_id
+        || response.execution.revision != record.offer.revision
+        || response.package_version.get() != record.offer.version.get().saturating_add(1)
+        || response.attempt_id.as_uuid().is_nil()
+        || response.lease_id.as_uuid().is_nil()
+        || response.granted_at >= response.expires_at
+        || response.expires_at > response.max_expires_at
+        || response.execution.git_object_format != expected_object_format
+        || !response.execution.canonical_document.is_object()
+        || !response.execution.input_snapshot.is_object()
+        || execution_bytes
+            .len()
+            .checked_add(input_bytes.len())
+            .is_none_or(|size| size > MAX_INLINE_EXECUTION_BYTES)
+        || Sha256Digest::of_bytes(execution_bytes) != response.execution.package_hash
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(())
 }
 
 fn load_claim_intent_by_id(
@@ -1342,7 +1456,7 @@ fn load_claim_intent_by_id(
     connection
         .query_row(
             "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
-                    created_at, attempt_id, lease_id, completed_at \
+                    created_at, attempt_id, lease_id, response_json, response_digest, completed_at \
              FROM claim_intents WHERE intent_id = ?1",
             [intent_id.to_string()],
             raw_claim_intent_row,
@@ -1360,7 +1474,7 @@ fn load_claim_intent_by_key(
     connection
         .query_row(
             "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
-                    created_at, attempt_id, lease_id, completed_at \
+                    created_at, attempt_id, lease_id, response_json, response_digest, completed_at \
              FROM claim_intents WHERE actor_id = ?1 AND idempotency_key = ?2",
             params![actor_id.to_string(), idempotency_key.as_str()],
             raw_claim_intent_row,
@@ -1706,6 +1820,7 @@ fn load_completed_candidate_artifact_init(
 struct CompletedClaimIntent {
     record: ClaimIntentRecord,
     lease_id: LeaseId,
+    response: Option<ClaimedWork>,
 }
 
 fn load_completed_claim_for_attempt(
@@ -1714,7 +1829,7 @@ fn load_completed_claim_for_attempt(
 ) -> JournalResult<Option<CompletedClaimIntent>> {
     let mut statement = connection.prepare(
         "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
-                created_at, attempt_id, lease_id, completed_at \
+                created_at, attempt_id, lease_id, response_json, response_digest, completed_at \
          FROM claim_intents WHERE state = 'completed' AND attempt_id = ?1 ORDER BY intent_id",
     )?;
     let rows = statement.query_map([attempt_id.to_string()], raw_claim_intent_row)?;
@@ -1722,13 +1837,18 @@ fn load_completed_claim_for_attempt(
         .map(|row| {
             let stored = decode_claim_intent(row?)?;
             let lease_id = stored.lease_id.ok_or(JournalError::Integrity)?;
-            if stored.state != ClaimIntentState::Completed || stored.attempt_id != Some(attempt_id)
+            if stored.state != ClaimIntentState::Completed
+                || stored.attempt_id != Some(attempt_id)
+                || stored.response.as_ref().is_some_and(|response| {
+                    response.attempt_id != attempt_id || response.lease_id != lease_id
+                })
             {
                 return Err(JournalError::Integrity);
             }
             Ok(CompletedClaimIntent {
                 record: stored.record,
                 lease_id,
+                response: stored.response,
             })
         })
         .collect::<JournalResult<Vec<_>>>()?;
@@ -1737,6 +1857,7 @@ fn load_completed_claim_for_attempt(
         [claim] => Ok(Some(CompletedClaimIntent {
             record: claim.record.clone(),
             lease_id: claim.lease_id,
+            response: claim.response.clone(),
         })),
         _ => Err(JournalError::Integrity),
     }
@@ -1749,12 +1870,16 @@ fn validate_candidate_artifact_binding(
 ) -> JournalResult<CompletedClaimIntent> {
     let claim = load_completed_claim_for_attempt(connection, record.attempt_id)?
         .ok_or(JournalError::Integrity)?;
+    let claimed = claim.response.as_ref().ok_or(JournalError::Integrity)?;
     if record.command.project_id() != claim.record.offer.project_id
         || record.command.actor_id() != claim.record.actor_id()
         || record.command.node_id() != claim.record.node_id()
         || record.command.lease_id() != state.lease_id()
         || record.command.lease_id() != claim.lease_id
         || record.command.fencing_token() != state.lease_generation()
+        || claimed.attempt_id != state.attempt_id()
+        || claimed.lease_id != state.lease_id()
+        || claimed.fencing_token != state.lease_generation()
     {
         return Err(JournalError::Runtime(WorkerError::LeaseStale));
     }
@@ -2089,6 +2214,7 @@ impl Journal {
                     .execute_batch(MIGRATE_V2_TO_V3)
                     .and_then(|()| connection.execute_batch(MIGRATE_V3_TO_V4))
                     .and_then(|()| connection.execute_batch(MIGRATE_V4_TO_V5))
+                    .and_then(|()| connection.execute_batch(MIGRATE_V5_TO_V6))
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -2103,6 +2229,7 @@ impl Journal {
                 let migrated = connection
                     .execute_batch(MIGRATE_V3_TO_V4)
                     .and_then(|()| connection.execute_batch(MIGRATE_V4_TO_V5))
+                    .and_then(|()| connection.execute_batch(MIGRATE_V5_TO_V6))
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -2116,6 +2243,20 @@ impl Journal {
                 connection.execute_batch("BEGIN IMMEDIATE")?;
                 let migrated = connection
                     .execute_batch(MIGRATE_V4_TO_V5)
+                    .and_then(|()| connection.execute_batch(MIGRATE_V5_TO_V6))
+                    .and_then(|()| {
+                        connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
+                    })
+                    .and_then(|()| connection.execute_batch("COMMIT"));
+                if let Err(error) = migrated {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
+            5 => {
+                connection.execute_batch("BEGIN IMMEDIATE")?;
+                let migrated = connection
+                    .execute_batch(MIGRATE_V5_TO_V6)
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -2187,7 +2328,7 @@ impl Journal {
     pub fn pending_claim_intents(&self) -> JournalResult<Vec<ClaimIntentRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, created_at, \
-                    attempt_id, lease_id, completed_at \
+                    attempt_id, lease_id, response_json, response_digest, completed_at \
              FROM claim_intents WHERE state = 'pending' ORDER BY created_at, intent_id",
         )?;
         let rows = statement.query_map([], raw_claim_intent_row)?;
@@ -2198,11 +2339,13 @@ impl Journal {
     pub fn complete_claim_intent(
         &mut self,
         intent_id: Uuid,
-        attempt_id: AttemptId,
-        lease_id: LeaseId,
+        response: &ClaimedWork,
         completed_at: ServerInstant,
     ) -> JournalResult<ClaimIntentCompletion> {
-        if intent_id.is_nil() || attempt_id.as_uuid().is_nil() || lease_id.as_uuid().is_nil() {
+        if intent_id.is_nil()
+            || response.attempt_id.as_uuid().is_nil()
+            || response.lease_id.as_uuid().is_nil()
+        {
             return Err(JournalError::Runtime(WorkerError::InvalidArgument(
                 "claim_intent_completion",
             )));
@@ -2212,9 +2355,11 @@ impl Journal {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let stored =
             load_claim_intent_by_id(&transaction, intent_id)?.ok_or(JournalError::Integrity)?;
+        validate_claimed_work_response_shape(&stored.record, response)?;
         if stored.state == ClaimIntentState::Completed {
-            if stored.attempt_id == Some(attempt_id)
-                && stored.lease_id == Some(lease_id)
+            if stored.attempt_id == Some(response.attempt_id)
+                && stored.lease_id == Some(response.lease_id)
+                && stored.response.as_ref() == Some(response)
                 && stored.completed_at == Some(completed_at)
             {
                 transaction.commit()?;
@@ -2228,7 +2373,7 @@ impl Journal {
         let attempt_binding = transaction
             .query_row(
                 "SELECT package_id, package_revision, lease_id FROM attempts WHERE attempt_id = ?1",
-                [attempt_id.to_string()],
+                [response.attempt_id.to_string()],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -2241,17 +2386,20 @@ impl Journal {
             .ok_or(JournalError::Integrity)?;
         if attempt_binding.0 != stored.record.offer.package_id.to_string()
             || attempt_binding.1 != i64::from(stored.record.offer.revision.get())
-            || attempt_binding.2 != lease_id.to_string()
+            || attempt_binding.2 != response.lease_id.to_string()
         {
             return Err(JournalError::Integrity);
         }
         let changed = transaction.execute(
             "UPDATE claim_intents SET state = 'completed', attempt_id = ?2, lease_id = ?3, \
-                    completed_at = ?4 WHERE intent_id = ?1 AND state = 'pending'",
+                    response_json = ?4, response_digest = ?5, completed_at = ?6 \
+             WHERE intent_id = ?1 AND state = 'pending'",
             params![
                 intent_id.to_string(),
-                attempt_id.to_string(),
-                lease_id.to_string(),
+                response.attempt_id.to_string(),
+                response.lease_id.to_string(),
+                encode(response)?,
+                digest_json(response)?.to_string(),
                 instant_text(completed_at),
             ],
         )?;
@@ -2666,7 +2814,7 @@ impl Journal {
             .ok_or(JournalError::Integrity)?;
         let mut statement = self.connection.prepare(
             "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
-                    created_at, attempt_id, lease_id, completed_at \
+                    created_at, attempt_id, lease_id, response_json, response_digest, completed_at \
              FROM claim_intents \
              WHERE state = 'completed' AND attempt_id = ?1 \
              ORDER BY intent_id",
@@ -2688,6 +2836,27 @@ impl Journal {
             return Err(JournalError::Integrity);
         }
         Ok(Some(record.offer.project_id))
+    }
+
+    /// Returns the exact successful Claim response needed by later remote CAS
+    /// commands. A Journal upgraded from v5 may contain a legacy completed
+    /// Claim without this response; that case returns `None` so callers fail
+    /// closed instead of guessing the central Attempt version.
+    pub fn claimed_work_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> JournalResult<Option<ClaimedWork>> {
+        let state = self
+            .load_attempt(attempt_id)?
+            .ok_or(JournalError::Integrity)?;
+        let Some(claim) = load_completed_claim_for_attempt(&self.connection, attempt_id)? else {
+            return Ok(None);
+        };
+        if claim.record.offer.package_id != state.package_id() || claim.lease_id != state.lease_id()
+        {
+            return Err(JournalError::Integrity);
+        }
+        Ok(claim.response)
     }
 
     pub fn pending_outbox(&self, limit: u16) -> JournalResult<Vec<PendingOutbox>> {
@@ -3408,6 +3577,24 @@ mod tests {
         }
     }
 
+    fn claimed_work() -> ClaimedWork {
+        ClaimedWork {
+            project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+            package_id: grant().package_id,
+            revision_id: PackageRevisionId::from_uuid(Uuid::from_bytes([42; 16])),
+            attempt_id: grant().attempt_id,
+            lease_id: grant().lease_id,
+            fencing_token: grant().lease_generation,
+            granted_at: grant().granted_at,
+            expires_at: grant().lease_expires_at,
+            max_expires_at: at(600),
+            package_version: AggregateVersion::new(2),
+            attempt_version: AggregateVersion::new(2),
+            lease_version: AggregateVersion::new(1),
+            execution: execution(),
+        }
+    }
+
     fn lease_command_intent() -> LeaseCommandIntentRecord {
         LeaseCommandIntentRecord {
             intent_id: Uuid::from_bytes([50; 16]),
@@ -3527,7 +3714,7 @@ mod tests {
             .expect("register claim intent");
         let mut state = bring_to_implementing(journal);
         journal
-            .complete_claim_intent(claim.intent_id, state.attempt_id(), state.lease_id(), at(1))
+            .complete_claim_intent(claim.intent_id, &claimed_work(), at(1))
             .expect("complete claim intent");
         state = journal
             .handle(&apply_request(
@@ -3800,23 +3987,13 @@ mod tests {
         journal.handle(&grant_request()).expect("grant");
         assert_eq!(
             journal
-                .complete_claim_intent(
-                    intent.intent_id,
-                    grant().attempt_id,
-                    grant().lease_id,
-                    at(1)
-                )
+                .complete_claim_intent(intent.intent_id, &claimed_work(), at(1))
                 .expect("complete intent"),
             ClaimIntentCompletion::Completed
         );
         assert_eq!(
             journal
-                .complete_claim_intent(
-                    intent.intent_id,
-                    grant().attempt_id,
-                    grant().lease_id,
-                    at(1)
-                )
+                .complete_claim_intent(intent.intent_id, &claimed_work(), at(1))
                 .expect("completion replay"),
             ClaimIntentCompletion::Existing
         );
@@ -3825,6 +4002,12 @@ mod tests {
                 .pending_claim_intents()
                 .expect("no pending intent")
                 .is_empty()
+        );
+        assert_eq!(
+            journal
+                .claimed_work_for_attempt(grant().attempt_id)
+                .expect("stored Claim response"),
+            Some(claimed_work())
         );
         assert!(
             journal
@@ -4094,13 +4277,13 @@ mod tests {
         drop(journal);
 
         let mut reopened =
-            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v5");
+            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v6");
         assert_eq!(
             reopened
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            5
+            6
         );
         assert_eq!(
             reopened
@@ -4117,6 +4300,126 @@ mod tests {
     }
 
     #[test]
+    fn schema_v5_preserves_legacy_claims_but_requires_receipts_for_new_completions() {
+        let directory = tempfile::tempdir().expect("temporary journal");
+        let path = directory.path().join("worker.sqlite3");
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY);
+                 PRAGMA user_version = 2;",
+            )
+            .expect("minimal v2 base");
+        connection
+            .execute_batch(MIGRATE_V2_TO_V3)
+            .and_then(|()| connection.execute_batch(MIGRATE_V3_TO_V4))
+            .and_then(|()| connection.execute_batch(MIGRATE_V4_TO_V5))
+            .expect("construct exact v5 deltas");
+        connection
+            .execute(
+                "INSERT INTO attempts (attempt_id) VALUES (?1)",
+                [grant().attempt_id.to_string()],
+            )
+            .expect("legacy attempt");
+        let intent = claim_intent();
+        connection
+            .execute(
+                "INSERT INTO claim_intents \
+                 (intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
+                  created_at, attempt_id, lease_id, completed_at) \
+                 VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    intent.intent_id.to_string(),
+                    intent.actor_id().to_string(),
+                    intent.command.context.idempotency_key.as_str(),
+                    encode(&intent).expect("intent json"),
+                    digest_json(&intent).expect("intent digest").to_string(),
+                    instant_text(intent.created_at),
+                    grant().attempt_id.to_string(),
+                    grant().lease_id.to_string(),
+                    instant_text(at(1)),
+                ],
+            )
+            .expect("legacy completed Claim");
+        connection
+            .pragma_update(None, "user_version", 5_i64)
+            .expect("v5 marker");
+        drop(connection);
+
+        let journal = Journal::open(&path).expect("migrate v5 to v6");
+        assert_eq!(
+            journal
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            6
+        );
+        let legacy_response: (Option<String>, Option<String>) = journal
+            .connection
+            .query_row(
+                "SELECT response_json, response_digest FROM claim_intents WHERE intent_id = ?1",
+                [intent.intent_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("legacy response shape");
+        assert_eq!(legacy_response, (None, None));
+        let mut pending = intent.clone();
+        pending.intent_id = Uuid::from_bytes([75; 16]);
+        pending.command.context.command_id = id(76);
+        pending.command.context.idempotency_key =
+            IdempotencyKey::new("remote-claim-v6").expect("key");
+        pending.command.context.correlation_id = id(77);
+        journal
+            .connection
+            .execute(
+                "INSERT INTO claim_intents \
+                 (intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
+                  created_at) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6)",
+                params![
+                    pending.intent_id.to_string(),
+                    pending.actor_id().to_string(),
+                    pending.command.context.idempotency_key.as_str(),
+                    encode(&pending).expect("pending json"),
+                    digest_json(&pending).expect("pending digest").to_string(),
+                    instant_text(pending.created_at),
+                ],
+            )
+            .expect("v6 pending Claim");
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "UPDATE claim_intents SET state = 'completed', attempt_id = ?2, lease_id = ?3, \
+                     completed_at = ?4 WHERE intent_id = ?1",
+                    params![
+                        pending.intent_id.to_string(),
+                        grant().attempt_id.to_string(),
+                        grant().lease_id.to_string(),
+                        instant_text(at(2)),
+                    ],
+                )
+                .is_err(),
+            "a new completion cannot omit its typed Claim response"
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "UPDATE claim_intents SET state = 'completed', attempt_id = ?2, lease_id = ?3, \
+                     completed_at = ?4 WHERE intent_id = ?1",
+                    params![
+                        intent.intent_id.to_string(),
+                        grant().attempt_id.to_string(),
+                        grant().lease_id.to_string(),
+                        instant_text(at(2)),
+                    ],
+                )
+                .is_err(),
+            "a legacy completed row remains immutable"
+        );
+    }
+
+    #[test]
     fn journal_is_wal_full_hash_chained_and_receipt_first() {
         let (_directory, mut journal) = fixture();
         let request = grant_request();
@@ -4125,7 +4428,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            5
+            6
         );
         let applied = journal.handle(&request).expect("grant applied");
         assert!(matches!(applied, JournalDisposition::Applied(_)));

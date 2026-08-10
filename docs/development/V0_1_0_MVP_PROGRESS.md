@@ -393,7 +393,8 @@ upload intent、`RecordCandidate + VerificationRun::Queued` 仍未接通，不�
 状态：实现完成，全工作区门禁以及 CI #78/#80 Rust job 通过。真实 PostgreSQL 17 连续揭示正向 fixture
 中三组“必须相等”的字段使用了独立 volatile 时钟：Artifact 初态 `created_at/updated_at`、VerificationRun
 初态 `queued_at/updated_at`、Artifact COMPLETE 的 `completed_at/updated_at`。M、M.1、M.2 已逐组改用同一
-transaction timestamp；数据库的 fail-closed 强约束保持不变，等待 M.2 推送后的完整 PostgreSQL 复验。
+transaction timestamp；数据库的 fail-closed 强约束保持不变。包含 M.2 的 CI #84 已在真实 PostgreSQL
+17 上全绿，三组 fixture 漂移全部关闭。
 
 当前完成：
 
@@ -434,7 +435,7 @@ SQLite Journal，也未由 fixture driver 触发上传；因此本检查点不�
 
 ## MVP-03 / Checkpoint N：Worker Candidate Artifact Journal v5
 
-状态：实现完成，Worker 定点门禁与全工作区 build/test/Clippy 通过；等待推送后的 CI。
+状态：实现完成，Worker 定点门禁与全工作区 build/test/Clippy 通过；CI #84 全绿（含真实 PostgreSQL 17）。
 
 当前完成：
 
@@ -472,3 +473,38 @@ git diff --check                                                             PAS
 当前边界：本检查点提供 durable upload intent/receipt 与恢复原语，但 daemon 尚未自动从 fixture Candidate
 生成真实 Bundle、依次注册/执行三类 intent；`RecordCandidate + VerificationRun::Queued` 也仍在后续，
 因此不能宣称端到端 Candidate handoff 已闭环。
+
+## MVP-03 / Checkpoint O.1：完整 Claim 回执与 Journal v6
+
+状态：实现完成，Worker 41 个定点测试与全工作区 build/test/Clippy 通过；等待推送后的 CI。
+
+当前完成：
+
+- Claim 完成不再只保存 Attempt/Lease ID；Journal 原子保存完整 `ClaimedWork` JSON、JCS digest 与完成时间，
+  ACK 丢失后的 exact completion 必须逐字段等于首次回执；
+- 持久化边界重新验证 Project/Package/revision、Package version、Attempt/Lease ID、时间窗口、Git object
+  format、1 MiB 内联上限、canonical AFWP 与 package hash，不能通过伪造 HTTP response 污染后续 CAS；
+- `claimed_work_for_attempt` 提供后续 Artifact Init 所需的权威 `attempt_version`、Lease version 与 execution
+  binding；旧 v5 completed Claim 的回执字段保持 NULL 并返回 `None`，调用者 fail closed 而不是推断 `v2`；
+- v5→v6 只 additive 增加 Claim response/digest 列并重装单调 trigger；真实 v5 legacy completed row 保留，
+  新 pending Claim 若不携完整 response 不能进入 completed；v2→v6 链同样通过；
+- lifecycle 在本地 Grant、execution snapshot、hash-chain 和 Outbox 已原子成功后，用同一 remote Claim response
+  完成 intent，保证后续恢复读取的是实际 ACK 而非重新构造的近似值。
+
+定点证据：
+
+```text
+cargo test -p agentforge-worker-daemon --lib --locked --offline            PASS (41/41)
+cargo clippy -p agentforge-worker-daemon --all-targets --all-features \
+  --locked --offline -- -D warnings                                        PASS
+cargo fmt --all -- --check                                                  PASS
+cargo build --workspace --locked --all-targets --offline                    PASS
+cargo test --workspace --locked --offline                                   PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                   PASS
+node --check crates/control-plane/assets/app.js                              PASS
+git diff --check                                                             PASS
+```
+
+当前边界：v6 只补齐自动上传所需的权威 Claim/CAS 输入；pending Artifact 网络执行器与 fixture Bundle planner
+将在下一检查点接入。

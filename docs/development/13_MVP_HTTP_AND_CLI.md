@@ -86,7 +86,9 @@ CAS 过期固定返回 `AF_VERSION_STALE/412`，不得使用旧拼写 `AF_STALE_
 
 ### 2.2 Worker Artifact upload Journal
 
-Worker SQLite Journal schema v5 增加 `candidate_artifact_command_intents`。Init、每个 Chunk、Complete 都以
+Worker SQLite Journal schema v5 增加 `candidate_artifact_command_intents`；schema v6 进一步把首次成功的
+完整 `ClaimedWork`（含 Package/Attempt/Lease CAS version 与 execution snapshot）保存进原 Claim intent。
+Init、每个 Chunk、Complete 都以
 完整 typed command、actor、idempotency key、Attempt binding、请求摘要和创建时间先于 HTTP 调用提交；
 成功后再以一个 SQLite 事务写入 typed response、响应摘要和完成时间。请求字段、完成回执和状态转换由
 触发器保护，不能 UPDATE 改写或 DELETE。
@@ -97,8 +99,10 @@ key、chunk 内容或 Bundle binding。即使 ACK 丢失后本地 Worker 已观�
 Init 回执固定 `UPLOADING/version=1`，Chunk 回执必须逐字段匹配声明和内容摘要，Complete 回执必须与 Init 的
 Candidate/Artifact/Bundle lineage 完全一致且为 `COMPLETE/version=3`。
 
-v2、v3、v4 Journal 在独占 SQLite 迁移事务内逐级升级到 v5；未知版本 fail closed。本阶段只交付 durable
-intent/receipt ledger，daemon 自动创建这些 intent 并驱动 fixture Bundle 上传属于下一检查点。
+v2、v3、v4、v5 Journal 在独占 SQLite 迁移事务内逐级升级到 v6；未知版本 fail closed。v5 以前已经完成
+的 Claim 没有可证明的中央 Attempt version，迁移会保留该历史行，但 Artifact workflow 返回“缺少可验证
+Claim 回执”，不得猜测常量 version。本阶段只交付 durable intent/receipt ledger，daemon 自动创建这些
+intent 并驱动 fixture Bundle 上传属于下一检查点。
 
 ## 3. 管理 CLI
 

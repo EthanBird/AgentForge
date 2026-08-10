@@ -403,8 +403,7 @@ async fn execute_claim_intent(
         .clone();
     journal.complete_claim_intent(
         record.intent_id,
-        claimed.attempt_id,
-        claimed.lease_id,
+        &claimed,
         max_instant(record.created_at, claimed.granted_at),
     )?;
     Ok(ClaimedAttempt {
