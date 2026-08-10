@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use crate::{
     journal::{
-        ClaimIntentRecord, Journal, JournalCommand, JournalError, JournalRequest,
-        LeaseCommandIntentRecord, LeaseControlCommand,
+        CandidateArtifactCommandIntentRecord, CandidateArtifactCommandResponse,
+        CandidateArtifactControlCommand, ClaimIntentRecord, Journal, JournalCommand, JournalError,
+        JournalRequest, LeaseCommandIntentRecord, LeaseControlCommand,
     },
     runtime::{
         AttemptGrant, LeaseLossReason, WorkerAttemptState, WorkerCommandEnvelope,
@@ -672,6 +673,50 @@ pub async fn resume_lease_command_intent(
     record: &LeaseCommandIntentRecord,
 ) -> LifecycleResult<LeaseMaintenanceOutcome> {
     execute_lease_command(control, journal, record).await
+}
+
+/// Executes a newly planned or recovered Candidate Artifact command. The
+/// immutable command is always present in SQLite before the remote effect; a
+/// lost ACK therefore leaves the exact actor/key/body tuple pending for the
+/// next startup rather than allowing the daemon to synthesize a replacement.
+pub async fn execute_candidate_artifact_command_intent(
+    control: &dyn WorkerControlPlane,
+    journal: &mut Journal,
+    record: &CandidateArtifactCommandIntentRecord,
+    observed_at: ServerInstant,
+) -> LifecycleResult<CandidateArtifactCommandResponse> {
+    journal.register_candidate_artifact_command_intent(record)?;
+    let response = match &record.command {
+        CandidateArtifactControlCommand::Init { command } => {
+            CandidateArtifactCommandResponse::Init {
+                artifact: control.init_candidate_artifact(command).await?,
+            }
+        }
+        CandidateArtifactControlCommand::UploadChunk { command } => {
+            CandidateArtifactCommandResponse::UploadChunk {
+                receipt: control.upload_candidate_artifact_chunk(command).await?,
+            }
+        }
+        CandidateArtifactControlCommand::Complete { command } => {
+            CandidateArtifactCommandResponse::Complete {
+                artifact: control.complete_candidate_artifact(command).await?,
+            }
+        }
+    };
+    let remote_updated_at = match &response {
+        CandidateArtifactCommandResponse::Init { artifact }
+        | CandidateArtifactCommandResponse::Complete { artifact } => artifact.updated_at,
+        CandidateArtifactCommandResponse::UploadChunk { .. } => observed_at,
+    };
+    journal.complete_candidate_artifact_command_intent(
+        record.intent_id,
+        &response,
+        max_instant(
+            record.created_at,
+            max_instant(observed_at, remote_updated_at),
+        ),
+    )?;
+    Ok(response)
 }
 
 async fn execute_lease_command(

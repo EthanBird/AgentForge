@@ -2,8 +2,13 @@
 
 use std::{future::Future, sync::Arc, time::Duration};
 
+use agentforge_application::{
+    CompleteCandidateArtifactInput, InitCandidateArtifactInput, MvpCommand, MvpCommandContext,
+    UploadCandidateArtifactChunkInput,
+};
 use agentforge_domain::{
-    AttemptId, CommandId, CorrelationId, IdempotencyKey, ProjectId, ServerInstant,
+    AggregateVersion, AttemptId, CommandId, CorrelationId, GitObjectId, IdempotencyKey, ProjectId,
+    ProtocolKey, ServerInstant, Sha256Digest,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -15,13 +20,16 @@ use crate::{
     fixture_driver::{
         FixtureDriveContext, FixtureDriveIds, FixtureDriverError, drive_fixture_attempt,
     },
-    journal::{Journal, JournalError},
+    journal::{
+        CandidateArtifactCommandIntentRecord, CandidateArtifactCommandResponse,
+        CandidateArtifactControlCommand, Journal, JournalCommand, JournalError, JournalRequest,
+    },
     lifecycle::{
         ClaimIntent, LeaseMaintenanceIntent, LeaseMaintenanceOutcome, LifecycleError,
-        WorkerControlPlane, claim_offer, maintain_attempt, poll_offer, resume_claim_intent,
-        resume_lease_command_intent,
+        WorkerControlPlane, claim_offer, execute_candidate_artifact_command_intent,
+        maintain_attempt, poll_offer, resume_claim_intent, resume_lease_command_intent,
     },
-    runtime::WorkerPhase,
+    runtime::{CandidateSnapshot, WorkerCommandEnvelope, WorkerCommandKind, WorkerPhase},
 };
 
 /// Trusted time and identifier boundary. Tests inject a deterministic source;
@@ -47,7 +55,10 @@ impl DaemonRuntime for SystemDaemonRuntime {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DaemonTickReport {
     pub resumed_claims: u16,
+    pub resumed_artifact_commands: u16,
     pub resumed_lease_commands: u16,
+    pub artifact_commands_completed: u16,
+    pub candidate_artifacts_completed: u16,
     pub maintenance_noops: u16,
     pub renewed: u16,
     pub released: u16,
@@ -72,6 +83,8 @@ pub enum DaemonError {
     InvalidRuntimeId,
     #[error("attempt {0} has no durable Project binding")]
     MissingProjectBinding(AttemptId),
+    #[error("attempt {0} has an invalid fixture Candidate Artifact command history")]
+    InvalidArtifactWorkflow(AttemptId),
     #[error("daemon counter exceeded its bounded representation")]
     CounterOverflow,
 }
@@ -86,6 +99,7 @@ impl DaemonError {
             Self::FixtureDriver(error) => error.code(),
             Self::InvalidRuntimeId => "AF_WORKER_RUNTIME_ID_INVALID",
             Self::MissingProjectBinding(_) => "AF_WORKER_PROJECT_BINDING_MISSING",
+            Self::InvalidArtifactWorkflow(_) => "AF_WORKER_ARTIFACT_WORKFLOW_INVALID",
             Self::CounterOverflow => "AF_WORKER_COUNTER_OVERFLOW",
         }
     }
@@ -142,9 +156,11 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
     /// Executes one deterministic scheduling turn:
     ///
     /// 1. replay pending Claim mutations;
-    /// 2. replay pending Renew/Release mutations;
-    /// 3. reconcile and maintain every locally owned Lease;
-    /// 4. poll and Claim only the remaining execution capacity.
+    /// 2. replay pending Candidate Artifact mutations;
+    /// 3. replay pending Renew/Release mutations;
+    /// 4. reconcile and maintain every locally owned Lease;
+    /// 5. drive fixture work and its deterministic Artifact upload;
+    /// 6. poll and Claim only the remaining execution capacity.
     pub async fn tick(&mut self) -> DaemonResult<DaemonTickReport> {
         let observed_at = self.runtime.now();
         let mut report = DaemonTickReport::default();
@@ -152,6 +168,17 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
         for record in self.journal.pending_claim_intents()? {
             resume_claim_intent(self.control.as_ref(), &mut self.journal, &record).await?;
             increment(&mut report.resumed_claims)?;
+        }
+        for record in self.journal.pending_candidate_artifact_command_intents()? {
+            let response = execute_candidate_artifact_command_intent(
+                self.control.as_ref(),
+                &mut self.journal,
+                &record,
+                observed_at,
+            )
+            .await?;
+            increment(&mut report.resumed_artifact_commands)?;
+            record_artifact_response(&mut report, &response)?;
         }
         for record in self.journal.pending_lease_command_intents()? {
             let outcome =
@@ -195,6 +222,7 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
                             | WorkerPhase::Planning
                             | WorkerPhase::Implementing
                             | WorkerPhase::LocalVerifying
+                            | WorkerPhase::SealingCandidate
                     )
                 })
                 .collect::<Vec<_>>();
@@ -217,6 +245,20 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
                 if outcome.local_candidate_ready {
                     increment(&mut report.local_candidates_ready)?;
                 }
+                if outcome.state.phase() == WorkerPhase::SealingCandidate {
+                    self.seal_fixture_candidate(&outcome.state, observed_at)?;
+                }
+            }
+
+            let handing_off = self
+                .journal
+                .recover_nonterminal()?
+                .into_iter()
+                .filter(|state| state.phase() == WorkerPhase::HandingOffCandidate)
+                .collect::<Vec<_>>();
+            for state in handing_off {
+                self.drive_fixture_candidate_artifact(&state, observed_at, &mut report)
+                    .await?;
             }
         }
 
@@ -329,6 +371,304 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
         })
     }
 
+    fn seal_fixture_candidate(
+        &mut self,
+        state: &crate::runtime::WorkerAttemptState,
+        observed_at: ServerInstant,
+    ) -> DaemonResult<()> {
+        let tree = state
+            .current_tree()
+            .cloned()
+            .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+        let author_evidence_digest = state
+            .last_verification_digest()
+            .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+        let candidate_commit = fixture_candidate_commit(state.attempt_id(), &tree)?;
+        let message_id = self.next_uuid()?;
+        self.journal.handle(&JournalRequest {
+            message_id,
+            actor_id: self.config.actor_id,
+            idempotency_key: idempotency_key("fixture-seal", message_id)?,
+            command: JournalCommand::Apply {
+                attempt_id: state.attempt_id(),
+                command: WorkerCommandEnvelope {
+                    expected_version: state.version(),
+                    observed_at,
+                    command: WorkerCommandKind::SealCandidate {
+                        candidate: CandidateSnapshot {
+                            commit: candidate_commit,
+                            tree,
+                            author_evidence_digest,
+                        },
+                        observed_generation: state.lease_generation(),
+                    },
+                },
+            },
+        })?;
+        Ok(())
+    }
+
+    async fn drive_fixture_candidate_artifact(
+        &mut self,
+        state: &crate::runtime::WorkerAttemptState,
+        observed_at: ServerInstant,
+        report: &mut DaemonTickReport,
+    ) -> DaemonResult<()> {
+        let claimed = self
+            .journal
+            .claimed_work_for_attempt(state.attempt_id())?
+            .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+        let bundle = fixture_candidate_bundle(state, &claimed)?;
+        let bundle_digest = Sha256Digest::of_bytes(&bundle);
+        let history = self
+            .journal
+            .candidate_artifact_command_history(state.attempt_id())?;
+
+        let mut init = None;
+        let mut chunk = None;
+        let mut complete = None;
+        for entry in history {
+            let response = entry
+                .response
+                .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+            let record = entry.record;
+            match response {
+                CandidateArtifactCommandResponse::Init { artifact } => {
+                    if !matches!(
+                        &record.command,
+                        CandidateArtifactControlCommand::Init { .. }
+                    ) || init.is_some()
+                    {
+                        return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+                    }
+                    init = Some((record, artifact));
+                }
+                CandidateArtifactCommandResponse::UploadChunk { receipt } => {
+                    if !matches!(
+                        &record.command,
+                        CandidateArtifactControlCommand::UploadChunk { .. }
+                    ) || chunk.is_some()
+                    {
+                        return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+                    }
+                    chunk = Some((record, receipt));
+                }
+                CandidateArtifactCommandResponse::Complete { artifact } => {
+                    if !matches!(
+                        &record.command,
+                        CandidateArtifactControlCommand::Complete { .. }
+                    ) || complete.is_some()
+                    {
+                        return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+                    }
+                    complete = Some((record, artifact));
+                }
+            }
+        }
+
+        if complete.is_some() && (init.is_none() || chunk.is_none()) {
+            return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+        }
+
+        if init.is_none() {
+            if chunk.is_some() {
+                return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+            }
+            let record =
+                self.fixture_artifact_init(state, &claimed, &bundle, bundle_digest, observed_at)?;
+            let response = execute_candidate_artifact_command_intent(
+                self.control.as_ref(),
+                &mut self.journal,
+                &record,
+                observed_at,
+            )
+            .await?;
+            record_artifact_response(report, &response)?;
+            let CandidateArtifactCommandResponse::Init { artifact } = response else {
+                return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+            };
+            init = Some((record, artifact));
+        }
+
+        let (_, artifact) = init
+            .as_ref()
+            .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+        if artifact.expected_bundle_digest != bundle_digest
+            || artifact.chunk_digests.as_slice() != [bundle_digest]
+            || artifact.expected_bundle_size_bytes
+                != u64::try_from(bundle.len())
+                    .map_err(|_| DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?
+        {
+            return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+        }
+        if complete.is_some() {
+            return Ok(());
+        }
+
+        if chunk.is_none() {
+            let record =
+                self.fixture_artifact_chunk(state, artifact, bundle, bundle_digest, observed_at)?;
+            let response = execute_candidate_artifact_command_intent(
+                self.control.as_ref(),
+                &mut self.journal,
+                &record,
+                observed_at,
+            )
+            .await?;
+            record_artifact_response(report, &response)?;
+            let CandidateArtifactCommandResponse::UploadChunk { receipt } = response else {
+                return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
+            };
+            chunk = Some((record, receipt));
+        }
+
+        chunk
+            .as_ref()
+            .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+        let record = self.fixture_artifact_complete(state, artifact, observed_at)?;
+        let response = execute_candidate_artifact_command_intent(
+            self.control.as_ref(),
+            &mut self.journal,
+            &record,
+            observed_at,
+        )
+        .await?;
+        record_artifact_response(report, &response)?;
+        Ok(())
+    }
+
+    fn fixture_artifact_init(
+        &mut self,
+        state: &crate::runtime::WorkerAttemptState,
+        claimed: &agentforge_application::ClaimedWork,
+        bundle: &[u8],
+        bundle_digest: Sha256Digest,
+        created_at: ServerInstant,
+    ) -> DaemonResult<CandidateArtifactCommandIntentRecord> {
+        let candidate = state
+            .candidate()
+            .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+        let (intent_id, context) =
+            self.artifact_command_context("worker-artifact-init", claimed.attempt_version)?;
+        Ok(CandidateArtifactCommandIntentRecord {
+            intent_id,
+            attempt_id: state.attempt_id(),
+            command: CandidateArtifactControlCommand::Init {
+                command: MvpCommand {
+                    context,
+                    input: InitCandidateArtifactInput {
+                        project_id: claimed.project_id,
+                        attempt_id: state.attempt_id(),
+                        lease_id: state.lease_id(),
+                        node_id: self.config.node_id,
+                        fencing_token: state.lease_generation(),
+                        package_hash: state.package_hash(),
+                        base_commit: state.base_commit().clone(),
+                        candidate_commit: candidate.commit.clone(),
+                        tree_hash: candidate.tree.clone(),
+                        author_evidence_digest: candidate.author_evidence_digest,
+                        expected_bundle_digest: bundle_digest,
+                        expected_bundle_size_bytes: u64::try_from(bundle.len()).map_err(|_| {
+                            DaemonError::InvalidArtifactWorkflow(state.attempt_id())
+                        })?,
+                        chunk_digests: vec![bundle_digest],
+                        upload_ttl_seconds: 600,
+                    },
+                },
+            },
+            created_at,
+        })
+    }
+
+    fn fixture_artifact_chunk(
+        &mut self,
+        state: &crate::runtime::WorkerAttemptState,
+        artifact: &agentforge_application::CandidateArtifactView,
+        bundle: Vec<u8>,
+        bundle_digest: Sha256Digest,
+        created_at: ServerInstant,
+    ) -> DaemonResult<CandidateArtifactCommandIntentRecord> {
+        let (intent_id, context) =
+            self.artifact_command_context("worker-artifact-chunk", artifact.version)?;
+        Ok(CandidateArtifactCommandIntentRecord {
+            intent_id,
+            attempt_id: state.attempt_id(),
+            command: CandidateArtifactControlCommand::UploadChunk {
+                command: MvpCommand {
+                    context,
+                    input: UploadCandidateArtifactChunkInput {
+                        project_id: artifact.project_id,
+                        artifact_id: artifact.artifact_id,
+                        lease_id: state.lease_id(),
+                        node_id: self.config.node_id,
+                        fencing_token: state.lease_generation(),
+                        chunk_index: 0,
+                        digest: bundle_digest,
+                        content: bundle,
+                    },
+                },
+            },
+            created_at,
+        })
+    }
+
+    fn fixture_artifact_complete(
+        &mut self,
+        state: &crate::runtime::WorkerAttemptState,
+        artifact: &agentforge_application::CandidateArtifactView,
+        created_at: ServerInstant,
+    ) -> DaemonResult<CandidateArtifactCommandIntentRecord> {
+        let (intent_id, context) =
+            self.artifact_command_context("worker-artifact-complete", artifact.version)?;
+        Ok(CandidateArtifactCommandIntentRecord {
+            intent_id,
+            attempt_id: state.attempt_id(),
+            command: CandidateArtifactControlCommand::Complete {
+                command: MvpCommand {
+                    context,
+                    input: CompleteCandidateArtifactInput {
+                        project_id: artifact.project_id,
+                        artifact_id: artifact.artifact_id,
+                        lease_id: state.lease_id(),
+                        node_id: self.config.node_id,
+                        fencing_token: state.lease_generation(),
+                        bundle_protocol_key: ProtocolKey::new(format!(
+                            "candidate-bundle-{}",
+                            state.attempt_id().as_uuid().simple()
+                        ))
+                        .map_err(|_| DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?,
+                        bundle_uri: format!(
+                            "artifact://candidate-artifacts/{}/fixture-bundle",
+                            state.attempt_id()
+                        ),
+                    },
+                },
+            },
+            created_at,
+        })
+    }
+
+    fn artifact_command_context(
+        &mut self,
+        prefix: &str,
+        expected_version: AggregateVersion,
+    ) -> DaemonResult<(Uuid, MvpCommandContext)> {
+        let intent_id = self.next_uuid()?;
+        Ok((
+            intent_id,
+            MvpCommandContext {
+                command_id: CommandId::from(self.next_uuid()?),
+                actor_id: self.config.actor_id,
+                idempotency_key: idempotency_key(prefix, intent_id)?,
+                correlation_id: CorrelationId::from(self.next_uuid()?),
+                // The MVP responses do not expose the server Event ID. Do not
+                // type-coerce a Command ID into a fabricated causation fact.
+                causation_id: None,
+                expected_version: Some(expected_version),
+            },
+        ))
+    }
+
     fn next_uuid(&mut self) -> DaemonResult<Uuid> {
         let value = self.runtime.next_uuid();
         if value.is_nil() {
@@ -360,6 +700,52 @@ fn record_maintenance_outcome(
     }
 }
 
+fn record_artifact_response(
+    report: &mut DaemonTickReport,
+    response: &CandidateArtifactCommandResponse,
+) -> DaemonResult<()> {
+    increment(&mut report.artifact_commands_completed)?;
+    if matches!(response, CandidateArtifactCommandResponse::Complete { .. }) {
+        increment(&mut report.candidate_artifacts_completed)?;
+    }
+    Ok(())
+}
+
+fn fixture_candidate_commit(
+    attempt_id: AttemptId,
+    tree: &GitObjectId,
+) -> DaemonResult<GitObjectId> {
+    let digest = Sha256Digest::of_bytes(format!(
+        "agentforge.fixture.candidate-commit.v1\n{attempt_id}\n{tree}"
+    ));
+    let digest = digest.to_string();
+    GitObjectId::new(digest["sha256:".len()..][..40].to_owned())
+        .map_err(|_| DaemonError::InvalidArtifactWorkflow(attempt_id))
+}
+
+fn fixture_candidate_bundle(
+    state: &crate::runtime::WorkerAttemptState,
+    claimed: &agentforge_application::ClaimedWork,
+) -> DaemonResult<Vec<u8>> {
+    let candidate = state
+        .candidate()
+        .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
+    serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "attempt_id": state.attempt_id(),
+        "author_evidence_digest": candidate.author_evidence_digest,
+        "base_commit": state.base_commit(),
+        "candidate_commit": candidate.commit,
+        "package_hash": state.package_hash(),
+        "package_id": state.package_id(),
+        "project_id": claimed.project_id,
+        "revision": claimed.execution.revision,
+        "revision_id": claimed.revision_id,
+        "schema": "agentforge.fixture.candidate-bundle.v1",
+        "tree_hash": candidate.tree,
+    }))
+    .map_err(|_| DaemonError::InvalidArtifactWorkflow(state.attempt_id()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -368,13 +754,15 @@ mod tests {
     };
 
     use agentforge_application::{
-        ClaimPackageInput, ClaimedWork, LeaseView, ListOffersQuery, MvpCommand, MvpError,
-        MvpFuture, OfferView, PackageExecutionSnapshot, PortError, ReleaseLeaseInput,
-        RenewLeaseInput,
+        CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
+        CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, ListOffersQuery,
+        MvpCommand, MvpError, MvpFuture, OfferView, PackageExecutionSnapshot, PortError,
+        ReleaseLeaseInput, RenewLeaseInput, UploadCandidateArtifactChunkInput,
     };
     use agentforge_domain::{
-        ActorId, AggregateVersion, ExecutorId, FencingToken, GitObjectId, LeaseId, NodeId,
-        PackageId, PackageRevision, ProtocolKey, Sha256Digest, lease::LeaseState,
+        ActorId, AggregateVersion, ArtifactRef, CandidateArtifactId, CandidateArtifactState,
+        CandidateId, ExecutorId, FencingToken, GitObjectId, LeaseId, NodeId, PackageId,
+        PackageRevision, ProtocolKey, Sha256Digest, lease::LeaseState,
         work_package::WorkPackageState,
     };
     use time::macros::datetime;
@@ -462,10 +850,17 @@ mod tests {
         claim_receipts: Mutex<BTreeMap<String, ClaimedWork>>,
         renew_receipts: Mutex<BTreeMap<String, LeaseView>>,
         release_receipts: Mutex<BTreeMap<String, LeaseView>>,
+        artifacts: Mutex<BTreeMap<CandidateArtifactId, CandidateArtifactView>>,
+        artifact_chunks: Mutex<BTreeMap<(CandidateArtifactId, u32), Vec<u8>>>,
+        artifact_init_receipts: Mutex<BTreeMap<String, CandidateArtifactView>>,
+        artifact_chunk_receipts: Mutex<BTreeMap<String, CandidateArtifactChunkReceipt>>,
+        artifact_complete_receipts: Mutex<BTreeMap<String, CandidateArtifactView>>,
         now: Mutex<ServerInstant>,
         claims: Mutex<u16>,
         renewals: Mutex<u16>,
+        artifact_effects: Mutex<u16>,
         fail_after_claim: Mutex<bool>,
+        fail_after_artifact_init: Mutex<bool>,
     }
 
     impl FakeControl {
@@ -481,10 +876,17 @@ mod tests {
                 claim_receipts: Mutex::new(BTreeMap::new()),
                 renew_receipts: Mutex::new(BTreeMap::new()),
                 release_receipts: Mutex::new(BTreeMap::new()),
+                artifacts: Mutex::new(BTreeMap::new()),
+                artifact_chunks: Mutex::new(BTreeMap::new()),
+                artifact_init_receipts: Mutex::new(BTreeMap::new()),
+                artifact_chunk_receipts: Mutex::new(BTreeMap::new()),
+                artifact_complete_receipts: Mutex::new(BTreeMap::new()),
                 now: Mutex::new(at(0)),
                 claims: Mutex::new(0),
                 renewals: Mutex::new(0),
+                artifact_effects: Mutex::new(0),
                 fail_after_claim: Mutex::new(false),
+                fail_after_artifact_init: Mutex::new(false),
             }
         }
 
@@ -554,23 +956,197 @@ mod tests {
 
         fn init_candidate_artifact<'a>(
             &'a self,
-            _command: &'a MvpCommand<agentforge_application::InitCandidateArtifactInput>,
-        ) -> MvpFuture<'a, agentforge_application::CandidateArtifactView> {
-            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+            command: &'a MvpCommand<InitCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
+            let key = command.context.idempotency_key.as_str().to_owned();
+            if let Some(response) = self
+                .artifact_init_receipts
+                .lock()
+                .expect("artifact init receipts")
+                .get(&key)
+                .cloned()
+            {
+                return Box::pin(async move { Ok(response) });
+            }
+            let Some(work) = self
+                .work
+                .values()
+                .find(|work| work.attempt_id == command.input.attempt_id)
+            else {
+                return Box::pin(async { Err(MvpError::Port(PortError::NotFound)) });
+            };
+            let lease = self.leases.lock().expect("leases lock");
+            let authority_matches = lease.get(&command.input.lease_id).is_some_and(|lease| {
+                lease.state == LeaseState::Active
+                    && lease.holder_node_id == command.input.node_id
+                    && lease.fencing_token == command.input.fencing_token
+            });
+            drop(lease);
+            if !authority_matches
+                || command.input.project_id != work.project_id
+                || command.input.package_hash != work.execution.package_hash
+                || command.input.base_commit != work.execution.base_commit
+                || command.context.expected_version != Some(work.attempt_version)
+            {
+                return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
+            }
+            let now = *self.now.lock().expect("now lock");
+            let artifact_id = CandidateArtifactId::from_uuid(*command.context.command_id.as_uuid());
+            let response = CandidateArtifactView {
+                project_id: command.input.project_id,
+                artifact_id,
+                candidate_id: CandidateId::from_uuid(*command.context.correlation_id.as_uuid()),
+                attempt_id: command.input.attempt_id,
+                package_id: work.package_id,
+                revision_id: work.revision_id,
+                lease_id: command.input.lease_id,
+                fencing_token: command.input.fencing_token,
+                candidate_commit: command.input.candidate_commit.clone(),
+                tree_hash: command.input.tree_hash.clone(),
+                state: CandidateArtifactState::Uploading,
+                expected_bundle_digest: command.input.expected_bundle_digest,
+                expected_bundle_size_bytes: command.input.expected_bundle_size_bytes,
+                chunk_digests: command.input.chunk_digests.clone(),
+                bundle: None,
+                created_at: now,
+                expires_at: ServerInstant(
+                    now.0 + time::Duration::seconds(i64::from(command.input.upload_ttl_seconds)),
+                ),
+                updated_at: now,
+                version: AggregateVersion::new(1),
+            };
+            self.artifacts
+                .lock()
+                .expect("artifacts")
+                .insert(artifact_id, response.clone());
+            self.artifact_init_receipts
+                .lock()
+                .expect("artifact init receipts")
+                .insert(key, response.clone());
+            *self.artifact_effects.lock().expect("artifact effects") += 1;
+            if std::mem::take(
+                &mut *self
+                    .fail_after_artifact_init
+                    .lock()
+                    .expect("artifact failure lock"),
+            ) {
+                return Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) });
+            }
+            Box::pin(async move { Ok(response) })
         }
 
         fn upload_candidate_artifact_chunk<'a>(
             &'a self,
-            _command: &'a MvpCommand<agentforge_application::UploadCandidateArtifactChunkInput>,
-        ) -> MvpFuture<'a, agentforge_application::CandidateArtifactChunkReceipt> {
-            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+            command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+        ) -> MvpFuture<'a, CandidateArtifactChunkReceipt> {
+            let key = command.context.idempotency_key.as_str().to_owned();
+            if let Some(response) = self
+                .artifact_chunk_receipts
+                .lock()
+                .expect("artifact chunk receipts")
+                .get(&key)
+                .copied()
+            {
+                return Box::pin(async move { Ok(response) });
+            }
+            let artifacts = self.artifacts.lock().expect("artifacts");
+            let Some(artifact) = artifacts.get(&command.input.artifact_id) else {
+                return Box::pin(async { Err(MvpError::Port(PortError::NotFound)) });
+            };
+            let chunk_index = usize::try_from(command.input.chunk_index).ok();
+            if artifact.state != CandidateArtifactState::Uploading
+                || artifact.project_id != command.input.project_id
+                || artifact.lease_id != command.input.lease_id
+                || artifact.fencing_token != command.input.fencing_token
+                || command.context.expected_version != Some(artifact.version)
+                || chunk_index.and_then(|index| artifact.chunk_digests.get(index))
+                    != Some(&command.input.digest)
+                || Sha256Digest::of_bytes(&command.input.content) != command.input.digest
+            {
+                return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
+            }
+            let response = CandidateArtifactChunkReceipt {
+                artifact_id: command.input.artifact_id,
+                chunk_index: command.input.chunk_index,
+                digest: command.input.digest,
+                size_bytes: u32::try_from(command.input.content.len()).expect("fixture chunk size"),
+                artifact_version: artifact.version,
+            };
+            drop(artifacts);
+            self.artifact_chunks
+                .lock()
+                .expect("artifact chunks")
+                .insert(
+                    (command.input.artifact_id, command.input.chunk_index),
+                    command.input.content.clone(),
+                );
+            self.artifact_chunk_receipts
+                .lock()
+                .expect("artifact chunk receipts")
+                .insert(key, response);
+            *self.artifact_effects.lock().expect("artifact effects") += 1;
+            Box::pin(async move { Ok(response) })
         }
 
         fn complete_candidate_artifact<'a>(
             &'a self,
-            _command: &'a MvpCommand<agentforge_application::CompleteCandidateArtifactInput>,
-        ) -> MvpFuture<'a, agentforge_application::CandidateArtifactView> {
-            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+            command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
+            let key = command.context.idempotency_key.as_str().to_owned();
+            if let Some(response) = self
+                .artifact_complete_receipts
+                .lock()
+                .expect("artifact complete receipts")
+                .get(&key)
+                .cloned()
+            {
+                return Box::pin(async move { Ok(response) });
+            }
+            let mut artifacts = self.artifacts.lock().expect("artifacts");
+            let Some(artifact) = artifacts.get_mut(&command.input.artifact_id) else {
+                return Box::pin(async { Err(MvpError::Port(PortError::NotFound)) });
+            };
+            let chunks = self.artifact_chunks.lock().expect("artifact chunks");
+            let mut bundle = Vec::new();
+            for (index, digest) in artifact.chunk_digests.iter().enumerate() {
+                let Some(content) = chunks.get(&(
+                    artifact.artifact_id,
+                    u32::try_from(index).expect("fixture index"),
+                )) else {
+                    return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
+                };
+                if Sha256Digest::of_bytes(content) != *digest {
+                    return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
+                }
+                bundle.extend_from_slice(content);
+            }
+            drop(chunks);
+            if artifact.state != CandidateArtifactState::Uploading
+                || artifact.project_id != command.input.project_id
+                || artifact.lease_id != command.input.lease_id
+                || artifact.fencing_token != command.input.fencing_token
+                || command.context.expected_version != Some(artifact.version)
+                || Sha256Digest::of_bytes(&bundle) != artifact.expected_bundle_digest
+                || u64::try_from(bundle.len()).ok() != Some(artifact.expected_bundle_size_bytes)
+            {
+                return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
+            }
+            artifact.state = CandidateArtifactState::Complete;
+            artifact.bundle = Some(ArtifactRef {
+                artifact_id: command.input.bundle_protocol_key.clone(),
+                uri: command.input.bundle_uri.clone(),
+                digest: artifact.expected_bundle_digest,
+            });
+            artifact.updated_at = *self.now.lock().expect("now lock");
+            artifact.version = AggregateVersion::new(artifact.version.get() + 2);
+            let response = artifact.clone();
+            drop(artifacts);
+            self.artifact_complete_receipts
+                .lock()
+                .expect("artifact complete receipts")
+                .insert(key, response.clone());
+            *self.artifact_effects.lock().expect("artifact effects") += 1;
+            Box::pin(async move { Ok(response) })
         }
 
         fn get_lease(&self, project_id: ProjectId, lease_id: LeaseId) -> MvpFuture<'_, LeaseView> {
@@ -787,7 +1363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixture_mode_drives_claimed_work_to_local_candidate_without_overclaiming() {
+    async fn fixture_mode_uploads_a_complete_candidate_artifact_without_overclaiming() {
         let (_directory, mut config, control, runtime) = fixture();
         config.driver_mode = crate::config::WorkerDriverMode::Fixture;
         let mut daemon = WorkerDaemon::open(control.clone(), config, runtime).expect("daemon");
@@ -798,6 +1374,8 @@ mod tests {
         let report = daemon.tick().await.expect("fixture drive tick");
         assert_eq!(report.driven_attempts, 1);
         assert_eq!(report.local_candidates_ready, 1);
+        assert_eq!(report.artifact_commands_completed, 3);
+        assert_eq!(report.candidate_artifacts_completed, 1);
         assert_eq!(
             report.claimed, 0,
             "a local Candidate still owns its author Lease and capacity"
@@ -810,8 +1388,15 @@ mod tests {
                 .expect("load first")
                 .expect("first attempt")
                 .phase(),
-            WorkerPhase::SealingCandidate
+            WorkerPhase::HandingOffCandidate
         );
+        let history = daemon
+            .journal()
+            .candidate_artifact_command_history(id(10))
+            .expect("artifact history");
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(|entry| entry.response.is_some()));
+        assert_eq!(*control.artifact_effects.lock().expect("effects"), 3);
         assert!(
             daemon
                 .journal()
@@ -819,6 +1404,64 @@ mod tests {
                 .expect("load second")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn restart_replays_the_same_pending_artifact_init_before_planning_later_steps() {
+        let (_directory, mut config, control, runtime) = fixture();
+        config.driver_mode = crate::config::WorkerDriverMode::Fixture;
+        let mut first =
+            WorkerDaemon::open(control.clone(), config.clone(), runtime).expect("daemon");
+        assert_eq!(first.tick().await.expect("claim tick").claimed, 1);
+
+        first.runtime.now = at(1);
+        control.set_now(at(1));
+        *control
+            .fail_after_artifact_init
+            .lock()
+            .expect("artifact failure") = true;
+        let error = first.tick().await.expect_err("artifact Init ACK loss");
+        assert_eq!(error.code(), "AF_UNAVAILABLE");
+        let pending = first
+            .journal()
+            .pending_candidate_artifact_command_intents()
+            .expect("pending artifact");
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].command,
+            CandidateArtifactControlCommand::Init { .. }
+        ));
+        assert_eq!(*control.artifact_effects.lock().expect("effects"), 1);
+        drop(first);
+
+        control.set_now(at(2));
+        let mut restarted = WorkerDaemon::open(
+            control.clone(),
+            config,
+            FakeRuntime {
+                now: at(2),
+                next: 30_000,
+            },
+        )
+        .expect("restart");
+        let report = restarted.tick().await.expect("artifact recovery");
+        assert_eq!(report.resumed_artifact_commands, 1);
+        assert_eq!(report.artifact_commands_completed, 3);
+        assert_eq!(report.candidate_artifacts_completed, 1);
+        assert_eq!(*control.artifact_effects.lock().expect("effects"), 3);
+        assert!(
+            restarted
+                .journal()
+                .pending_candidate_artifact_command_intents()
+                .expect("pending artifact")
+                .is_empty()
+        );
+        let history = restarted
+            .journal()
+            .candidate_artifact_command_history(id(10))
+            .expect("artifact history");
+        assert_eq!(history.len(), 3);
+        assert!(history.iter().all(|entry| entry.response.is_some()));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 - 分支：`agent/v0.1.0-mvp`
 - 更新日期：2026-08-10
-- 总体状态：MVP-01 完成；MVP-02 基础层实施中
+- 总体状态：MVP-01/MVP-02 完成；MVP-03 Candidate handoff 实施中
 - 发布计划：[V0_1_0_MVP_RELEASE_PLAN.md](V0_1_0_MVP_RELEASE_PLAN.md)
 
 ## MVP-01 / Checkpoint A：Typed Market 与 Lease 命令面
@@ -508,3 +508,45 @@ git diff --check                                                             PAS
 
 当前边界：v6 只补齐自动上传所需的权威 Claim/CAS 输入；pending Artifact 网络执行器与 fixture Bundle planner
 将在下一检查点接入。
+
+## MVP-03 / Checkpoint O.2：可恢复 Fixture Artifact 自动上传
+
+状态：实现完成，Worker 42 个定点测试与全工作区 build/test/Clippy 通过；等待推送后的 CI。
+
+当前完成：
+
+- daemon 的 pending-first 顺序扩展为 Claim → Candidate Artifact → Lease command；Artifact ACK 丢失后，
+  下一次 tick 在续租、执行新任务或规划后续上传步骤之前先重放原 actor/key/body；
+- lifecycle 新增统一 Artifact command executor：Init、Chunk、Complete 均先登记 SQLite intent，再调用远端，
+  最后原子保存经过 lineage 校验的 typed response；新规划与启动恢复不再有两套调用逻辑；
+- Journal 提供按 Attempt 读取的受校验 Artifact 命令历史；每条记录重新核对请求/响应摘要、Claim/Lease/
+  fencing 与本地 sealed Candidate，pending 行不会被误认为已完成步骤；
+- fixture driver 在本地 hard verification 后持久化确定性 Candidate seal，再生成一个小型 canonical JSON
+  测试 Bundle；Bundle 绑定 Project、Package/revision/hash、Attempt、base/candidate/tree 与作者证据摘要；
+- fixture 上传严格执行单一 Init → 单一 Chunk → Complete，并使用 Claim 回执中的真实 Attempt version、Init
+  回执中的 Artifact version；同一 Attempt 的第二个 Init 或不完整/重复历史均 fail closed；
+- 不伪造 causation Event：MVP Artifact response 尚不返回服务端 Event ID，因此后续命令的 `causation_id`
+  保持空值，而不是把 Command ID 强转为 Event ID；
+- daemon 端到端测试覆盖 Init 远端已生效但 ACK 丢失：第一次进程只留下一个 pending Init，重启后取回
+  同一 receipt，再完成 Chunk/Complete；远端三类副作用各发生一次，本地最终只有三条 completed ledger。
+
+定点证据：
+
+```text
+cargo test -p agentforge-worker-daemon --locked --offline                  PASS (42/42)
+cargo clippy -p agentforge-worker-daemon --all-targets --all-features \
+  --locked --offline -- -D warnings                                        PASS
+cargo fmt --all -- --check                                                  PASS
+bash tests/contract/workspace_layout.sh                                     PASS
+cargo build --workspace --locked --all-targets --offline                    PASS
+cargo test --workspace --locked --offline                                   PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                   PASS
+node --check crates/control-plane/assets/app.js                              PASS
+git diff --check                                                             PASS
+```
+
+明确边界：这里的 fixture Bundle 是确定性 canonical JSON 测试载荷，不是可由 Git 解包的真实 Bundle；
+Artifact Complete 后本地仍停在 `HandingOffCandidate`。下一纵切必须实现原子的
+`RecordCandidate + VerificationRun::Queued`，之后才能关闭作者 Lease；真实 workspace/jcode 产生 Git 对象、
+LAN mTLS/enrollment 与独立 verifier 仍不属于本检查点。

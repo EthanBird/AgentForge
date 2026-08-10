@@ -391,6 +391,11 @@ impl WorkerAttemptState {
     }
 
     #[must_use]
+    pub const fn last_verification_digest(&self) -> Option<Sha256Digest> {
+        self.last_verification_digest
+    }
+
+    #[must_use]
     pub const fn turns_completed(&self) -> u32 {
         self.turns_completed
     }

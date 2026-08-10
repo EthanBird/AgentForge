@@ -101,8 +101,14 @@ Candidate/Artifact/Bundle lineage 完全一致且为 `COMPLETE/version=3`。
 
 v2、v3、v4、v5 Journal 在独占 SQLite 迁移事务内逐级升级到 v6；未知版本 fail closed。v5 以前已经完成
 的 Claim 没有可证明的中央 Attempt version，迁移会保留该历史行，但 Artifact workflow 返回“缺少可验证
-Claim 回执”，不得猜测常量 version。本阶段只交付 durable intent/receipt ledger，daemon 自动创建这些
-intent 并驱动 fixture Bundle 上传属于下一检查点。
+Claim 回执”，不得猜测常量 version。
+
+在显式 `driver_mode=fixture` 下，daemon 会在本地 hard verification 后持久化 Candidate seal，生成一个
+确定性的单 chunk canonical JSON 测试 Bundle，并按 Init → Chunk → Complete 顺序自动创建、执行上述 intent。
+启动时 pending Artifact command 的恢复优先于 Lease maintenance 和任何新规划；Init ACK 丢失后只回放原
+key/body，不建立第二个 Artifact。该载荷仅验证 wire、fencing、CAS、摘要和宕机恢复，不是 Git Bundle，
+也不能替代真实 jcode workspace 输出。Complete 后 Worker 仍停在 `HandingOffCandidate`；当前尚未调用
+`RecordCandidate`、关闭作者 Lease或启动独立 VerificationRun。
 
 ## 3. 管理 CLI
 

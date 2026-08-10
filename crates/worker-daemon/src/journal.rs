@@ -1047,6 +1047,15 @@ pub enum CandidateArtifactCommandCompletion {
     Existing,
 }
 
+/// Validated local history for one author-side Candidate Artifact command.
+/// `response == None` denotes a pending command; the fixture planner replays
+/// all such commands before it plans a later Artifact mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateArtifactCommandHistoryEntry {
+    pub record: CandidateArtifactCommandIntentRecord,
+    pub response: Option<CandidateArtifactCommandResponse>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingOutbox {
     pub outbox_id: Uuid,
@@ -2597,6 +2606,48 @@ impl Journal {
         let rows = statement.query_map([], raw_candidate_artifact_command_row)?;
         rows.map(|row| decode_candidate_artifact_command(row?).map(|stored| stored.record))
             .collect()
+    }
+
+    /// Returns the complete, ordered Artifact command ledger for an Attempt.
+    /// Every row is digest-checked and rebound to the durable Claim/Lease and
+    /// local Candidate before it is exposed to the daemon planner.
+    pub fn candidate_artifact_command_history(
+        &self,
+        attempt_id: AttemptId,
+    ) -> JournalResult<Vec<CandidateArtifactCommandHistoryEntry>> {
+        if attempt_id.as_uuid().is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "candidate_artifact_command_history",
+            )));
+        }
+        let state = self
+            .load_attempt(attempt_id)?
+            .ok_or(JournalError::Runtime(WorkerError::HistoryEmpty))?;
+        let mut statement = self.connection.prepare(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM candidate_artifact_command_intents \
+             WHERE attempt_id = ?1 ORDER BY created_at, intent_id",
+        )?;
+        let rows =
+            statement.query_map([attempt_id.to_string()], raw_candidate_artifact_command_row)?;
+        rows.map(|row| {
+            let stored = decode_candidate_artifact_command(row?)?;
+            validate_candidate_artifact_binding(&self.connection, &stored.record, &state)?;
+            if let Some(response) = &stored.response {
+                validate_candidate_artifact_response(
+                    &self.connection,
+                    &stored.record,
+                    &state,
+                    response,
+                )?;
+            }
+            Ok(CandidateArtifactCommandHistoryEntry {
+                record: stored.record,
+                response: stored.response,
+            })
+        })
+        .collect()
     }
 
     pub fn complete_candidate_artifact_command_intent(
