@@ -379,8 +379,10 @@ mod tests {
     use std::sync::Arc;
 
     use agentforge_application::{
-        ClaimedWork, LeaseReconciliationReport, MvpControlPlane, MvpFuture, ProjectView,
-        ReconcileExpiredLeasesQuery,
+        CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimedWork,
+        CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseReconciliationReport,
+        MvpControlPlane, MvpFuture, ProjectView, ReconcileExpiredLeasesQuery,
+        UploadCandidateArtifactChunkInput,
     };
     use agentforge_domain::{ExecutorId, NodeId, ProtocolKey};
 
@@ -422,6 +424,27 @@ mod tests {
             &'a self,
             _command: &'a MvpCommand<ClaimPackageInput>,
         ) -> MvpFuture<'a, ClaimedWork> {
+            unavailable()
+        }
+
+        fn init_candidate_artifact<'a>(
+            &'a self,
+            _command: &'a MvpCommand<InitCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
+            unavailable()
+        }
+
+        fn upload_candidate_artifact_chunk<'a>(
+            &'a self,
+            _command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+        ) -> MvpFuture<'a, CandidateArtifactChunkReceipt> {
+            unavailable()
+        }
+
+        fn complete_candidate_artifact<'a>(
+            &'a self,
+            _command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
             unavailable()
         }
 

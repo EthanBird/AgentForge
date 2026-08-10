@@ -303,7 +303,11 @@ cargo fmt --all -- --check                                         PASS
 
 ## MVP-03 / Checkpoint K：Candidate-first PostgreSQL 事实源
 
-状态：实现与本地门禁通过；本检查点提交后等待 PostgreSQL 17 CI。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端实现提交：`b1215043629e8ffe98ef2a64ca77acd00284168c`
+- CI 期望值修复：`8d28715fe4d0ba39cd46385c1185979c872c6d14`
+- GitHub Actions：CI #74 / run `31354262053`
 
 当前完成：
 
@@ -341,3 +345,43 @@ cargo fmt --all -- --check                                                PASS
 正反例，但 PostgreSQL 17 仍以本检查点推送后的 GitHub Actions 为发布证据。下一检查点把 Artifact
 init/chunk/complete 与原子 `RecordCandidate + VerificationRun::Queued` 接入 application/HTTP/Worker，
 并遵守 receipt-first 与固定锁顺序。
+
+## MVP-03 / Checkpoint L：Candidate Artifact 应用与 PostgreSQL 命令纵切
+
+状态：实现与本地全工作区门禁通过；推送后等待 PostgreSQL 17 合同。
+
+当前完成：
+
+- application 新增 `init_candidate_artifact`、`upload_candidate_artifact_chunk`、
+  `complete_candidate_artifact` 三个 typed use case；返回值显式携带 Artifact/Candidate 预留 ID、lineage、
+  chunk 声明、Bundle 与 aggregate version；
+- init 在一个 Serializable 事务中固定按 Package → Attempt → Lease 加锁，先回放 receipt，随后核对当前
+  ACTIVE Lease、holder node、fencing token、Package hash/base commit 与 Attempt CAS，再创建服务端 ID、
+  typed Artifact row、Event、Outbox 和 Receipt；
+- chunk 写入复算请求内容 SHA-256，限制单块 1 MiB，并逐项匹配 reservation；相同 artifact/index/content
+  可安全恢复，changed payload 复用同一 idempotency key 稳定拒绝；
+- complete 在同一事务内锁定 Package → Attempt → Lease → Artifact，按序读取并复算所有 chunk、总大小和
+  Bundle SHA-256，再执行 `UPLOADING -> ASSEMBLING -> COMPLETE` 两个领域转换；两个 Event、Outbox 与
+  首次成功 Receipt 原子提交；
+- receipt 命中先于当前 Lease、version 与终态检查；因此 ACK 丢失后，即使作者 Lease 已关闭，完全相同的
+  complete 仍返回首次结果；receipt miss 的新 mutation 则被 fencing/terminal guard 拒绝；
+- PostgreSQL 17 条件合同覆盖 init/chunk/complete 精确回放、changed-body key reuse、缺块拒绝、Bundle
+  持久化、终态不可变、Lease 关闭后的 exact replay 与 fresh mutation 拒绝；本地无 PostgreSQL 时明确
+  skip，不冒充真实数据库证据。
+
+本地证据：
+
+```text
+cargo fmt --all -- --check                                             PASS
+bash tests/contract/workspace_layout.sh                                PASS
+cargo build --workspace --locked --all-targets --offline              PASS
+cargo test --workspace --locked --offline                             PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                             PASS
+node --check crates/control-plane/assets/app.js                        PASS
+git diff --check                                                       PASS
+```
+
+明确边界：本检查点只完成 application + PostgreSQL 的作者侧 Artifact 命令面；HTTP wire、Worker durable
+upload intent、`RecordCandidate + VerificationRun::Queued` 仍未接通，不能据此宣称 Candidate handoff 或
+独立验收闭环已经完成。

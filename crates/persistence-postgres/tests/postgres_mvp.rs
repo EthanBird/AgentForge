@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use agentforge_application::{
-    ClaimPackageInput, CreateProjectInput, ListOffersQuery, MvpCommand, MvpCommandContext,
-    MvpControlPlane, PublishPackageInput, ReconcileExpiredLeasesQuery, ReleaseLeaseInput,
-    RenewLeaseInput,
+    ClaimPackageInput, ClaimedWork, CompleteCandidateArtifactInput, CreateProjectInput,
+    InitCandidateArtifactInput, ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane,
+    PublishPackageInput, ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
-    ActorId, AggregateVersion, CommandId, CorrelationId, ExecutorId, GitObjectId, IdempotencyKey,
-    NodeId, PackageId, PackageRevision, PackageRevisionId, ProjectId, ProtocolKey, Sha256Digest,
-    lease::LeaseState,
+    ActorId, AggregateVersion, CandidateArtifactState, CommandId, CorrelationId, ExecutorId,
+    GitObjectId, IdempotencyKey, NodeId, PackageId, PackageRevision, PackageRevisionId, ProjectId,
+    ProtocolKey, Sha256Digest, lease::LeaseState,
 };
 use agentforge_storage_postgres::{PostgresMvpControlPlane, migration};
 use anyhow::{Context, Result, anyhow};
@@ -315,20 +316,27 @@ async fn exercise_mvp(
         })
         .await?;
     assert_eq!(after_expiry.len(), 1);
-    let third_claim = control
-        .claim_package(&MvpCommand {
-            context: context("claim-after-expiry", Some(after_expiry[0].version)),
-            input: ClaimPackageInput {
-                project_id,
-                package_id,
-                executor_id: ExecutorId::from_uuid(Uuid::now_v7()),
-                node_id: NodeId::from_uuid(Uuid::now_v7()),
-                lease_seconds: 60,
-                max_lease_seconds: 600,
-            },
-        })
-        .await?;
+    let third_claim_command = MvpCommand {
+        context: context("claim-after-expiry", Some(after_expiry[0].version)),
+        input: ClaimPackageInput {
+            project_id,
+            package_id,
+            executor_id: ExecutorId::from_uuid(Uuid::now_v7()),
+            node_id: NodeId::from_uuid(Uuid::now_v7()),
+            lease_seconds: 60,
+            max_lease_seconds: 600,
+        },
+    };
+    let third_claim = control.claim_package(&third_claim_command).await?;
     assert_eq!(third_claim.fencing_token.get(), 3);
+    exercise_candidate_artifact(
+        admin,
+        control.as_ref(),
+        project_id,
+        &third_claim,
+        third_claim_command.input.node_id,
+    )
+    .await?;
 
     let row = admin
         .query_one(
@@ -340,19 +348,251 @@ async fn exercise_mvp(
                (SELECT count(*) FROM outbox_messages WHERE project_id=$2), \
                (SELECT count(*) FROM command_receipts WHERE project_id=$2), \
                (SELECT count(*) FROM attempts WHERE package_id=$1 AND state='LOST'), \
-               (SELECT next_fencing_token FROM work_packages WHERE id=$1)",
+               (SELECT next_fencing_token FROM work_packages WHERE id=$1), \
+               (SELECT count(*) FROM candidate_artifacts WHERE package_id=$1 AND state='COMPLETE'), \
+               (SELECT count(*) FROM candidate_artifact_chunks WHERE artifact_id IN \
+                    (SELECT id FROM candidate_artifacts WHERE package_id=$1))",
             &[package_id.as_uuid(), project_id.as_uuid()],
         )
         .await?;
     assert_eq!(row.get::<_, i64>(0), 3);
     assert_eq!(row.get::<_, i64>(1), 3);
-    assert_eq!(row.get::<_, i64>(2), 1);
-    assert_eq!(row.get::<_, i64>(3), 18);
-    assert_eq!(row.get::<_, i64>(4), 18);
-    assert_eq!(row.get::<_, i64>(5), 8);
-    assert_eq!(row.get::<_, i64>(6), 2);
+    assert_eq!(row.get::<_, i64>(2), 0);
+    assert_eq!(row.get::<_, i64>(3), 24);
+    assert_eq!(row.get::<_, i64>(4), 24);
+    assert_eq!(row.get::<_, i64>(5), 13);
+    assert_eq!(row.get::<_, i64>(6), 3);
     assert_eq!(row.get::<_, i64>(7), 3);
+    assert_eq!(row.get::<_, i64>(8), 1);
+    assert_eq!(row.get::<_, i64>(9), 2);
     Ok(())
+}
+
+async fn exercise_candidate_artifact(
+    admin: &tokio_postgres::Client,
+    control: &PostgresMvpControlPlane,
+    project_id: ProjectId,
+    claimed: &ClaimedWork,
+    node_id: NodeId,
+) -> Result<()> {
+    let chunks = [
+        b"candidate-bundle-part-one".to_vec(),
+        b"candidate-bundle-part-two".to_vec(),
+    ];
+    let chunk_digests = chunks
+        .iter()
+        .map(Sha256Digest::of_bytes)
+        .collect::<Vec<_>>();
+    let bundle_bytes = chunks.concat();
+    let bundle_digest = Sha256Digest::of_bytes(&bundle_bytes);
+    let init = MvpCommand {
+        context: context("candidate-artifact-init", Some(claimed.attempt_version)),
+        input: InitCandidateArtifactInput {
+            project_id,
+            attempt_id: claimed.attempt_id,
+            lease_id: claimed.lease_id,
+            node_id,
+            fencing_token: claimed.fencing_token,
+            package_hash: claimed.execution.package_hash,
+            base_commit: claimed.execution.base_commit.clone(),
+            candidate_commit: GitObjectId::new("2".repeat(40))?,
+            tree_hash: GitObjectId::new("3".repeat(40))?,
+            author_evidence_digest: Sha256Digest::of_bytes(b"author-evidence"),
+            expected_bundle_digest: bundle_digest,
+            expected_bundle_size_bytes: u64::try_from(bundle_bytes.len())?,
+            chunk_digests: chunk_digests.clone(),
+            upload_ttl_seconds: 30,
+        },
+    };
+    let artifact = control.init_candidate_artifact(&init).await?;
+    assert_eq!(artifact.state, CandidateArtifactState::Uploading);
+    assert_eq!(artifact.version, AggregateVersion::new(1));
+    assert_eq!(control.init_candidate_artifact(&init).await?, artifact);
+
+    let mut changed_init = init.clone();
+    changed_init.input.upload_ttl_seconds = 31;
+    assert_eq!(
+        control
+            .init_candidate_artifact(&changed_init)
+            .await
+            .expect_err("same init key with changed input must fail")
+            .code(),
+        "AF_IDEMPOTENCY_KEY_REUSED"
+    );
+
+    for (index, content) in chunks.iter().enumerate() {
+        let command = MvpCommand {
+            context: context(
+                &format!("candidate-artifact-chunk-{index}"),
+                Some(artifact.version),
+            ),
+            input: UploadCandidateArtifactChunkInput {
+                project_id,
+                artifact_id: artifact.artifact_id,
+                lease_id: claimed.lease_id,
+                node_id,
+                fencing_token: claimed.fencing_token,
+                chunk_index: u32::try_from(index)?,
+                digest: chunk_digests[index],
+                content: content.clone(),
+            },
+        };
+        let receipt = control.upload_candidate_artifact_chunk(&command).await?;
+        assert_eq!(receipt.artifact_version, AggregateVersion::new(1));
+        assert_eq!(
+            control.upload_candidate_artifact_chunk(&command).await?,
+            receipt
+        );
+
+        if index == 0 {
+            let mut changed = command.clone();
+            changed.input.content = b"changed-valid-chunk".to_vec();
+            changed.input.digest = Sha256Digest::of_bytes(&changed.input.content);
+            assert_eq!(
+                control
+                    .upload_candidate_artifact_chunk(&changed)
+                    .await
+                    .expect_err("same chunk key with changed input must fail")
+                    .code(),
+                "AF_IDEMPOTENCY_KEY_REUSED"
+            );
+
+            let incomplete = complete_candidate_artifact_command(
+                "candidate-artifact-complete-incomplete",
+                artifact.artifact_id,
+                project_id,
+                claimed,
+                node_id,
+            )?;
+            assert_eq!(
+                control
+                    .complete_candidate_artifact(&incomplete)
+                    .await
+                    .expect_err("all chunks are required")
+                    .code(),
+                "AF_CANDIDATE_ARTIFACT_NOT_COMPLETE"
+            );
+        }
+    }
+
+    let complete = complete_candidate_artifact_command(
+        "candidate-artifact-complete",
+        artifact.artifact_id,
+        project_id,
+        claimed,
+        node_id,
+    )?;
+    let completed = control.complete_candidate_artifact(&complete).await?;
+    assert_eq!(completed.state, CandidateArtifactState::Complete);
+    assert_eq!(completed.version, AggregateVersion::new(3));
+    assert_eq!(
+        completed.bundle.as_ref().map(|bundle| bundle.digest),
+        Some(bundle_digest)
+    );
+
+    let mut reused = complete.clone();
+    reused.input.bundle_uri = "artifact://candidate/changed".into();
+    assert_eq!(
+        control
+            .complete_candidate_artifact(&reused)
+            .await
+            .expect_err("same complete key with changed input must fail")
+            .code(),
+        "AF_IDEMPOTENCY_KEY_REUSED"
+    );
+    let terminal_retry = MvpCommand {
+        context: context(
+            "candidate-artifact-complete-new-key",
+            Some(completed.version),
+        ),
+        input: complete.input.clone(),
+    };
+    assert_eq!(
+        control
+            .complete_candidate_artifact(&terminal_retry)
+            .await
+            .expect_err("complete artifact is immutable")
+            .code(),
+        "AF_TRANSITION_INVALID"
+    );
+
+    let release = MvpCommand {
+        context: context(
+            "candidate-author-lease-release",
+            Some(claimed.lease_version),
+        ),
+        input: ReleaseLeaseInput {
+            project_id,
+            lease_id: claimed.lease_id,
+            node_id,
+            fencing_token: claimed.fencing_token,
+        },
+    };
+    assert_eq!(
+        control.release_lease(&release).await?.state,
+        LeaseState::Released
+    );
+    assert_eq!(
+        control.complete_candidate_artifact(&complete).await?,
+        completed,
+        "ACK-loss replay must precede the now-closed author Lease guard"
+    );
+    let post_release_new_key = MvpCommand {
+        context: context(
+            "candidate-artifact-complete-after-release",
+            Some(completed.version),
+        ),
+        input: complete.input.clone(),
+    };
+    assert_eq!(
+        control
+            .complete_candidate_artifact(&post_release_new_key)
+            .await
+            .expect_err("a fresh author mutation cannot use a closed Lease")
+            .code(),
+        "AF_LEASE_STALE"
+    );
+
+    let persisted = admin
+        .query_one(
+            "SELECT state,version,event_seq,bundle_digest,bundle_size_bytes \
+             FROM candidate_artifacts WHERE id=$1",
+            &[artifact.artifact_id.as_uuid()],
+        )
+        .await?;
+    assert_eq!(persisted.get::<_, String>(0), "COMPLETE");
+    assert_eq!(persisted.get::<_, i64>(1), 3);
+    assert_eq!(persisted.get::<_, i64>(2), 3);
+    assert_eq!(
+        persisted.get::<_, Vec<u8>>(3).as_slice(),
+        bundle_digest.as_bytes()
+    );
+    assert_eq!(
+        persisted.get::<_, i64>(4),
+        i64::try_from(bundle_bytes.len())?
+    );
+    Ok(())
+}
+
+fn complete_candidate_artifact_command(
+    key: &str,
+    artifact_id: agentforge_domain::CandidateArtifactId,
+    project_id: ProjectId,
+    claimed: &ClaimedWork,
+    node_id: NodeId,
+) -> Result<MvpCommand<CompleteCandidateArtifactInput>> {
+    Ok(MvpCommand {
+        context: context(key, Some(AggregateVersion::new(1))),
+        input: CompleteCandidateArtifactInput {
+            project_id,
+            artifact_id,
+            lease_id: claimed.lease_id,
+            node_id,
+            fencing_token: claimed.fencing_token,
+            bundle_protocol_key: ProtocolKey::new(format!("bundle-{artifact_id}"))?,
+            bundle_uri: format!("artifact://candidate/{artifact_id}"),
+        },
+    })
 }
 
 fn context(key: &str, expected_version: Option<AggregateVersion>) -> MvpCommandContext {

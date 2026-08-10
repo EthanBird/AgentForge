@@ -7,10 +7,11 @@
 use std::{future::Future, pin::Pin};
 
 use agentforge_domain::{
-    ActorId, AggregateVersion, AttemptId, CommandId, CommandMetadata, CorrelationId, EventId,
-    ExecutorId, FencingToken, GitObjectId, IdempotencyKey, LeaseId, NodeId, PackageId,
-    PackageRevision, PackageRevisionId, ProjectId, ProtocolKey, ServerInstant, Sha256Digest,
-    lease::LeaseState, work_package::WorkPackageState,
+    ActorId, AggregateVersion, ArtifactRef, AttemptId, CandidateArtifactId, CandidateArtifactState,
+    CandidateId, CommandId, CommandMetadata, CorrelationId, EventId, ExecutorId, FencingToken,
+    GitObjectId, IdempotencyKey, LeaseId, NodeId, PackageId, PackageRevision, PackageRevisionId,
+    ProjectId, ProtocolKey, ServerInstant, Sha256Digest, lease::LeaseState,
+    work_package::WorkPackageState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -299,6 +300,85 @@ pub struct ClaimedWork {
     pub execution: PackageExecutionSnapshot,
 }
 
+/// Author-side reservation for one immutable Candidate bundle.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitCandidateArtifactInput {
+    pub project_id: ProjectId,
+    pub attempt_id: AttemptId,
+    pub lease_id: LeaseId,
+    pub node_id: NodeId,
+    pub fencing_token: FencingToken,
+    pub package_hash: Sha256Digest,
+    pub base_commit: GitObjectId,
+    pub candidate_commit: GitObjectId,
+    pub tree_hash: GitObjectId,
+    pub author_evidence_digest: Sha256Digest,
+    pub expected_bundle_digest: Sha256Digest,
+    pub expected_bundle_size_bytes: u64,
+    pub chunk_digests: Vec<Sha256Digest>,
+    pub upload_ttl_seconds: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateArtifactView {
+    pub project_id: ProjectId,
+    pub artifact_id: CandidateArtifactId,
+    pub candidate_id: CandidateId,
+    pub attempt_id: AttemptId,
+    pub package_id: PackageId,
+    pub revision_id: PackageRevisionId,
+    pub lease_id: LeaseId,
+    pub fencing_token: FencingToken,
+    pub candidate_commit: GitObjectId,
+    pub tree_hash: GitObjectId,
+    pub state: CandidateArtifactState,
+    pub expected_bundle_digest: Sha256Digest,
+    pub expected_bundle_size_bytes: u64,
+    pub chunk_digests: Vec<Sha256Digest>,
+    pub bundle: Option<ArtifactRef>,
+    pub created_at: ServerInstant,
+    pub expires_at: ServerInstant,
+    pub updated_at: ServerInstant,
+    pub version: AggregateVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadCandidateArtifactChunkInput {
+    pub project_id: ProjectId,
+    pub artifact_id: CandidateArtifactId,
+    pub lease_id: LeaseId,
+    pub node_id: NodeId,
+    pub fencing_token: FencingToken,
+    pub chunk_index: u32,
+    pub digest: Sha256Digest,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateArtifactChunkReceipt {
+    pub artifact_id: CandidateArtifactId,
+    pub chunk_index: u32,
+    pub digest: Sha256Digest,
+    pub size_bytes: u32,
+    pub artifact_version: AggregateVersion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompleteCandidateArtifactInput {
+    pub project_id: ProjectId,
+    pub artifact_id: CandidateArtifactId,
+    pub lease_id: LeaseId,
+    pub node_id: NodeId,
+    pub fencing_token: FencingToken,
+    pub bundle_protocol_key: ProtocolKey,
+    pub bundle_uri: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenewLeaseInput {
@@ -374,6 +454,21 @@ pub trait MvpControlPlane: Send + Sync {
         &'a self,
         command: &'a MvpCommand<ClaimPackageInput>,
     ) -> MvpFuture<'a, ClaimedWork>;
+
+    fn init_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<InitCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView>;
+
+    fn upload_candidate_artifact_chunk<'a>(
+        &'a self,
+        command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+    ) -> MvpFuture<'a, CandidateArtifactChunkReceipt>;
+
+    fn complete_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView>;
 
     fn renew_lease<'a>(
         &'a self,

@@ -12,11 +12,13 @@ pub mod read_models;
 
 pub use error::{ApplicationError, ApplicationResult};
 pub use mvp::{
-    ClaimPackageInput, ClaimedWork, CreateProjectInput, LeaseReconciliationReport, LeaseView,
-    ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane, MvpError, MvpFuture,
-    MvpRemoteError, MvpResult, OfferView, PackageExecutionSnapshot, ProjectView,
-    PublishPackageInput, PublishedPackage, ReconcileExpiredLeasesQuery, ReleaseLeaseInput,
-    RenewLeaseInput,
+    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
+    CompleteCandidateArtifactInput, CreateProjectInput, InitCandidateArtifactInput,
+    LeaseReconciliationReport, LeaseView, ListOffersQuery, MvpCommand, MvpCommandContext,
+    MvpControlPlane, MvpError, MvpFuture, MvpRemoteError, MvpResult, OfferView,
+    PackageExecutionSnapshot, ProjectView, PublishPackageInput, PublishedPackage,
+    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput,
+    UploadCandidateArtifactChunkInput,
 };
 pub use ports::{
     AppendEventsReceipt, Clock, EventAppendPort, EventRecord, IdGenerator, Isolation, PortError,

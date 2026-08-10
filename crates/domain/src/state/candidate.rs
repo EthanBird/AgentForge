@@ -228,30 +228,30 @@ pub struct CandidateArtifact {
     version: AggregateVersion,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CandidateArtifactSnapshot {
-    id: CandidateArtifactId,
-    reserved_candidate_id: CandidateId,
-    attempt_id: AttemptId,
-    package_id: PackageId,
-    revision_id: PackageRevisionId,
-    package_hash: Sha256Digest,
-    lease_id: LeaseId,
-    fencing_token: FencingToken,
-    base_commit: GitObjectId,
-    candidate_commit: GitObjectId,
-    tree_hash: GitObjectId,
-    author_evidence_digest: Sha256Digest,
-    expected_bundle_digest: Sha256Digest,
-    expected_bundle_size_bytes: u64,
-    chunk_digests: Vec<Sha256Digest>,
-    bundle: Option<ArtifactRef>,
-    state: CandidateArtifactState,
-    created_at: ServerInstant,
-    expires_at: ServerInstant,
-    updated_at: ServerInstant,
-    version: AggregateVersion,
+pub struct CandidateArtifactSnapshot {
+    pub id: CandidateArtifactId,
+    pub reserved_candidate_id: CandidateId,
+    pub attempt_id: AttemptId,
+    pub package_id: PackageId,
+    pub revision_id: PackageRevisionId,
+    pub package_hash: Sha256Digest,
+    pub lease_id: LeaseId,
+    pub fencing_token: FencingToken,
+    pub base_commit: GitObjectId,
+    pub candidate_commit: GitObjectId,
+    pub tree_hash: GitObjectId,
+    pub author_evidence_digest: Sha256Digest,
+    pub expected_bundle_digest: Sha256Digest,
+    pub expected_bundle_size_bytes: u64,
+    pub chunk_digests: Vec<Sha256Digest>,
+    pub bundle: Option<ArtifactRef>,
+    pub state: CandidateArtifactState,
+    pub created_at: ServerInstant,
+    pub expires_at: ServerInstant,
+    pub updated_at: ServerInstant,
+    pub version: AggregateVersion,
 }
 
 impl<'de> Deserialize<'de> for CandidateArtifact {
@@ -260,7 +260,7 @@ impl<'de> Deserialize<'de> for CandidateArtifact {
         D: Deserializer<'de>,
     {
         let snapshot = CandidateArtifactSnapshot::deserialize(deserializer)?;
-        Self::restore(snapshot).map_err(de::Error::custom)
+        Self::restore_snapshot(snapshot).map_err(de::Error::custom)
     }
 }
 
@@ -465,7 +465,7 @@ impl CandidateArtifact {
         })
     }
 
-    fn restore(snapshot: CandidateArtifactSnapshot) -> Result<Self, DomainError> {
+    pub fn restore_snapshot(snapshot: CandidateArtifactSnapshot) -> Result<Self, DomainError> {
         let artifact = Self {
             id: snapshot.id,
             reserved_candidate_id: snapshot.reserved_candidate_id,
@@ -491,6 +491,33 @@ impl CandidateArtifact {
         };
         artifact.validate_shape()?;
         Ok(artifact)
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> CandidateArtifactSnapshot {
+        CandidateArtifactSnapshot {
+            id: self.id,
+            reserved_candidate_id: self.reserved_candidate_id,
+            attempt_id: self.attempt_id,
+            package_id: self.package_id,
+            revision_id: self.revision_id,
+            package_hash: self.package_hash,
+            lease_id: self.lease_id,
+            fencing_token: self.fencing_token,
+            base_commit: self.base_commit.clone(),
+            candidate_commit: self.candidate_commit.clone(),
+            tree_hash: self.tree_hash.clone(),
+            author_evidence_digest: self.author_evidence_digest,
+            expected_bundle_digest: self.expected_bundle_digest,
+            expected_bundle_size_bytes: self.expected_bundle_size_bytes,
+            chunk_digests: self.chunk_digests.clone(),
+            bundle: self.bundle.clone(),
+            state: self.state,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            updated_at: self.updated_at,
+            version: self.version,
+        }
     }
 
     fn validate_shape(&self) -> Result<(), DomainError> {
@@ -661,6 +688,36 @@ impl CandidateArtifact {
     #[must_use]
     pub const fn author_evidence_digest(&self) -> Sha256Digest {
         self.author_evidence_digest
+    }
+
+    #[must_use]
+    pub const fn expected_bundle_digest(&self) -> Sha256Digest {
+        self.expected_bundle_digest
+    }
+
+    #[must_use]
+    pub const fn expected_bundle_size_bytes(&self) -> u64 {
+        self.expected_bundle_size_bytes
+    }
+
+    #[must_use]
+    pub fn chunk_digests(&self) -> &[Sha256Digest] {
+        &self.chunk_digests
+    }
+
+    #[must_use]
+    pub const fn created_at(&self) -> ServerInstant {
+        self.created_at
+    }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> ServerInstant {
+        self.expires_at
+    }
+
+    #[must_use]
+    pub const fn updated_at(&self) -> ServerInstant {
+        self.updated_at
     }
 
     #[must_use]

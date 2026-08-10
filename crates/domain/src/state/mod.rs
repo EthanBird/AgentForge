@@ -17,7 +17,7 @@ pub mod work_package;
 
 pub use attempt::Attempt;
 pub use budget::BudgetReservation;
-pub use candidate::{Candidate, CandidateArtifact, VerificationRun};
+pub use candidate::{Candidate, CandidateArtifact, CandidateArtifactState, VerificationRun};
 pub use governance::{Decision, GovernanceCase};
 pub use invocation::{InvocationIntent, InvocationRun};
 pub use lease::Lease;

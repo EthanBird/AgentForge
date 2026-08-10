@@ -1,18 +1,22 @@
 //! PostgreSQL-backed typed command surface for the runnable MVP.
 
 use agentforge_application::{
-    ClaimPackageInput, ClaimedWork, CreateProjectInput, EventAppendPort, EventRecord, Isolation,
-    LeaseReconciliationReport, LeaseView, ListOffersQuery, MvpCommand, MvpControlPlane, MvpError,
-    MvpFuture, MvpResult, OfferView, PackageExecutionSnapshot, ProjectView, PublishPackageInput,
-    PublishedPackage, ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, UnitOfWork,
-    UnitOfWorkFactory,
+    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
+    CompleteCandidateArtifactInput, CreateProjectInput, EventAppendPort, EventRecord,
+    InitCandidateArtifactInput, Isolation, LeaseReconciliationReport, LeaseView, ListOffersQuery,
+    MvpCommand, MvpControlPlane, MvpError, MvpFuture, MvpResult, OfferView,
+    PackageExecutionSnapshot, ProjectView, PublishPackageInput, PublishedPackage,
+    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, UnitOfWork, UnitOfWorkFactory,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
-    ActorId, AggregateId, AggregateVersion, Attempt, AttemptId, CommandId, CommandMetadata,
+    ActorId, AggregateId, AggregateVersion, ArtifactRef, Attempt, AttemptId, CandidateArtifact,
+    CandidateArtifactId, CandidateArtifactState, CandidateId, CommandId, CommandMetadata,
     CommandReceipt, CorrelationId, DomainEventEnvelope, EventContext, EventId, FencingToken,
     GitObjectId, IdempotencyKey, IdempotencyScope, Lease, LeaseId, PackageRevision,
     PackageRevisionId, ProjectId, ProtocolKey, ServerInstant, Sha256Digest, WorkPackage,
     attempt::{AttemptCommand, AttemptState, NewAttempt, WakeCondition},
+    candidate::{CandidateArtifactCommand, CandidateArtifactSnapshot, ReserveCandidateArtifact},
     command::ReceiptDecision,
     lease::{GrantLease, LeaseCommand, LeaseState},
     work_package::{
@@ -509,6 +513,356 @@ impl PostgresMvpControlPlane {
         finish(uow, result).await
     }
 
+    async fn init_candidate_artifact_inner(
+        &self,
+        command: &MvpCommand<InitCandidateArtifactInput>,
+    ) -> MvpResult<CandidateArtifactView> {
+        validate_candidate_artifact_init(&command.input)?;
+        let metadata = command.context.metadata(&command.input)?;
+        let scope = scope(
+            command.input.project_id,
+            "candidate_artifact.init",
+            &metadata,
+        )?;
+        let mut uow = self.factory.begin(Isolation::Serializable).await?;
+        let result = async {
+            if let Some(response) =
+                replay::<CandidateArtifactView>(&mut uow, &scope, &metadata).await?
+            {
+                return Ok(response);
+            }
+
+            let package_id = locate_attempt_package(&uow, command.input.attempt_id).await?;
+            let package =
+                load_package_for_update(&uow, command.input.project_id, package_id).await?;
+            let attempt =
+                load_attempt_for_update(&uow, package_id, command.input.attempt_id).await?;
+            let lease =
+                load_lease(&uow, command.input.project_id, command.input.lease_id, true).await?;
+            metadata.require_version(attempt.attempt.version)?;
+            let now = uow.server_now().await?;
+            validate_author_lease(
+                &package,
+                &attempt,
+                &lease,
+                command.input.node_id,
+                command.input.fencing_token,
+                now,
+            )?;
+            if command.input.package_hash != package.execution.package_hash
+                || command.input.base_commit != package.execution.base_commit
+            {
+                return Err(agentforge_domain::DomainError::PackageHashMismatch.into());
+            }
+
+            let artifact_id = CandidateArtifactId::from_uuid(Uuid::now_v7());
+            let candidate_id = CandidateId::from_uuid(Uuid::now_v7());
+            let requested_expiry = ServerInstant(
+                now.0 + Duration::seconds(i64::from(command.input.upload_ttl_seconds)),
+            );
+            let expires_at = ServerInstant(requested_expiry.0.min(lease.lease.expires_at.0));
+            let transition = CandidateArtifact::transition(
+                None,
+                &CandidateArtifactCommand::Reserve(ReserveCandidateArtifact {
+                    id: artifact_id,
+                    reserved_candidate_id: candidate_id,
+                    attempt_id: attempt.attempt.id,
+                    package_id: package.package.id,
+                    revision_id: package.package.selected_revision_id,
+                    package_hash: command.input.package_hash,
+                    lease_id: lease.lease.id,
+                    fencing_token: lease.lease.fencing_token,
+                    base_commit: command.input.base_commit.clone(),
+                    candidate_commit: command.input.candidate_commit.clone(),
+                    tree_hash: command.input.tree_hash.clone(),
+                    author_evidence_digest: command.input.author_evidence_digest,
+                    expected_bundle_digest: command.input.expected_bundle_digest,
+                    expected_bundle_size_bytes: command.input.expected_bundle_size_bytes,
+                    chunk_digests: command.input.chunk_digests.clone(),
+                    created_at: now,
+                    expires_at,
+                }),
+            )?;
+            insert_candidate_artifact(&uow, command.input.project_id, &transition.aggregate, 1)
+                .await?;
+            let event = build_event(
+                command.input.project_id,
+                AggregateId::CandidateArtifact(artifact_id),
+                transition.aggregate.version(),
+                1,
+                &metadata,
+                now,
+                transition.events[0].clone(),
+            )?;
+            uow.append_events(std::slice::from_ref(&event.record))
+                .await?;
+            uow.enqueue_outbox(&[event.outbox(now, artifact_id.to_string())])
+                .await?;
+            let response = candidate_artifact_view(command.input.project_id, &transition.aggregate);
+            store_receipt(
+                &mut uow,
+                scope,
+                &metadata,
+                response.clone(),
+                response.version,
+                effect_digest(&json!({
+                    "artifact_id": artifact_id,
+                    "candidate_id": candidate_id,
+                    "event_id": event.record.event_id,
+                }))?,
+            )
+            .await?;
+            Ok(response)
+        }
+        .await;
+        finish(uow, result).await
+    }
+
+    async fn upload_candidate_artifact_chunk_inner(
+        &self,
+        command: &MvpCommand<UploadCandidateArtifactChunkInput>,
+    ) -> MvpResult<CandidateArtifactChunkReceipt> {
+        validate_candidate_artifact_chunk(&command.input)?;
+        let metadata = command.context.metadata(&command.input)?;
+        let scope = scope(
+            command.input.project_id,
+            "candidate_artifact.chunk",
+            &metadata,
+        )?;
+        let mut uow = self.factory.begin(Isolation::Serializable).await?;
+        let result = async {
+            if let Some(response) =
+                replay::<CandidateArtifactChunkReceipt>(&mut uow, &scope, &metadata).await?
+            {
+                return Ok(response);
+            }
+            let locator = locate_candidate_artifact(&uow, command.input.artifact_id).await?;
+            let package =
+                load_package_for_update(&uow, command.input.project_id, locator.package_id).await?;
+            let attempt =
+                load_attempt_for_update(&uow, locator.package_id, locator.attempt_id).await?;
+            let lease = load_lease(&uow, command.input.project_id, locator.lease_id, true).await?;
+            let loaded = load_candidate_artifact(
+                &uow,
+                command.input.project_id,
+                command.input.artifact_id,
+                true,
+            )
+            .await?;
+            metadata.require_version(loaded.artifact.version())?;
+            let now = uow.server_now().await?;
+            validate_artifact_authority(
+                &package,
+                &attempt,
+                &lease,
+                &loaded.artifact,
+                command.input.lease_id,
+                command.input.node_id,
+                command.input.fencing_token,
+                now,
+            )?;
+            let chunk_index = usize::try_from(command.input.chunk_index)
+                .map_err(|_| agentforge_application::PortError::Integrity)?;
+            if loaded.artifact.chunk_digests().get(chunk_index) != Some(&command.input.digest) {
+                return Err(agentforge_domain::DomainError::EvidenceInvalid.into());
+            }
+            let size_bytes = u32::try_from(command.input.content.len())
+                .map_err(|_| agentforge_application::PortError::Integrity)?;
+            let inserted = uow
+                .client()?
+                .execute(
+                    "INSERT INTO candidate_artifact_chunks
+                     (artifact_id, chunk_index, digest, size_bytes, content, received_at)
+                     VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+                    &[
+                        command.input.artifact_id.as_uuid(),
+                        &i32::try_from(command.input.chunk_index)
+                            .map_err(|_| agentforge_application::PortError::Integrity)?,
+                        &&command.input.digest.as_bytes()[..],
+                        &i32::try_from(size_bytes)
+                            .map_err(|_| agentforge_application::PortError::Integrity)?,
+                        &command.input.content,
+                        &now.0,
+                    ],
+                )
+                .await
+                .map_err(map_database_error)?;
+            if inserted == 0 {
+                validate_existing_candidate_chunk(&uow, &command.input).await?;
+            }
+            let response = CandidateArtifactChunkReceipt {
+                artifact_id: command.input.artifact_id,
+                chunk_index: command.input.chunk_index,
+                digest: command.input.digest,
+                size_bytes,
+                artifact_version: loaded.artifact.version(),
+            };
+            store_receipt(
+                &mut uow,
+                scope,
+                &metadata,
+                response,
+                response.artifact_version,
+                effect_digest(&response)?,
+            )
+            .await?;
+            Ok(response)
+        }
+        .await;
+        finish(uow, result).await
+    }
+
+    async fn complete_candidate_artifact_inner(
+        &self,
+        command: &MvpCommand<CompleteCandidateArtifactInput>,
+    ) -> MvpResult<CandidateArtifactView> {
+        validate_complete_candidate_artifact(&command.input)?;
+        let metadata = command.context.metadata(&command.input)?;
+        let scope = scope(
+            command.input.project_id,
+            "candidate_artifact.complete",
+            &metadata,
+        )?;
+        let mut uow = self.factory.begin(Isolation::Serializable).await?;
+        let result = async {
+            if let Some(response) =
+                replay::<CandidateArtifactView>(&mut uow, &scope, &metadata).await?
+            {
+                return Ok(response);
+            }
+            let locator = locate_candidate_artifact(&uow, command.input.artifact_id).await?;
+            let package =
+                load_package_for_update(&uow, command.input.project_id, locator.package_id).await?;
+            let attempt =
+                load_attempt_for_update(&uow, locator.package_id, locator.attempt_id).await?;
+            let lease = load_lease(&uow, command.input.project_id, locator.lease_id, true).await?;
+            let loaded = load_candidate_artifact(
+                &uow,
+                command.input.project_id,
+                command.input.artifact_id,
+                true,
+            )
+            .await?;
+            metadata.require_version(loaded.artifact.version())?;
+            let now = uow.server_now().await?;
+            validate_artifact_authority(
+                &package,
+                &attempt,
+                &lease,
+                &loaded.artifact,
+                command.input.lease_id,
+                command.input.node_id,
+                command.input.fencing_token,
+                now,
+            )?;
+            let (chunk_digests, bundle_bytes) =
+                load_candidate_artifact_bytes(&uow, &loaded.artifact).await?;
+            let bundle_digest = Sha256Digest::of_bytes(&bundle_bytes);
+            let bundle_size = u64::try_from(bundle_bytes.len())
+                .map_err(|_| agentforge_application::PortError::Integrity)?;
+            if chunk_digests != loaded.artifact.chunk_digests()
+                || bundle_digest != loaded.artifact.expected_bundle_digest()
+                || bundle_size != loaded.artifact.expected_bundle_size_bytes()
+            {
+                return Err(agentforge_domain::DomainError::EvidenceInvalid.into());
+            }
+
+            let mut current = loaded.artifact;
+            let mut event_seq = loaded.event_seq;
+            let mut events = Vec::with_capacity(2);
+            if current.state() == CandidateArtifactState::Uploading {
+                let transition = CandidateArtifact::transition(
+                    Some(&current),
+                    &CandidateArtifactCommand::BeginAssembly {
+                        expected_version: current.version(),
+                        observed_at: now,
+                    },
+                )?;
+                let next_seq = next_event_seq(event_seq)?;
+                update_candidate_artifact(
+                    &uow,
+                    &current,
+                    &transition.aggregate,
+                    event_seq,
+                    next_seq,
+                )
+                .await?;
+                let event = build_event(
+                    command.input.project_id,
+                    AggregateId::CandidateArtifact(command.input.artifact_id),
+                    transition.aggregate.version(),
+                    next_seq,
+                    &metadata,
+                    now,
+                    transition.events[0].clone(),
+                )?;
+                uow.append_events(std::slice::from_ref(&event.record))
+                    .await?;
+                events.push(event);
+                current = transition.aggregate;
+                event_seq = next_seq;
+            }
+
+            let bundle = ArtifactRef {
+                artifact_id: command.input.bundle_protocol_key.clone(),
+                uri: command.input.bundle_uri.clone(),
+                digest: bundle_digest,
+            };
+            let transition = CandidateArtifact::transition(
+                Some(&current),
+                &CandidateArtifactCommand::Complete {
+                    expected_version: current.version(),
+                    bundle,
+                    observed_size_bytes: bundle_size,
+                    observed_chunk_digests: chunk_digests,
+                    completed_at: now,
+                },
+            )?;
+            let next_seq = next_event_seq(event_seq)?;
+            update_candidate_artifact(&uow, &current, &transition.aggregate, event_seq, next_seq)
+                .await?;
+            let event = build_event(
+                command.input.project_id,
+                AggregateId::CandidateArtifact(command.input.artifact_id),
+                transition.aggregate.version(),
+                next_seq,
+                &metadata,
+                now,
+                transition.events[0].clone(),
+            )?;
+            uow.append_events(std::slice::from_ref(&event.record))
+                .await?;
+            events.push(event);
+            let outbox = events
+                .iter()
+                .map(|event| event.outbox(now, command.input.artifact_id.to_string()))
+                .collect::<Vec<_>>();
+            uow.enqueue_outbox(&outbox).await?;
+
+            let response = candidate_artifact_view(command.input.project_id, &transition.aggregate);
+            let event_ids = events
+                .iter()
+                .map(|event| event.record.event_id)
+                .collect::<Vec<_>>();
+            store_receipt(
+                &mut uow,
+                scope,
+                &metadata,
+                response.clone(),
+                response.version,
+                effect_digest(&json!({
+                    "artifact_id": response.artifact_id,
+                    "bundle_digest": response.expected_bundle_digest,
+                    "event_ids": event_ids,
+                }))?,
+            )
+            .await?;
+            Ok(response)
+        }
+        .await;
+        finish(uow, result).await
+    }
+
     async fn renew_lease_inner(
         &self,
         command: &MvpCommand<RenewLeaseInput>,
@@ -891,6 +1245,27 @@ impl MvpControlPlane for PostgresMvpControlPlane {
         Box::pin(self.claim_package_inner(command))
     }
 
+    fn init_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<InitCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView> {
+        Box::pin(self.init_candidate_artifact_inner(command))
+    }
+
+    fn upload_candidate_artifact_chunk<'a>(
+        &'a self,
+        command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+    ) -> MvpFuture<'a, CandidateArtifactChunkReceipt> {
+        Box::pin(self.upload_candidate_artifact_chunk_inner(command))
+    }
+
+    fn complete_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView> {
+        Box::pin(self.complete_candidate_artifact_inner(command))
+    }
+
     fn renew_lease<'a>(
         &'a self,
         command: &'a MvpCommand<RenewLeaseInput>,
@@ -1111,6 +1486,589 @@ fn validate_claim_input(input: &ClaimPackageInput) -> MvpResult<()> {
         .into());
     }
     Ok(())
+}
+
+fn validate_candidate_artifact_init(input: &InitCandidateArtifactInput) -> MvpResult<()> {
+    if input.project_id.as_uuid().is_nil()
+        || input.attempt_id.as_uuid().is_nil()
+        || input.lease_id.as_uuid().is_nil()
+        || input.node_id.as_uuid().is_nil()
+        || input.base_commit == input.candidate_commit
+        || input.base_commit.as_str().len() != input.candidate_commit.as_str().len()
+        || input.candidate_commit.as_str().len() != input.tree_hash.as_str().len()
+        || digest_is_zero(input.package_hash)
+        || digest_is_zero(input.author_evidence_digest)
+        || digest_is_zero(input.expected_bundle_digest)
+        || input.expected_bundle_size_bytes == 0
+        || input.expected_bundle_size_bytes > 16_777_216
+        || input.chunk_digests.is_empty()
+        || input.chunk_digests.len() > 4_096
+        || u64::try_from(input.chunk_digests.len())
+            .ok()
+            .is_none_or(|count| count > input.expected_bundle_size_bytes)
+        || input.chunk_digests.iter().copied().any(digest_is_zero)
+        || !(30..=3_600).contains(&input.upload_ttl_seconds)
+    {
+        return Err(agentforge_domain::DomainError::InvalidArgument {
+            field: "candidate_artifact".into(),
+            reason: "init binding, size, chunks, or upload window is invalid".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_candidate_artifact_chunk(input: &UploadCandidateArtifactChunkInput) -> MvpResult<()> {
+    if input.project_id.as_uuid().is_nil()
+        || input.artifact_id.as_uuid().is_nil()
+        || input.lease_id.as_uuid().is_nil()
+        || input.node_id.as_uuid().is_nil()
+        || input.chunk_index > 4_095
+        || input.content.is_empty()
+        || input.content.len() > 1_048_576
+        || digest_is_zero(input.digest)
+        || Sha256Digest::of_bytes(&input.content) != input.digest
+    {
+        return Err(agentforge_domain::DomainError::EvidenceInvalid.into());
+    }
+    Ok(())
+}
+
+fn validate_complete_candidate_artifact(input: &CompleteCandidateArtifactInput) -> MvpResult<()> {
+    if input.project_id.as_uuid().is_nil()
+        || input.artifact_id.as_uuid().is_nil()
+        || input.lease_id.as_uuid().is_nil()
+        || input.node_id.as_uuid().is_nil()
+        || !input.bundle_uri.starts_with("artifact://")
+        || input.bundle_uri.len() > 2_048
+        || input.bundle_uri.chars().any(char::is_control)
+    {
+        return Err(agentforge_domain::DomainError::InvalidArgument {
+            field: "candidate_artifact_complete".into(),
+            reason: "resource identifiers or bundle URI are invalid".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn digest_is_zero(digest: Sha256Digest) -> bool {
+    digest.as_bytes().iter().all(|byte| *byte == 0)
+}
+
+async fn locate_attempt_package(
+    uow: &PostgresUnitOfWork,
+    attempt_id: AttemptId,
+) -> MvpResult<agentforge_domain::PackageId> {
+    let row = uow
+        .client()?
+        .query_opt(
+            "SELECT package_id FROM attempts WHERE id=$1",
+            &[attempt_id.as_uuid()],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or(agentforge_application::PortError::NotFound)?;
+    Ok(agentforge_domain::PackageId::from_uuid(
+        row.try_get(0)
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+    ))
+}
+
+#[derive(Clone, Copy)]
+struct CandidateArtifactLocator {
+    package_id: agentforge_domain::PackageId,
+    attempt_id: AttemptId,
+    lease_id: LeaseId,
+}
+
+async fn locate_candidate_artifact(
+    uow: &PostgresUnitOfWork,
+    artifact_id: CandidateArtifactId,
+) -> MvpResult<CandidateArtifactLocator> {
+    let row = uow
+        .client()?
+        .query_opt(
+            "SELECT package_id, attempt_id, lease_id FROM candidate_artifacts WHERE id=$1",
+            &[artifact_id.as_uuid()],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or(agentforge_application::PortError::NotFound)?;
+    Ok(CandidateArtifactLocator {
+        package_id: agentforge_domain::PackageId::from_uuid(
+            row.try_get(0)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        attempt_id: AttemptId::from_uuid(
+            row.try_get(1)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        lease_id: LeaseId::from_uuid(
+            row.try_get(2)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+    })
+}
+
+struct LoadedCandidateArtifact {
+    artifact: CandidateArtifact,
+    event_seq: u64,
+}
+
+async fn load_candidate_artifact(
+    uow: &PostgresUnitOfWork,
+    project_id: ProjectId,
+    artifact_id: CandidateArtifactId,
+    for_update: bool,
+) -> MvpResult<LoadedCandidateArtifact> {
+    let lock = if for_update { " FOR UPDATE" } else { "" };
+    let sql = format!(
+        "SELECT reserved_candidate_id, attempt_id, package_id, revision_id, package_hash,
+                lease_id, fencing_token, base_commit, candidate_commit, tree_hash,
+                author_evidence_digest, expected_bundle_digest, expected_bundle_size_bytes,
+                expected_chunk_digests, state, bundle_protocol_key, bundle_uri, bundle_digest,
+                created_at, expires_at, updated_at, version, event_seq
+         FROM candidate_artifacts WHERE id=$1 AND project_id=$2{lock}"
+    );
+    let row = uow
+        .client()?
+        .query_opt(&sql, &[artifact_id.as_uuid(), project_id.as_uuid()])
+        .await
+        .map_err(map_database_error)?
+        .ok_or(agentforge_application::PortError::NotFound)?;
+    let chunk_bytes: Vec<Vec<u8>> = row
+        .try_get(13)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let chunk_digests = chunk_bytes
+        .into_iter()
+        .map(digest_from_bytes)
+        .collect::<MvpResult<Vec<_>>>()?;
+    let bundle_key = row
+        .try_get::<_, Option<String>>(15)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let bundle_uri = row
+        .try_get::<_, Option<String>>(16)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let bundle_digest = row
+        .try_get::<_, Option<Vec<u8>>>(17)
+        .map_err(|_| agentforge_application::PortError::Integrity)?
+        .map(digest_from_bytes)
+        .transpose()?;
+    let bundle = match (bundle_key, bundle_uri, bundle_digest) {
+        (None, None, None) => None,
+        (Some(artifact_id), Some(uri), Some(digest)) => Some(ArtifactRef {
+            artifact_id: ProtocolKey::new(artifact_id)?,
+            uri,
+            digest,
+        }),
+        _ => return Err(agentforge_application::PortError::Integrity.into()),
+    };
+    let version = version_from_i64(
+        row.try_get(21)
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+    )?;
+    let event_seq = u64::try_from(
+        row.try_get::<_, i64>(22)
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+    )
+    .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let artifact = CandidateArtifact::restore_snapshot(CandidateArtifactSnapshot {
+        id: artifact_id,
+        reserved_candidate_id: CandidateId::from_uuid(
+            row.try_get(0)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        attempt_id: AttemptId::from_uuid(
+            row.try_get(1)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        package_id: agentforge_domain::PackageId::from_uuid(
+            row.try_get(2)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        revision_id: PackageRevisionId::from_uuid(
+            row.try_get(3)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        package_hash: digest_from_bytes(
+            row.try_get(4)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        lease_id: LeaseId::from_uuid(
+            row.try_get(5)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        fencing_token: FencingToken::new(
+            u64::try_from(
+                row.try_get::<_, i64>(6)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            )
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        base_commit: GitObjectId::new(
+            row.try_get::<_, String>(7)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        candidate_commit: GitObjectId::new(
+            row.try_get::<_, String>(8)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        tree_hash: GitObjectId::new(
+            row.try_get::<_, String>(9)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        author_evidence_digest: digest_from_bytes(
+            row.try_get(10)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        expected_bundle_digest: digest_from_bytes(
+            row.try_get(11)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        expected_bundle_size_bytes: u64::try_from(
+            row.try_get::<_, i64>(12)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )
+        .map_err(|_| agentforge_application::PortError::Integrity)?,
+        chunk_digests,
+        bundle,
+        state: parse_candidate_artifact_state(
+            &row.try_get::<_, String>(14)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?,
+        created_at: ServerInstant(
+            row.try_get(18)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        expires_at: ServerInstant(
+            row.try_get(19)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        updated_at: ServerInstant(
+            row.try_get(20)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        ),
+        version,
+    })?;
+    if event_seq != artifact.version().get() {
+        return Err(agentforge_application::PortError::Integrity.into());
+    }
+    Ok(LoadedCandidateArtifact {
+        artifact,
+        event_seq,
+    })
+}
+
+async fn insert_candidate_artifact(
+    uow: &PostgresUnitOfWork,
+    project_id: ProjectId,
+    artifact: &CandidateArtifact,
+    event_seq: u64,
+) -> MvpResult<()> {
+    let snapshot = artifact.snapshot();
+    let chunk_digests = snapshot
+        .chunk_digests
+        .iter()
+        .map(|digest| digest.as_bytes().to_vec())
+        .collect::<Vec<_>>();
+    let changed = uow
+        .client()?
+        .execute(
+            "INSERT INTO candidate_artifacts
+             (id,reserved_candidate_id,project_id,attempt_id,package_id,revision_id,
+              package_hash,lease_id,fencing_token,base_commit,candidate_commit,tree_hash,
+              author_evidence_digest,expected_bundle_digest,expected_bundle_size_bytes,
+              expected_chunk_digests,state,version,event_seq,created_at,expires_at,updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'UPLOADING',
+                     $17,$18,$19,$20,$19)",
+            &[
+                snapshot.id.as_uuid(),
+                snapshot.reserved_candidate_id.as_uuid(),
+                project_id.as_uuid(),
+                snapshot.attempt_id.as_uuid(),
+                snapshot.package_id.as_uuid(),
+                snapshot.revision_id.as_uuid(),
+                &&snapshot.package_hash.as_bytes()[..],
+                snapshot.lease_id.as_uuid(),
+                &u64_to_i64(snapshot.fencing_token.get())?,
+                &snapshot.base_commit.as_str(),
+                &snapshot.candidate_commit.as_str(),
+                &snapshot.tree_hash.as_str(),
+                &&snapshot.author_evidence_digest.as_bytes()[..],
+                &&snapshot.expected_bundle_digest.as_bytes()[..],
+                &u64_to_i64(snapshot.expected_bundle_size_bytes)?,
+                &chunk_digests,
+                &version_to_i64(snapshot.version)?,
+                &u64_to_i64(event_seq)?,
+                &snapshot.created_at.0,
+                &snapshot.expires_at.0,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+async fn update_candidate_artifact(
+    uow: &PostgresUnitOfWork,
+    previous: &CandidateArtifact,
+    next: &CandidateArtifact,
+    previous_event_seq: u64,
+    next_event_seq: u64,
+) -> MvpResult<()> {
+    let bundle_key = next.bundle().map(|bundle| bundle.artifact_id.as_str());
+    let bundle_uri = next.bundle().map(|bundle| bundle.uri.as_str());
+    let bundle_digest = next
+        .bundle()
+        .map(|bundle| bundle.digest.as_bytes().to_vec());
+    let bundle_size = next
+        .bundle()
+        .map(|_| u64_to_i64(next.expected_bundle_size_bytes()))
+        .transpose()?;
+    let completed_at = next.bundle().map(|_| next.updated_at().0);
+    let changed = uow
+        .client()?
+        .execute(
+            "UPDATE candidate_artifacts
+             SET state=$2,bundle_protocol_key=$3,bundle_uri=$4,bundle_digest=$5,
+                 bundle_size_bytes=$6,version=$7,event_seq=$8,updated_at=$9,completed_at=$10
+             WHERE id=$1 AND version=$11 AND event_seq=$12 AND state=$13",
+            &[
+                next.id().as_uuid(),
+                &candidate_artifact_state_label(next.state()),
+                &bundle_key,
+                &bundle_uri,
+                &bundle_digest,
+                &bundle_size,
+                &version_to_i64(next.version())?,
+                &u64_to_i64(next_event_seq)?,
+                &next.updated_at().0,
+                &completed_at,
+                &version_to_i64(previous.version())?,
+                &u64_to_i64(previous_event_seq)?,
+                &candidate_artifact_state_label(previous.state()),
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+fn validate_author_lease(
+    package: &LoadedPackage,
+    attempt: &LoadedAttempt,
+    lease: &LoadedLease,
+    node_id: agentforge_domain::NodeId,
+    fencing_token: FencingToken,
+    now: ServerInstant,
+) -> MvpResult<()> {
+    validate_active_work_binding(&package.package, &attempt.attempt, &lease.lease)?;
+    if lease.lease.holder_node_id != node_id || lease.lease.fencing_token != fencing_token {
+        return Err(agentforge_domain::DomainError::StaleLease.into());
+    }
+    if lease.lease.state != LeaseState::Active {
+        return Err(if lease.lease.state == LeaseState::Expired {
+            agentforge_domain::DomainError::LeaseExpired
+        } else {
+            agentforge_domain::DomainError::StaleLease
+        }
+        .into());
+    }
+    if now >= lease.lease.expires_at {
+        return Err(agentforge_domain::DomainError::LeaseExpired.into());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_artifact_authority(
+    package: &LoadedPackage,
+    attempt: &LoadedAttempt,
+    lease: &LoadedLease,
+    artifact: &CandidateArtifact,
+    lease_id: LeaseId,
+    node_id: agentforge_domain::NodeId,
+    fencing_token: FencingToken,
+    now: ServerInstant,
+) -> MvpResult<()> {
+    validate_author_lease(package, attempt, lease, node_id, fencing_token, now)?;
+    if artifact.package_id() != package.package.id
+        || artifact.revision_id() != package.package.selected_revision_id
+        || artifact.attempt_id() != attempt.attempt.id
+        || artifact.lease_id() != lease_id
+        || artifact.lease_id() != lease.lease.id
+        || artifact.fencing_token() != fencing_token
+        || artifact.package_hash() != package.execution.package_hash
+        || artifact.base_commit() != &package.execution.base_commit
+    {
+        return Err(agentforge_domain::DomainError::StaleLease.into());
+    }
+    if now >= artifact.expires_at() {
+        return Err(agentforge_domain::DomainError::LeaseExpired.into());
+    }
+    Ok(())
+}
+
+async fn validate_existing_candidate_chunk(
+    uow: &PostgresUnitOfWork,
+    input: &UploadCandidateArtifactChunkInput,
+) -> MvpResult<()> {
+    let row = uow
+        .client()?
+        .query_opt(
+            "SELECT digest, size_bytes, content FROM candidate_artifact_chunks
+             WHERE artifact_id=$1 AND chunk_index=$2",
+            &[
+                input.artifact_id.as_uuid(),
+                &i32::try_from(input.chunk_index)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or(agentforge_application::PortError::Conflict)?;
+    let digest: Vec<u8> = row
+        .try_get(0)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let size: i32 = row
+        .try_get(1)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let content: Vec<u8> = row
+        .try_get(2)
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    if digest.as_slice() != input.digest.as_bytes()
+        || usize::try_from(size).ok() != Some(input.content.len())
+        || content != input.content
+    {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+async fn load_candidate_artifact_bytes(
+    uow: &PostgresUnitOfWork,
+    artifact: &CandidateArtifact,
+) -> MvpResult<(Vec<Sha256Digest>, Vec<u8>)> {
+    let rows = uow
+        .client()?
+        .query(
+            "SELECT chunk_index,digest,size_bytes,content
+             FROM candidate_artifact_chunks WHERE artifact_id=$1 ORDER BY chunk_index",
+            &[artifact.id().as_uuid()],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if rows.len() != artifact.chunk_digests().len() {
+        return Err(agentforge_domain::DomainError::CandidateArtifactNotComplete.into());
+    }
+    let capacity = usize::try_from(artifact.expected_bundle_size_bytes())
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut digests = Vec::with_capacity(rows.len());
+    for (expected_index, row) in rows.into_iter().enumerate() {
+        let index = usize::try_from(
+            row.try_get::<_, i32>(0)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+        let digest = digest_from_bytes(
+            row.try_get(1)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )?;
+        let size = usize::try_from(
+            row.try_get::<_, i32>(2)
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+        )
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+        let content: Vec<u8> = row
+            .try_get(3)
+            .map_err(|_| agentforge_application::PortError::Integrity)?;
+        if index != expected_index
+            || artifact.chunk_digests().get(index) != Some(&digest)
+            || content.len() != size
+            || Sha256Digest::of_bytes(&content) != digest
+            || bytes
+                .len()
+                .checked_add(content.len())
+                .is_none_or(|total| total > capacity)
+        {
+            return Err(agentforge_domain::DomainError::EvidenceInvalid.into());
+        }
+        bytes.extend_from_slice(&content);
+        digests.push(digest);
+    }
+    if bytes.len() != capacity {
+        return Err(agentforge_domain::DomainError::CandidateArtifactNotComplete.into());
+    }
+    Ok((digests, bytes))
+}
+
+fn digest_from_bytes(bytes: Vec<u8>) -> MvpResult<Sha256Digest> {
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| agentforge_application::PortError::Integrity)?;
+    let digest = Sha256Digest::from_bytes(bytes);
+    if digest_is_zero(digest) {
+        return Err(agentforge_application::PortError::Integrity.into());
+    }
+    Ok(digest)
+}
+
+fn candidate_artifact_view(
+    project_id: ProjectId,
+    artifact: &CandidateArtifact,
+) -> CandidateArtifactView {
+    CandidateArtifactView {
+        project_id,
+        artifact_id: artifact.id(),
+        candidate_id: artifact.reserved_candidate_id(),
+        attempt_id: artifact.attempt_id(),
+        package_id: artifact.package_id(),
+        revision_id: artifact.revision_id(),
+        lease_id: artifact.lease_id(),
+        fencing_token: artifact.fencing_token(),
+        candidate_commit: artifact.candidate_commit().clone(),
+        tree_hash: artifact.tree_hash().clone(),
+        state: artifact.state(),
+        expected_bundle_digest: artifact.expected_bundle_digest(),
+        expected_bundle_size_bytes: artifact.expected_bundle_size_bytes(),
+        chunk_digests: artifact.chunk_digests().to_vec(),
+        bundle: artifact.bundle().cloned(),
+        created_at: artifact.created_at(),
+        expires_at: artifact.expires_at(),
+        updated_at: artifact.updated_at(),
+        version: artifact.version(),
+    }
+}
+
+fn parse_candidate_artifact_state(value: &str) -> MvpResult<CandidateArtifactState> {
+    match value {
+        "UPLOADING" => Ok(CandidateArtifactState::Uploading),
+        "ASSEMBLING" => Ok(CandidateArtifactState::Assembling),
+        "COMPLETE" => Ok(CandidateArtifactState::Complete),
+        "REJECTED" => Ok(CandidateArtifactState::Rejected),
+        "QUARANTINED" => Ok(CandidateArtifactState::Quarantined),
+        "EXPIRED" => Ok(CandidateArtifactState::Expired),
+        _ => Err(agentforge_application::PortError::Integrity.into()),
+    }
+}
+
+const fn candidate_artifact_state_label(state: CandidateArtifactState) -> &'static str {
+    match state {
+        CandidateArtifactState::Uploading => "UPLOADING",
+        CandidateArtifactState::Assembling => "ASSEMBLING",
+        CandidateArtifactState::Complete => "COMPLETE",
+        CandidateArtifactState::Rejected => "REJECTED",
+        CandidateArtifactState::Quarantined => "QUARANTINED",
+        CandidateArtifactState::Expired => "EXPIRED",
+    }
 }
 
 struct LoadedPackage {
@@ -2082,5 +3040,24 @@ mod tests {
             parse_package_state(state).expect("known database package state");
         }
         assert!(parse_package_state("UNKNOWN").is_err());
+    }
+
+    #[test]
+    fn candidate_artifact_state_decoder_is_exhaustive_for_the_database_contract() {
+        for (label, expected) in [
+            ("UPLOADING", CandidateArtifactState::Uploading),
+            ("ASSEMBLING", CandidateArtifactState::Assembling),
+            ("COMPLETE", CandidateArtifactState::Complete),
+            ("REJECTED", CandidateArtifactState::Rejected),
+            ("QUARANTINED", CandidateArtifactState::Quarantined),
+            ("EXPIRED", CandidateArtifactState::Expired),
+        ] {
+            assert_eq!(
+                parse_candidate_artifact_state(label).expect("known artifact state"),
+                expected
+            );
+            assert_eq!(candidate_artifact_state_label(expected), label);
+        }
+        assert!(parse_candidate_artifact_state("UNKNOWN").is_err());
     }
 }
