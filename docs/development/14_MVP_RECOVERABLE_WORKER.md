@@ -47,7 +47,7 @@ Granted -> Preparing -> Baseline -> Planning -> Implementing
 
 ## 3. SQLite Journal
 
-首次打开 Journal 会创建 schema version 3，并强制：
+首次打开 Journal 会创建 schema version 4，并强制：
 
 ```text
 PRAGMA journal_mode = WAL
@@ -67,6 +67,7 @@ PRAGMA quick_check = ok
 | `outbox` | 待发控制面事件 | destination + semantic key 唯一、payload 不可变 |
 | `operations` | 外部副作用账本 | 先计划后执行、request immutable、Pending 只能单向完成 |
 | `claim_intents` | 远端 Claim 前的节点级意图 | actor/key 唯一、request immutable、Pending 只能完成 |
+| `lease_command_intents` | Renew/Release 远端意图与回执 | Attempt/fencing 绑定、request immutable、receipt JCS digest |
 
 每个正式命令采用以下顺序：
 
@@ -81,8 +82,10 @@ Journal 在恢复时重算每条事实的 JCS SHA-256、整条 previous-digest �
 fail closed 为 `AF_WORKER_JOURNAL_INTEGRITY`。
 
 Schema version 1 是尚未携带执行快照的预发布开发格式，无法安全补造 AFWP/input，因此明确拒绝打开；
-version 2 到 version 3 使用单事务增加空的 `claim_intents` 账本，已有 Attempt、事实链和执行快照保持
-不变。正式 `v0.1.0-mvp` 发布后，Journal 变更必须提供可验证迁移或显式导出/重新 Claim 流程。
+version 2 到 version 3 使用单事务增加空的 `claim_intents` 账本，version 3 到 version 4 增加
+`lease_command_intents`；跨级打开会在同一个排他事务中顺序执行两步，已有 Attempt、事实链和执行
+快照保持不变。正式 `v0.1.0-mvp` 发布后，Journal 变更必须提供可验证迁移或显式导出/重新 Claim
+流程。
 
 ## 4. Claim handoff 与 Lease reconciliation
 
@@ -105,6 +108,13 @@ Lease、holder node 和 generation：
   `LeaseRenewed`；
 - Expired、Revoked、holder/generation 不匹配：追加 `LeaseLost` 并进入 `Salvaging`；
 - 响应绑定错误、expiry 回退或时间形状异常：`AF_WORKER_CONTROL_RESPONSE_INVALID`，不启动副作用。
+
+`maintain_attempt` 以注入的 `LeaseMaintenancePolicy` 决定动作：距离 expiry 大于窗口时不写任何远端
+命令；进入窗口后把 exact Renew command 写入 `lease_command_intents` 再调用控制面，并把服务器
+receipt 与摘要封存。若服务器已经续租但响应丢失，重启重放同一 idempotency key，只导入首次
+expiry。`LocalFailed`/`LocalCancelled` 使用相同机制 Release；`AuthorComplete` 在 Candidate handoff
+完成前仍按阈值 Renew，不能被维护循环错误地回收到 `REWORK_READY`。此时若 Lease 丢失，本地
+Candidate 只保留为 salvage 输入，正式 `candidate_id` 授权被清除。
 
 ## 5. 外部副作用与重启恢复
 
@@ -142,7 +152,7 @@ cargo fmt --all -- --check
 - 模型提前声称完成但 hard criterion 失败时继续下一 Turn；
 - Worker 重启后查询原非幂等 Turn，并恢复 Pending Verification；
 - Claim 响应执行快照的双端摘要校验、远端调用前 durable intent、ACK-loss/restart exact replay、漏收
-  Renew 导入和 Revoke 停止；
+  Renew 导入、阈值续租、终态 Release 和 Revoke 停止；
 - Turn budget 与 Lease expiry 在启动 Executor 前阻止新副作用。
 
 ## 7. 下一纵切
@@ -150,7 +160,7 @@ cargo fmt --all -- --check
 MVP-02 的下一检查点按顺序接入：
 
 1. Worker enrollment、本地节点身份与 loopback HTTP / LAN mTLS 控制面 adapter；
-2. 自动 Renew 调度和 Release；
+2. daemon 定时循环与 pending intent 启动恢复的组合根；
 3. workspace/日志/凭据目录隔离与受控命令执行；
 4. jcode bridge 版本握手、能力探测、operation query 与 sanitized transcript；
 5. Candidate Artifact 上传及 `RecordCandidate` handoff。

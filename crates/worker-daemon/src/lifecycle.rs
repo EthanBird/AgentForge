@@ -2,7 +2,8 @@
 
 use agentforge_application::{
     ClaimPackageInput, ClaimedWork, LeaseView, ListOffersQuery, MvpCommand, MvpCommandContext,
-    MvpControlPlane, MvpError, MvpFuture, OfferView, PackageExecutionSnapshot,
+    MvpControlPlane, MvpError, MvpFuture, OfferView, PackageExecutionSnapshot, ReleaseLeaseInput,
+    RenewLeaseInput,
 };
 use agentforge_domain::{
     ActorId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, NodeId, ProjectId,
@@ -12,7 +13,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    journal::{ClaimIntentRecord, Journal, JournalCommand, JournalError, JournalRequest},
+    journal::{
+        ClaimIntentRecord, Journal, JournalCommand, JournalError, JournalRequest,
+        LeaseCommandIntentRecord, LeaseControlCommand,
+    },
     runtime::{
         AttemptGrant, LeaseLossReason, WorkerAttemptState, WorkerCommandEnvelope,
         WorkerCommandKind, WorkerPhase,
@@ -36,6 +40,16 @@ pub trait WorkerControlPlane: Send + Sync {
         project_id: ProjectId,
         lease_id: agentforge_domain::LeaseId,
     ) -> MvpFuture<'_, LeaseView>;
+
+    fn renew_lease<'a>(
+        &'a self,
+        command: &'a MvpCommand<RenewLeaseInput>,
+    ) -> MvpFuture<'a, LeaseView>;
+
+    fn release_lease<'a>(
+        &'a self,
+        command: &'a MvpCommand<ReleaseLeaseInput>,
+    ) -> MvpFuture<'a, LeaseView>;
 }
 
 impl<T> WorkerControlPlane for T
@@ -59,6 +73,20 @@ where
         lease_id: agentforge_domain::LeaseId,
     ) -> MvpFuture<'_, LeaseView> {
         MvpControlPlane::get_lease(self, project_id, lease_id)
+    }
+
+    fn renew_lease<'a>(
+        &'a self,
+        command: &'a MvpCommand<RenewLeaseInput>,
+    ) -> MvpFuture<'a, LeaseView> {
+        MvpControlPlane::renew_lease(self, command)
+    }
+
+    fn release_lease<'a>(
+        &'a self,
+        command: &'a MvpCommand<ReleaseLeaseInput>,
+    ) -> MvpFuture<'a, LeaseView> {
+        MvpControlPlane::release_lease(self, command)
     }
 }
 
@@ -143,6 +171,64 @@ impl ReconcileDisposition {
             Self::Current(state) | Self::LeaseUpdated(state) | Self::Stopped(state) => state,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LeaseMaintenancePolicy {
+    pub renew_before_seconds: u32,
+    pub extend_by_seconds: u32,
+}
+
+impl LeaseMaintenancePolicy {
+    fn validate(self) -> LifecycleResult<()> {
+        if self.renew_before_seconds == 0
+            || self.renew_before_seconds > 3_600
+            || self.extend_by_seconds == 0
+            || self.extend_by_seconds > 86_400
+        {
+            return Err(LifecycleError::InvalidIntent);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LeaseMaintenanceIntent {
+    pub project_id: ProjectId,
+    pub attempt_id: agentforge_domain::AttemptId,
+    pub intent_id: Uuid,
+    pub command_id: CommandId,
+    pub correlation_id: CorrelationId,
+    pub idempotency_key: IdempotencyKey,
+    pub observed_at: ServerInstant,
+}
+
+impl LeaseMaintenanceIntent {
+    fn validate(&self) -> LifecycleResult<()> {
+        if self.project_id.as_uuid().is_nil()
+            || self.attempt_id.as_uuid().is_nil()
+            || self.intent_id.is_nil()
+            || self.command_id.as_uuid().is_nil()
+            || self.correlation_id.as_uuid().is_nil()
+        {
+            return Err(LifecycleError::InvalidIntent);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaseMaintenanceOutcome {
+    NoAction(WorkerAttemptState),
+    Renewed {
+        state: WorkerAttemptState,
+        lease: LeaseView,
+    },
+    Released {
+        state: WorkerAttemptState,
+        lease: LeaseView,
+    },
+    Stopped(WorkerAttemptState),
 }
 
 #[derive(Debug, Error)]
@@ -305,12 +391,25 @@ pub async fn reconcile_attempt(
     let state = journal
         .load_attempt(intent.attempt_id)?
         .ok_or(LifecycleError::InvalidIntent)?;
-    if state.phase().is_terminal() || state.phase() == WorkerPhase::Salvaging {
+    if matches!(
+        state.phase(),
+        WorkerPhase::LocalFailed | WorkerPhase::LocalCancelled | WorkerPhase::Salvaging
+    ) {
         return Ok(ReconcileDisposition::Stopped(state));
     }
     let lease = control
         .get_lease(intent.project_id, state.lease_id())
         .await?;
+    reconcile_lease_view(journal, identity, intent, state, &lease)
+}
+
+fn reconcile_lease_view(
+    journal: &mut Journal,
+    identity: WorkerIdentity,
+    intent: ReconcileIntent,
+    state: WorkerAttemptState,
+    lease: &LeaseView,
+) -> LifecycleResult<ReconcileDisposition> {
     if lease.project_id != intent.project_id
         || lease.package_id != state.package_id()
         || lease.attempt_id != state.attempt_id()
@@ -404,6 +503,210 @@ pub async fn reconcile_attempt(
     } else {
         ReconcileDisposition::Current(state)
     })
+}
+
+pub async fn maintain_attempt(
+    control: &dyn WorkerControlPlane,
+    journal: &mut Journal,
+    identity: WorkerIdentity,
+    policy: LeaseMaintenancePolicy,
+    intent: &LeaseMaintenanceIntent,
+) -> LifecycleResult<LeaseMaintenanceOutcome> {
+    identity.validate()?;
+    policy.validate()?;
+    intent.validate()?;
+    let initial = journal
+        .load_attempt(intent.attempt_id)?
+        .ok_or(LifecycleError::InvalidIntent)?;
+
+    if matches!(
+        initial.phase(),
+        WorkerPhase::LocalFailed | WorkerPhase::LocalCancelled
+    ) {
+        let lease = control
+            .get_lease(intent.project_id, initial.lease_id())
+            .await?;
+        validate_lease_binding(&lease, &initial, identity, intent.project_id)?;
+        if lease.state != LeaseState::Active {
+            return Ok(LeaseMaintenanceOutcome::Stopped(initial));
+        }
+        let record = LeaseCommandIntentRecord {
+            intent_id: intent.intent_id,
+            attempt_id: intent.attempt_id,
+            command: LeaseControlCommand::Release {
+                command: MvpCommand {
+                    context: MvpCommandContext {
+                        command_id: intent.command_id,
+                        actor_id: identity.actor_id,
+                        idempotency_key: intent.idempotency_key.clone(),
+                        correlation_id: intent.correlation_id,
+                        causation_id: None,
+                        expected_version: Some(lease.version),
+                    },
+                    input: ReleaseLeaseInput {
+                        project_id: intent.project_id,
+                        lease_id: initial.lease_id(),
+                        node_id: identity.node_id,
+                        fencing_token: initial.lease_generation(),
+                    },
+                },
+            },
+            created_at: intent.observed_at,
+        };
+        return execute_lease_command(control, journal, &record).await;
+    }
+    if initial.phase() == WorkerPhase::Salvaging {
+        return Ok(LeaseMaintenanceOutcome::Stopped(initial));
+    }
+
+    let lease = control
+        .get_lease(intent.project_id, initial.lease_id())
+        .await?;
+    let reconciled = reconcile_lease_view(
+        journal,
+        identity,
+        ReconcileIntent {
+            project_id: intent.project_id,
+            attempt_id: intent.attempt_id,
+            observed_at: intent.observed_at,
+            local_message_id: intent.intent_id,
+        },
+        initial,
+        &lease,
+    )?;
+    let state = match reconciled {
+        ReconcileDisposition::Stopped(state) => {
+            return Ok(LeaseMaintenanceOutcome::Stopped(state));
+        }
+        ReconcileDisposition::LeaseUpdated(state) => {
+            return Ok(LeaseMaintenanceOutcome::NoAction(state));
+        }
+        ReconcileDisposition::Current(state) => state,
+    };
+    if lease.state != LeaseState::Active || intent.observed_at >= lease.expires_at {
+        return Ok(LeaseMaintenanceOutcome::Stopped(state));
+    }
+    let renew_at = ServerInstant(
+        lease.expires_at.0 - time::Duration::seconds(i64::from(policy.renew_before_seconds)),
+    );
+    if intent.observed_at < renew_at {
+        return Ok(LeaseMaintenanceOutcome::NoAction(state));
+    }
+    let available_seconds = (lease.max_expires_at.0 - lease.expires_at.0).whole_seconds();
+    if available_seconds <= 0 {
+        return Ok(LeaseMaintenanceOutcome::NoAction(state));
+    }
+    let extend_by_seconds = policy
+        .extend_by_seconds
+        .min(u32::try_from(available_seconds).unwrap_or(u32::MAX));
+    if extend_by_seconds == 0 {
+        return Ok(LeaseMaintenanceOutcome::NoAction(state));
+    }
+    let record = LeaseCommandIntentRecord {
+        intent_id: intent.intent_id,
+        attempt_id: intent.attempt_id,
+        command: LeaseControlCommand::Renew {
+            command: MvpCommand {
+                context: MvpCommandContext {
+                    command_id: intent.command_id,
+                    actor_id: identity.actor_id,
+                    idempotency_key: intent.idempotency_key.clone(),
+                    correlation_id: intent.correlation_id,
+                    causation_id: None,
+                    expected_version: Some(lease.version),
+                },
+                input: RenewLeaseInput {
+                    project_id: intent.project_id,
+                    lease_id: state.lease_id(),
+                    node_id: identity.node_id,
+                    fencing_token: state.lease_generation(),
+                    extend_by_seconds,
+                },
+            },
+        },
+        created_at: intent.observed_at,
+    };
+    execute_lease_command(control, journal, &record).await
+}
+
+pub async fn resume_lease_command_intent(
+    control: &dyn WorkerControlPlane,
+    journal: &mut Journal,
+    record: &LeaseCommandIntentRecord,
+) -> LifecycleResult<LeaseMaintenanceOutcome> {
+    execute_lease_command(control, journal, record).await
+}
+
+async fn execute_lease_command(
+    control: &dyn WorkerControlPlane,
+    journal: &mut Journal,
+    record: &LeaseCommandIntentRecord,
+) -> LifecycleResult<LeaseMaintenanceOutcome> {
+    journal.register_lease_command_intent(record)?;
+    let response = match &record.command {
+        LeaseControlCommand::Renew { command } => control.renew_lease(command).await?,
+        LeaseControlCommand::Release { command } => control.release_lease(command).await?,
+    };
+    journal.complete_lease_command_intent(
+        record.intent_id,
+        &response,
+        max_instant(record.created_at, response.updated_at),
+    )?;
+    let state = journal
+        .load_attempt(record.attempt_id)?
+        .ok_or(LifecycleError::InvalidIntent)?;
+    match &record.command {
+        LeaseControlCommand::Renew { .. } => {
+            let state = if state.lease_expires_at() >= response.expires_at {
+                state
+            } else {
+                apply_local(
+                    journal,
+                    record.command.actor_id(),
+                    record.intent_id,
+                    &state,
+                    max_instant(response.updated_at, state.updated_at()),
+                    format!(
+                        "lease-renew-remote:{}:v{}",
+                        state.lease_id(),
+                        response.version.get()
+                    ),
+                    WorkerCommandKind::RenewLease {
+                        observed_generation: state.lease_generation(),
+                        new_expires_at: response.expires_at,
+                    },
+                )?
+            };
+            Ok(LeaseMaintenanceOutcome::Renewed {
+                state,
+                lease: response,
+            })
+        }
+        LeaseControlCommand::Release { .. } => Ok(LeaseMaintenanceOutcome::Released {
+            state,
+            lease: response,
+        }),
+    }
+}
+
+fn validate_lease_binding(
+    lease: &LeaseView,
+    state: &WorkerAttemptState,
+    identity: WorkerIdentity,
+    project_id: ProjectId,
+) -> LifecycleResult<()> {
+    if lease.project_id != project_id
+        || lease.package_id != state.package_id()
+        || lease.attempt_id != state.attempt_id()
+        || lease.lease_id != state.lease_id()
+        || lease.holder_node_id != identity.node_id
+        || lease.fencing_token != state.lease_generation()
+        || lease.updated_at < lease.granted_at
+        || lease.expires_at > lease.max_expires_at
+    {
+        return Err(LifecycleError::InvalidResponse);
+    }
+    Ok(())
 }
 
 fn validate_claim_response(claimed: &ClaimedWork, offer: &OfferView) -> LifecycleResult<()> {
@@ -573,6 +876,11 @@ mod tests {
         lease: Mutex<LeaseView>,
         claims: Mutex<u32>,
         fail_next_claim: Mutex<bool>,
+        renew_receipt: Mutex<Option<(IdempotencyKey, LeaseView)>>,
+        release_receipt: Mutex<Option<(IdempotencyKey, LeaseView)>>,
+        fail_after_renew: Mutex<bool>,
+        renewals: Mutex<u32>,
+        releases: Mutex<u32>,
     }
 
     impl WorkerControlPlane for FakeControl {
@@ -601,6 +909,59 @@ mod tests {
             let lease = self.lease.lock().expect("lease lock").clone();
             Box::pin(async move { Ok(lease) })
         }
+
+        fn renew_lease<'a>(
+            &'a self,
+            command: &'a MvpCommand<RenewLeaseInput>,
+        ) -> MvpFuture<'a, LeaseView> {
+            if let Some((key, response)) =
+                self.renew_receipt.lock().expect("renew receipt").as_ref()
+                && key == &command.context.idempotency_key
+            {
+                let response = response.clone();
+                return Box::pin(async move { Ok(response) });
+            }
+            let mut lease = self.lease.lock().expect("lease lock");
+            lease.expires_at = ServerInstant(
+                lease.expires_at.0
+                    + time::Duration::seconds(i64::from(command.input.extend_by_seconds)),
+            );
+            lease.updated_at = ServerInstant(lease.updated_at.0 + time::Duration::seconds(1));
+            lease.version = AggregateVersion::new(lease.version.get() + 1);
+            let response = lease.clone();
+            *self.renew_receipt.lock().expect("renew receipt") =
+                Some((command.context.idempotency_key.clone(), response.clone()));
+            *self.renewals.lock().expect("renewals") += 1;
+            if std::mem::take(&mut *self.fail_after_renew.lock().expect("renew failure")) {
+                return Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) });
+            }
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn release_lease<'a>(
+            &'a self,
+            command: &'a MvpCommand<ReleaseLeaseInput>,
+        ) -> MvpFuture<'a, LeaseView> {
+            if let Some((key, response)) = self
+                .release_receipt
+                .lock()
+                .expect("release receipt")
+                .as_ref()
+                && key == &command.context.idempotency_key
+            {
+                let response = response.clone();
+                return Box::pin(async move { Ok(response) });
+            }
+            let mut lease = self.lease.lock().expect("lease lock");
+            lease.state = LeaseState::Released;
+            lease.updated_at = ServerInstant(lease.updated_at.0 + time::Duration::seconds(1));
+            lease.version = AggregateVersion::new(lease.version.get() + 1);
+            let response = lease.clone();
+            *self.release_receipt.lock().expect("release receipt") =
+                Some((command.context.idempotency_key.clone(), response.clone()));
+            *self.releases.lock().expect("releases") += 1;
+            Box::pin(async move { Ok(response) })
+        }
     }
 
     fn identity() -> WorkerIdentity {
@@ -624,6 +985,25 @@ mod tests {
         }
     }
 
+    fn maintenance_intent(byte: u8, second: i64, key: &str) -> LeaseMaintenanceIntent {
+        LeaseMaintenanceIntent {
+            project_id: id(1),
+            attempt_id: id(4),
+            intent_id: Uuid::from_bytes([byte; 16]),
+            command_id: id(byte.wrapping_add(1)),
+            correlation_id: id(byte.wrapping_add(2)),
+            idempotency_key: IdempotencyKey::new(key).expect("key"),
+            observed_at: at(second),
+        }
+    }
+
+    fn maintenance_policy() -> LeaseMaintenancePolicy {
+        LeaseMaintenancePolicy {
+            renew_before_seconds: 15,
+            extend_by_seconds: 30,
+        }
+    }
+
     fn fixture() -> (TempDir, Journal, FakeControl) {
         let directory = tempfile::tempdir().expect("tempdir");
         let journal = Journal::open(directory.path().join("worker.sqlite3")).expect("journal");
@@ -633,6 +1013,11 @@ mod tests {
             lease: Mutex::new(lease(LeaseState::Active, at(60), at(0))),
             claims: Mutex::new(0),
             fail_next_claim: Mutex::new(false),
+            renew_receipt: Mutex::new(None),
+            release_receipt: Mutex::new(None),
+            fail_after_renew: Mutex::new(false),
+            renewals: Mutex::new(0),
+            releases: Mutex::new(0),
         };
         (directory, journal, control)
     }
@@ -685,6 +1070,99 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(*control.claims.lock().expect("claims"), 2);
+    }
+
+    #[tokio::test]
+    async fn scheduler_renews_only_inside_the_window_and_recovers_an_ack_loss() {
+        let (directory, mut journal, control) = fixture();
+        claim_offer(&control, &mut journal, identity(), &intent())
+            .await
+            .expect("claim");
+        let early = maintain_attempt(
+            &control,
+            &mut journal,
+            identity(),
+            maintenance_policy(),
+            &maintenance_intent(30, 44, "lease-maintenance-early"),
+        )
+        .await
+        .expect("early maintenance");
+        assert!(matches!(early, LeaseMaintenanceOutcome::NoAction(_)));
+        assert_eq!(*control.renewals.lock().expect("renewals"), 0);
+
+        *control.fail_after_renew.lock().expect("renew failure") = true;
+        let renewal_intent = maintenance_intent(31, 50, "lease-maintenance-renew-v2");
+        let error = maintain_attempt(
+            &control,
+            &mut journal,
+            identity(),
+            maintenance_policy(),
+            &renewal_intent,
+        )
+        .await
+        .expect_err("renew response was lost");
+        assert_eq!(error.code(), "AF_UNAVAILABLE");
+        let pending = journal
+            .pending_lease_command_intents()
+            .expect("pending renewal");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(*control.renewals.lock().expect("renewals"), 1);
+        drop(journal);
+
+        let mut reopened =
+            Journal::open(directory.path().join("worker.sqlite3")).expect("reopen journal");
+        let resumed = resume_lease_command_intent(&control, &mut reopened, &pending[0])
+            .await
+            .expect("resume renewal receipt");
+        let LeaseMaintenanceOutcome::Renewed { state, lease } = resumed else {
+            panic!("renewed outcome")
+        };
+        assert_eq!(state.lease_expires_at(), at(90));
+        assert_eq!(lease.expires_at, at(90));
+        assert_eq!(*control.renewals.lock().expect("renewals"), 1);
+        assert!(
+            reopened
+                .pending_lease_command_intents()
+                .expect("renew completed")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_failure_releases_the_server_lease_without_rewriting_local_history() {
+        let (_directory, mut journal, control) = fixture();
+        let claimed = claim_offer(&control, &mut journal, identity(), &intent())
+            .await
+            .expect("claim");
+        let failed = apply_local(
+            &mut journal,
+            identity().actor_id,
+            Uuid::from_bytes([60; 16]),
+            &claimed.state,
+            at(10),
+            "local-failure-release".to_owned(),
+            WorkerCommandKind::Fail {
+                reason_code: ProtocolKey::new("fixture_failed").expect("reason"),
+            },
+        )
+        .expect("local failure");
+        assert_eq!(failed.phase(), WorkerPhase::LocalFailed);
+
+        let outcome = maintain_attempt(
+            &control,
+            &mut journal,
+            identity(),
+            maintenance_policy(),
+            &maintenance_intent(61, 20, "lease-maintenance-release-v2"),
+        )
+        .await
+        .expect("release terminal lease");
+        let LeaseMaintenanceOutcome::Released { state, lease } = outcome else {
+            panic!("released outcome")
+        };
+        assert_eq!(state.phase(), WorkerPhase::LocalFailed);
+        assert_eq!(lease.state, LeaseState::Released);
+        assert_eq!(*control.releases.lock().expect("releases"), 1);
     }
 
     #[tokio::test]

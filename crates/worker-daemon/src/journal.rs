@@ -6,7 +6,10 @@
 
 use std::{path::Path, str::FromStr};
 
-use agentforge_application::{ClaimPackageInput, MvpCommand, OfferView, PackageExecutionSnapshot};
+use agentforge_application::{
+    ClaimPackageInput, LeaseView, MvpCommand, OfferView, PackageExecutionSnapshot,
+    ReleaseLeaseInput, RenewLeaseInput,
+};
 use agentforge_domain::{
     ActorId, AttemptId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, LeaseId, NodeId,
     ProtocolKey, ServerInstant, Sha256Digest, work_package::WorkPackageState,
@@ -21,7 +24,7 @@ use crate::runtime::{
     AttemptGrant, WorkerAttemptState, WorkerCommandEnvelope, WorkerError, WorkerFact, grant_fact,
 };
 
-const JOURNAL_SCHEMA_VERSION: i64 = 3;
+const JOURNAL_SCHEMA_VERSION: i64 = 4;
 const OUTBOX_DESTINATION: &str = "control-plane.worker-events";
 const MAX_INLINE_EXECUTION_BYTES: usize = 1_048_576;
 
@@ -130,6 +133,26 @@ CREATE TABLE claim_intents (
           AND completed_at IS NOT NULL))
 );
 
+CREATE TABLE lease_command_intents (
+  intent_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('renew', 'release')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  response_json TEXT,
+  response_digest TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  CHECK ((state = 'pending' AND response_json IS NULL AND response_digest IS NULL
+          AND completed_at IS NULL)
+      OR (state = 'completed' AND response_json IS NOT NULL AND response_digest IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
 CREATE INDEX operations_pending_idx
   ON operations (attempt_id, planned_at, operation_id)
   WHERE state = 'pending';
@@ -140,6 +163,10 @@ CREATE INDEX outbox_pending_idx
 
 CREATE INDEX claim_intents_pending_idx
   ON claim_intents (created_at, intent_id)
+  WHERE state = 'pending';
+
+CREATE INDEX lease_command_intents_pending_idx
+  ON lease_command_intents (created_at, intent_id)
   WHERE state = 'pending';
 
 CREATE TRIGGER attempts_binding_is_immutable
@@ -268,6 +295,37 @@ BEFORE DELETE ON claim_intents
 BEGIN
   SELECT RAISE(ABORT, 'claim intents cannot be deleted');
 END;
+
+CREATE TRIGGER lease_command_intents_request_is_immutable
+BEFORE UPDATE ON lease_command_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.attempt_id <> OLD.attempt_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.kind <> OLD.kind
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'lease command intent request is immutable');
+END;
+
+CREATE TRIGGER lease_command_intents_state_is_monotonic
+BEFORE UPDATE ON lease_command_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'lease command intent state is monotonic');
+END;
+
+CREATE TRIGGER lease_command_intents_cannot_be_deleted
+BEFORE DELETE ON lease_command_intents
+BEGIN
+  SELECT RAISE(ABORT, 'lease command intents cannot be deleted');
+END;
 "#;
 
 const MIGRATE_V2_TO_V3: &str = r#"
@@ -319,6 +377,63 @@ CREATE TRIGGER claim_intents_cannot_be_deleted
 BEFORE DELETE ON claim_intents
 BEGIN
   SELECT RAISE(ABORT, 'claim intents cannot be deleted');
+END;
+"#;
+
+const MIGRATE_V3_TO_V4: &str = r#"
+CREATE TABLE lease_command_intents (
+  intent_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('renew', 'release')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  response_json TEXT,
+  response_digest TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  CHECK ((state = 'pending' AND response_json IS NULL AND response_digest IS NULL
+          AND completed_at IS NULL)
+      OR (state = 'completed' AND response_json IS NOT NULL AND response_digest IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
+CREATE INDEX lease_command_intents_pending_idx
+  ON lease_command_intents (created_at, intent_id)
+  WHERE state = 'pending';
+
+CREATE TRIGGER lease_command_intents_request_is_immutable
+BEFORE UPDATE ON lease_command_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.attempt_id <> OLD.attempt_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.kind <> OLD.kind
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'lease command intent request is immutable');
+END;
+
+CREATE TRIGGER lease_command_intents_state_is_monotonic
+BEFORE UPDATE ON lease_command_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'lease command intent state is monotonic');
+END;
+
+CREATE TRIGGER lease_command_intents_cannot_be_deleted
+BEFORE DELETE ON lease_command_intents
+BEGIN
+  SELECT RAISE(ABORT, 'lease command intents cannot be deleted');
 END;
 "#;
 
@@ -437,6 +552,120 @@ pub enum ClaimIntentRegistration {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClaimIntentCompletion {
+    Completed,
+    Existing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LeaseControlCommand {
+    Renew {
+        command: MvpCommand<RenewLeaseInput>,
+    },
+    Release {
+        command: MvpCommand<ReleaseLeaseInput>,
+    },
+}
+
+impl LeaseControlCommand {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Renew { .. } => "renew",
+            Self::Release { .. } => "release",
+        }
+    }
+
+    #[must_use]
+    pub const fn actor_id(&self) -> ActorId {
+        match self {
+            Self::Renew { command } => command.context.actor_id,
+            Self::Release { command } => command.context.actor_id,
+        }
+    }
+
+    fn idempotency_key(&self) -> &IdempotencyKey {
+        match self {
+            Self::Renew { command } => &command.context.idempotency_key,
+            Self::Release { command } => &command.context.idempotency_key,
+        }
+    }
+
+    fn lease_id(&self) -> LeaseId {
+        match self {
+            Self::Renew { command } => command.input.lease_id,
+            Self::Release { command } => command.input.lease_id,
+        }
+    }
+
+    fn fencing_token(&self) -> agentforge_domain::FencingToken {
+        match self {
+            Self::Renew { command } => command.input.fencing_token,
+            Self::Release { command } => command.input.fencing_token,
+        }
+    }
+
+    fn validate(&self) -> JournalResult<()> {
+        let (context, project_id, lease_id, node_id, extend_by_seconds) = match self {
+            Self::Renew { command } => (
+                &command.context,
+                command.input.project_id,
+                command.input.lease_id,
+                command.input.node_id,
+                Some(command.input.extend_by_seconds),
+            ),
+            Self::Release { command } => (
+                &command.context,
+                command.input.project_id,
+                command.input.lease_id,
+                command.input.node_id,
+                None,
+            ),
+        };
+        if context.command_id.as_uuid().is_nil()
+            || context.actor_id.as_uuid().is_nil()
+            || context.correlation_id.as_uuid().is_nil()
+            || context.expected_version.is_none()
+            || project_id.as_uuid().is_nil()
+            || lease_id.as_uuid().is_nil()
+            || node_id.as_uuid().is_nil()
+            || extend_by_seconds.is_some_and(|seconds| seconds == 0 || seconds > 86_400)
+        {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "lease_control_command",
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseCommandIntentRecord {
+    pub intent_id: Uuid,
+    pub attempt_id: AttemptId,
+    pub command: LeaseControlCommand,
+    pub created_at: ServerInstant,
+}
+
+impl LeaseCommandIntentRecord {
+    fn validate(&self) -> JournalResult<()> {
+        if self.intent_id.is_nil() || self.attempt_id.as_uuid().is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "lease_command_intent",
+            )));
+        }
+        self.command.validate()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeaseCommandRegistration {
+    Registered,
+    Existing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeaseCommandCompletion {
     Completed,
     Existing,
 }
@@ -810,6 +1039,205 @@ fn load_claim_intent_by_key(
         .transpose()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LeaseCommandState {
+    Pending,
+    Completed,
+}
+
+impl LeaseCommandState {
+    fn parse(value: &str) -> JournalResult<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            _ => Err(JournalError::Integrity),
+        }
+    }
+}
+
+struct StoredLeaseCommand {
+    record: LeaseCommandIntentRecord,
+    state: LeaseCommandState,
+    response: Option<LeaseView>,
+    completed_at: Option<ServerInstant>,
+}
+
+struct RawLeaseCommand {
+    intent_id: String,
+    attempt_id: String,
+    actor_id: String,
+    idempotency_key: String,
+    kind: String,
+    state: String,
+    intent_json: String,
+    intent_digest: String,
+    created_at: String,
+    response_json: Option<String>,
+    response_digest: Option<String>,
+    completed_at: Option<String>,
+}
+
+fn raw_lease_command_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawLeaseCommand> {
+    Ok(RawLeaseCommand {
+        intent_id: row.get(0)?,
+        attempt_id: row.get(1)?,
+        actor_id: row.get(2)?,
+        idempotency_key: row.get(3)?,
+        kind: row.get(4)?,
+        state: row.get(5)?,
+        intent_json: row.get(6)?,
+        intent_digest: row.get(7)?,
+        created_at: row.get(8)?,
+        response_json: row.get(9)?,
+        response_digest: row.get(10)?,
+        completed_at: row.get(11)?,
+    })
+}
+
+fn decode_lease_command(raw: RawLeaseCommand) -> JournalResult<StoredLeaseCommand> {
+    let record: LeaseCommandIntentRecord = decode_stored(&raw.intent_json)?;
+    record.validate()?;
+    let state = LeaseCommandState::parse(&raw.state)?;
+    let response = raw
+        .response_json
+        .as_deref()
+        .map(decode_stored::<LeaseView>)
+        .transpose()?;
+    let completed_at = raw
+        .completed_at
+        .map(|value| parse_instant(&value))
+        .transpose()?;
+    let completion_shape_is_valid = match state {
+        LeaseCommandState::Pending => {
+            response.is_none() && raw.response_digest.is_none() && completed_at.is_none()
+        }
+        LeaseCommandState::Completed => {
+            response.is_some() && raw.response_digest.is_some() && completed_at.is_some()
+        }
+    };
+    if let Some(response) = &response {
+        validate_lease_command_response_shape(&record, response)?;
+    }
+    if record.intent_id.to_string() != raw.intent_id
+        || record.attempt_id.to_string() != raw.attempt_id
+        || record.command.actor_id().to_string() != raw.actor_id
+        || record.command.idempotency_key().as_str() != raw.idempotency_key
+        || record.command.kind() != raw.kind
+        || instant_text(record.created_at) != raw.created_at
+        || digest_json(&record)?.to_string() != raw.intent_digest
+        || response
+            .as_ref()
+            .zip(raw.response_digest.as_deref())
+            .is_some_and(|(value, digest)| {
+                digest_json(value).map(|d| d.to_string()).ok().as_deref() != Some(digest)
+            })
+        || !completion_shape_is_valid
+        || completed_at.is_some_and(|instant| instant < record.created_at)
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(StoredLeaseCommand {
+        record,
+        state,
+        response,
+        completed_at,
+    })
+}
+
+fn load_lease_command_by_id(
+    connection: &Connection,
+    intent_id: Uuid,
+) -> JournalResult<Option<StoredLeaseCommand>> {
+    connection
+        .query_row(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM lease_command_intents WHERE intent_id = ?1",
+            [intent_id.to_string()],
+            raw_lease_command_row,
+        )
+        .optional()?
+        .map(decode_lease_command)
+        .transpose()
+}
+
+fn load_lease_command_by_key(
+    connection: &Connection,
+    actor_id: ActorId,
+    idempotency_key: &IdempotencyKey,
+) -> JournalResult<Option<StoredLeaseCommand>> {
+    connection
+        .query_row(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM lease_command_intents WHERE actor_id = ?1 AND idempotency_key = ?2",
+            params![actor_id.to_string(), idempotency_key.as_str()],
+            raw_lease_command_row,
+        )
+        .optional()?
+        .map(decode_lease_command)
+        .transpose()
+}
+
+fn validate_lease_command_response(
+    record: &LeaseCommandIntentRecord,
+    state: &WorkerAttemptState,
+    response: &LeaseView,
+) -> JournalResult<()> {
+    validate_lease_command_response_shape(record, response)?;
+    if response.package_id != state.package_id()
+        || response.lease_id != state.lease_id()
+        || response.fencing_token != state.lease_generation()
+    {
+        return Err(JournalError::Integrity);
+    }
+    match &record.command {
+        LeaseControlCommand::Release { .. } if response.expires_at != state.lease_expires_at() => {
+            Err(JournalError::Integrity)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_lease_command_response_shape(
+    record: &LeaseCommandIntentRecord,
+    response: &LeaseView,
+) -> JournalResult<()> {
+    let (project_id, lease_id, node_id, fencing_token, expected_version, expected_state) =
+        match &record.command {
+            LeaseControlCommand::Renew { command } => (
+                command.input.project_id,
+                command.input.lease_id,
+                command.input.node_id,
+                command.input.fencing_token,
+                command.context.expected_version,
+                agentforge_domain::lease::LeaseState::Active,
+            ),
+            LeaseControlCommand::Release { command } => (
+                command.input.project_id,
+                command.input.lease_id,
+                command.input.node_id,
+                command.input.fencing_token,
+                command.context.expected_version,
+                agentforge_domain::lease::LeaseState::Released,
+            ),
+        };
+    let expected_version = expected_version.ok_or(JournalError::Integrity)?;
+    if response.project_id != project_id
+        || response.attempt_id != record.attempt_id
+        || response.lease_id != lease_id
+        || response.holder_node_id != node_id
+        || response.fencing_token != fencing_token
+        || response.state != expected_state
+        || response.version.get() != expected_version.get().saturating_add(1)
+        || response.updated_at < response.granted_at
+        || response.expires_at > response.max_expires_at
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(())
+}
+
 impl JournalError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
@@ -875,6 +1303,20 @@ impl Journal {
                 connection.execute_batch("BEGIN IMMEDIATE")?;
                 let migrated = connection
                     .execute_batch(MIGRATE_V2_TO_V3)
+                    .and_then(|()| connection.execute_batch(MIGRATE_V3_TO_V4))
+                    .and_then(|()| {
+                        connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
+                    })
+                    .and_then(|()| connection.execute_batch("COMMIT"));
+                if let Err(error) = migrated {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
+            3 => {
+                connection.execute_batch("BEGIN IMMEDIATE")?;
+                let migrated = connection
+                    .execute_batch(MIGRATE_V3_TO_V4)
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -1019,6 +1461,119 @@ impl Journal {
         }
         transaction.commit()?;
         Ok(ClaimIntentCompletion::Completed)
+    }
+
+    pub fn register_lease_command_intent(
+        &mut self,
+        intent: &LeaseCommandIntentRecord,
+    ) -> JournalResult<LeaseCommandRegistration> {
+        intent.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = load_lease_command_by_id(&transaction, intent.intent_id)? {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(LeaseCommandRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        if let Some(existing) = load_lease_command_by_key(
+            &transaction,
+            intent.command.actor_id(),
+            intent.command.idempotency_key(),
+        )? {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(LeaseCommandRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        let state = load_state(&transaction, intent.attempt_id)?
+            .ok_or(JournalError::Runtime(WorkerError::HistoryEmpty))?;
+        if state.lease_id() != intent.command.lease_id()
+            || state.lease_generation() != intent.command.fencing_token()
+        {
+            return Err(JournalError::Runtime(WorkerError::LeaseStale));
+        }
+        transaction.execute(
+            "INSERT INTO lease_command_intents \
+             (intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+              intent_digest, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8)",
+            params![
+                intent.intent_id.to_string(),
+                intent.attempt_id.to_string(),
+                intent.command.actor_id().to_string(),
+                intent.command.idempotency_key().as_str(),
+                intent.command.kind(),
+                encode(intent)?,
+                digest_json(intent)?.to_string(),
+                instant_text(intent.created_at),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(LeaseCommandRegistration::Registered)
+    }
+
+    pub fn pending_lease_command_intents(&self) -> JournalResult<Vec<LeaseCommandIntentRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM lease_command_intents WHERE state = 'pending' ORDER BY created_at, intent_id",
+        )?;
+        let rows = statement.query_map([], raw_lease_command_row)?;
+        rows.map(|row| decode_lease_command(row?).map(|stored| stored.record))
+            .collect()
+    }
+
+    pub fn complete_lease_command_intent(
+        &mut self,
+        intent_id: Uuid,
+        response: &LeaseView,
+        completed_at: ServerInstant,
+    ) -> JournalResult<LeaseCommandCompletion> {
+        if intent_id.is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "lease_command_completion",
+            )));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored =
+            load_lease_command_by_id(&transaction, intent_id)?.ok_or(JournalError::Integrity)?;
+        if stored.state == LeaseCommandState::Completed {
+            if stored.response.as_ref() == Some(response)
+                && stored.completed_at == Some(completed_at)
+            {
+                transaction.commit()?;
+                return Ok(LeaseCommandCompletion::Existing);
+            }
+            return Err(JournalError::Integrity);
+        }
+        if completed_at < stored.record.created_at {
+            return Err(JournalError::Runtime(WorkerError::TimeRegressed));
+        }
+        let state =
+            load_state(&transaction, stored.record.attempt_id)?.ok_or(JournalError::Integrity)?;
+        validate_lease_command_response(&stored.record, &state, response)?;
+        let changed = transaction.execute(
+            "UPDATE lease_command_intents SET state = 'completed', response_json = ?2, \
+                    response_digest = ?3, completed_at = ?4 \
+             WHERE intent_id = ?1 AND state = 'pending'",
+            params![
+                intent_id.to_string(),
+                encode(response)?,
+                digest_json(response)?.to_string(),
+                instant_text(completed_at),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::Integrity);
+        }
+        transaction.commit()?;
+        Ok(LeaseCommandCompletion::Completed)
     }
 
     pub fn plan_operation(
@@ -1847,6 +2402,52 @@ mod tests {
         }
     }
 
+    fn lease_command_intent() -> LeaseCommandIntentRecord {
+        LeaseCommandIntentRecord {
+            intent_id: Uuid::from_bytes([50; 16]),
+            attempt_id: grant().attempt_id,
+            command: LeaseControlCommand::Renew {
+                command: MvpCommand {
+                    context: MvpCommandContext {
+                        command_id: id(51),
+                        actor_id: id(9),
+                        idempotency_key: IdempotencyKey::new("remote-renew-fixture")
+                            .expect("idempotency key"),
+                        correlation_id: id(52),
+                        causation_id: None,
+                        expected_version: Some(AggregateVersion::new(1)),
+                    },
+                    input: RenewLeaseInput {
+                        project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+                        lease_id: grant().lease_id,
+                        node_id: id(46),
+                        fencing_token: grant().lease_generation,
+                        extend_by_seconds: 30,
+                    },
+                },
+            },
+            created_at: at(5),
+        }
+    }
+
+    fn renewed_lease() -> LeaseView {
+        LeaseView {
+            project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+            package_id: grant().package_id,
+            revision_id: PackageRevisionId::from_uuid(Uuid::from_bytes([42; 16])),
+            attempt_id: grant().attempt_id,
+            lease_id: grant().lease_id,
+            holder_node_id: id(46),
+            fencing_token: grant().lease_generation,
+            state: agentforge_domain::lease::LeaseState::Active,
+            granted_at: at(0),
+            expires_at: at(90),
+            max_expires_at: at(600),
+            updated_at: at(10),
+            version: AggregateVersion::new(2),
+        }
+    }
+
     fn apply_request(
         state: &WorkerAttemptState,
         key: &str,
@@ -1994,6 +2595,56 @@ mod tests {
     }
 
     #[test]
+    fn lease_command_intent_is_bound_to_attempt_and_preserves_the_remote_receipt() {
+        let (_directory, mut journal) = fixture();
+        journal.handle(&grant_request()).expect("grant");
+        let intent = lease_command_intent();
+        assert_eq!(
+            journal
+                .register_lease_command_intent(&intent)
+                .expect("register lease command"),
+            LeaseCommandRegistration::Registered
+        );
+        assert_eq!(
+            journal
+                .pending_lease_command_intents()
+                .expect("pending lease commands"),
+            vec![intent.clone()]
+        );
+        assert_eq!(
+            journal
+                .complete_lease_command_intent(intent.intent_id, &renewed_lease(), at(10))
+                .expect("complete lease command"),
+            LeaseCommandCompletion::Completed
+        );
+        assert_eq!(
+            journal
+                .complete_lease_command_intent(intent.intent_id, &renewed_lease(), at(10))
+                .expect("completion replay"),
+            LeaseCommandCompletion::Existing
+        );
+        assert!(
+            journal
+                .pending_lease_command_intents()
+                .expect("no pending lease command")
+                .is_empty()
+        );
+
+        let mut reused = intent;
+        let LeaseControlCommand::Renew { command } = &mut reused.command else {
+            panic!("renew fixture")
+        };
+        command.input.extend_by_seconds = 31;
+        assert_eq!(
+            journal
+                .register_lease_command_intent(&reused)
+                .expect_err("changed command reuses key")
+                .code(),
+            "AF_IDEMPOTENCY_KEY_REUSED"
+        );
+    }
+
+    #[test]
     fn schema_v2_is_upgraded_without_losing_existing_attempts() {
         let (directory, mut journal) = fixture();
         let state = journal
@@ -2009,19 +2660,24 @@ mod tests {
                  DROP TRIGGER claim_intents_cannot_be_deleted;
                  DROP INDEX claim_intents_pending_idx;
                  DROP TABLE claim_intents;
+                 DROP TRIGGER lease_command_intents_request_is_immutable;
+                 DROP TRIGGER lease_command_intents_state_is_monotonic;
+                 DROP TRIGGER lease_command_intents_cannot_be_deleted;
+                 DROP INDEX lease_command_intents_pending_idx;
+                 DROP TABLE lease_command_intents;
                  PRAGMA user_version = 2;",
             )
             .expect("downgrade fixture to the exact v2 delta");
         drop(journal);
 
         let mut reopened =
-            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v3");
+            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v4");
         assert_eq!(
             reopened
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            3
+            4
         );
         assert_eq!(
             reopened
@@ -2046,7 +2702,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            3
+            4
         );
         let applied = journal.handle(&request).expect("grant applied");
         assert!(matches!(applied, JournalDisposition::Applied(_)));

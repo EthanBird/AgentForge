@@ -601,7 +601,12 @@ pub fn from_grant(grant: &AttemptGrant) -> WorkerResult<WorkerAttemptState> {
 }
 
 fn decide(state: &WorkerAttemptState, command: &WorkerCommandEnvelope) -> WorkerResult<WorkerFact> {
-    if state.phase.is_terminal() {
+    let author_lease_command = state.phase == WorkerPhase::AuthorComplete
+        && matches!(
+            &command.command,
+            WorkerCommandKind::RenewLease { .. } | WorkerCommandKind::LoseLease { .. }
+        );
+    if state.phase.is_terminal() && !author_lease_command {
         return Err(WorkerError::InvalidTransition);
     }
     if command.expected_version != state.version {
@@ -774,8 +779,13 @@ fn decide(state: &WorkerAttemptState, command: &WorkerCommandEnvelope) -> Worker
 
 pub fn apply(state: &mut WorkerAttemptState, fact: &WorkerFact) -> WorkerResult<()> {
     state.validate()?;
-    if state.phase.is_terminal() || fact.observed_at < state.updated_at {
-        return Err(if state.phase.is_terminal() {
+    let author_lease_fact = state.phase == WorkerPhase::AuthorComplete
+        && matches!(
+            &fact.kind,
+            WorkerFactKind::LeaseRenewed { .. } | WorkerFactKind::LeaseLost { .. }
+        );
+    if (state.phase.is_terminal() && !author_lease_fact) || fact.observed_at < state.updated_at {
+        return Err(if state.phase.is_terminal() && !author_lease_fact {
             WorkerError::InvalidTransition
         } else {
             WorkerError::TimeRegressed
@@ -907,6 +917,7 @@ pub fn apply(state: &mut WorkerAttemptState, fact: &WorkerFact) -> WorkerResult<
             }
             state.resume_phase = None;
             state.wake_condition = None;
+            state.candidate_id = None;
             state.phase = WorkerPhase::Salvaging;
         }
         WorkerFactKind::Cancelled { reason_code } => {
@@ -1090,6 +1101,20 @@ mod tests {
                 .code(),
             "AF_TRANSITION_INVALID"
         );
+        let salvaged = state
+            .transition(&command(
+                &state,
+                9,
+                WorkerCommandKind::LoseLease {
+                    reason: LeaseLossReason::Revoked,
+                    observed_generation: state.lease_generation,
+                },
+            ))
+            .expect("lost Lease preserves only the local candidate for salvage")
+            .aggregate;
+        assert_eq!(salvaged.phase, WorkerPhase::Salvaging);
+        assert!(salvaged.candidate.is_some());
+        assert!(salvaged.candidate_id.is_none());
     }
 
     #[test]

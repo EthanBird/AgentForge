@@ -134,7 +134,13 @@ Renew/Release 调度、enrollment、sandbox 与 jcode bridge。
 
 ## MVP-02 / Checkpoint E：Durable Claim Intent 与 CI 时间一致性修复
 
-状态：本地实现与完整 workspace 门禁通过；等待提交与远端 PostgreSQL 17 复核。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端提交：`9ae930eedaf0973d73852e8f53e546a453d78d5b`
+- GitHub Actions：CI #59 / run `31348766919`
+- Rust job：format、metadata、workspace boundary、build、Clippy、workspace test 全部通过
+- PostgreSQL 17 job：migration、transactional UoW、MVP market/Lease contract 全部通过；CI #57
+  暴露的 Renew response/typed row `updated_at` 漂移已关闭
 
 当前完成：
 
@@ -147,4 +153,25 @@ Renew/Release 调度、enrollment、sandbox 与 jcode bridge。
   CI #57 的亚毫秒时间漂移；
 - Worker 定点测试增至 21 项，覆盖远端失败→进程重启→exact Claim replay。
 
-仍待：自动 Renew/Release 调度、HTTP/mTLS Worker adapter、enrollment、sandbox 与 jcode bridge。
+Checkpoint E 当时仍待自动 Renew/Release（现由 F 关闭）；其余仍待 HTTP/mTLS Worker adapter、
+enrollment、sandbox 与 jcode bridge。
+
+## MVP-02 / Checkpoint F：可恢复 Lease Maintenance
+
+状态：本地实现与完整 workspace 门禁通过；等待提交和远端 CI。
+
+当前完成：
+
+- Journal schema v4 增加 `lease_command_intents`；Renew/Release 请求在远端调用前绑定 Attempt、actor、
+  idempotency key、expected Lease version 与 fencing token，响应以 JCS digest 封存；
+- v2→v3→v4 可在一次启动中顺序迁移，已有 Attempt、执行快照和事实链保持不变；
+- `LeaseMaintenancePolicy` 只在 expiry 阈值内续租，并按 `max_expires_at` 截断 extension；阈值外不产生
+  远端 mutation；
+- 服务器已 Renew 但响应丢失时，Pending intent 跨重启取回首次 receipt，本地只追加一次
+  `LeaseRenewed`；
+- `LocalFailed`/`LocalCancelled` 自动 Release，`AuthorComplete` 在 Candidate handoff 前继续 Renew；若
+  Lease 丢失只保留本地 Candidate 做 salvage，并清除正式 candidate ID 授权；
+- Worker 定点测试增至 24 项，覆盖 scheduler window、Renew ACK-loss/restart、Release 和 response
+  binding。
+
+仍待：daemon 定时组合根、HTTP/mTLS Worker adapter、enrollment、sandbox 与 jcode bridge。
