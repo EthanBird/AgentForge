@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "actor_id": "01010101-0101-0101-0101-010101010101",
+  "executor_id": "02020202-0202-0202-0202-020202020202",
+  "node_id": "03030303-0303-0303-0303-030303030303",
+  "runtime_fingerprint": "sha256:80d2ad958af83e8a6b8e829b76666a9592463826345963f47cbf6a8b3781f38d",
+  "project_ids": [
+    "04040404-0404-0404-0404-040404040404"
+  ],
+  "control_plane_url": "http://127.0.0.1:8080",
+  "request_timeout_seconds": 10,
+  "max_response_bytes": 2097152,
+  "journal_path": "/var/lib/agentforge/worker-fixture.sqlite3",
+  "capacity": 1,
+  "offer_limit": 10,
+  "lease_seconds": 60,
+  "max_lease_seconds": 600,
+  "renew_before_seconds": 15,
+  "extend_by_seconds": 30,
+  "tick_seconds": 5,
+  "driver_mode": "fixture",
+  "max_turns": 3,
+  "operation_timeout_seconds": 60
+}

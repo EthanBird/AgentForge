@@ -1,7 +1,10 @@
 //! PostgreSQL source-of-truth adapters and embedded migrations.
 
 pub mod migration;
+pub mod mvp;
 pub mod uow;
+
+pub use mvp::PostgresMvpControlPlane;
 
 pub use uow::{
     CommandReceiptLookup, InboxDisposition, LocalNoTlsPostgresUnitOfWorkFactory, OutboxClaim,

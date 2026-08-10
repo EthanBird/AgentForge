@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod attempt;
 pub mod budget;
+pub mod candidate;
 pub mod governance;
 pub mod invocation;
 pub mod lease;
@@ -16,6 +17,7 @@ pub mod work_package;
 
 pub use attempt::Attempt;
 pub use budget::BudgetReservation;
+pub use candidate::{Candidate, CandidateArtifact, CandidateArtifactState, VerificationRun};
 pub use governance::{Decision, GovernanceCase};
 pub use invocation::{InvocationIntent, InvocationRun};
 pub use lease::Lease;

@@ -8,10 +8,10 @@ use serde_json::Value;
 use crate::{
     error::DomainError,
     ids::{
-        ActorId, AggregateVersion, AttemptId, BudgetReservationId, CorrelationId, DecisionId,
-        EventId, GovernanceCaseId, InvocationIntentId, InvocationRunId, LeaseId, PackageId,
-        PolicyRevisionId, RunClaimId, RunSignalId, ServerInstant, SessionCapsuleId, Sha256Digest,
-        SubmissionId,
+        ActorId, AggregateVersion, AttemptId, BudgetReservationId, CandidateArtifactId,
+        CandidateId, CorrelationId, DecisionId, EventId, GovernanceCaseId, InvocationIntentId,
+        InvocationRunId, LeaseId, PackageId, PolicyRevisionId, RunClaimId, RunSignalId,
+        ServerInstant, SessionCapsuleId, Sha256Digest, SubmissionId, VerificationRunId,
     },
 };
 
@@ -28,6 +28,9 @@ pub enum AggregateType {
     WorkPackage,
     Attempt,
     Lease,
+    CandidateArtifact,
+    Candidate,
+    VerificationRun,
     Submission,
     RunSignal,
     InvocationIntent,
@@ -46,6 +49,9 @@ pub enum AggregateId {
     WorkPackage(PackageId),
     Attempt(AttemptId),
     Lease(LeaseId),
+    CandidateArtifact(CandidateArtifactId),
+    Candidate(CandidateId),
+    VerificationRun(VerificationRunId),
     Submission(SubmissionId),
     RunSignal(RunSignalId),
     InvocationIntent(InvocationIntentId),
@@ -65,6 +71,9 @@ impl AggregateId {
             Self::WorkPackage(_) => AggregateType::WorkPackage,
             Self::Attempt(_) => AggregateType::Attempt,
             Self::Lease(_) => AggregateType::Lease,
+            Self::CandidateArtifact(_) => AggregateType::CandidateArtifact,
+            Self::Candidate(_) => AggregateType::Candidate,
+            Self::VerificationRun(_) => AggregateType::VerificationRun,
             Self::Submission(_) => AggregateType::Submission,
             Self::RunSignal(_) => AggregateType::RunSignal,
             Self::InvocationIntent(_) => AggregateType::InvocationIntent,
@@ -277,6 +286,7 @@ fn is_reserved_key(key: &str) -> bool {
 
 pub use crate::state::attempt::AttemptEvent;
 pub use crate::state::budget::BudgetReservationEvent;
+pub use crate::state::candidate::{CandidateArtifactEvent, CandidateEvent, VerificationRunEvent};
 pub use crate::state::governance::{DecisionEvent, GovernanceCaseEvent};
 pub use crate::state::invocation::{
     InvocationIntentEvent, InvocationRunEvent, InvocationRunEventV1, UpcastInvocationRunEventV1,

@@ -1,0 +1,1086 @@
+//! Versioned HTTP command surface for the runnable local MVP.
+
+use agentforge_application::{
+    AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
+    CompleteCandidateArtifactInput, CreateProjectInput, InitCandidateArtifactInput, LeaseView,
+    ListOffersQuery, MvpCommand, MvpCommandContext, MvpError, OfferView, ProjectView,
+    PublishPackageInput, PublishedPackage, RecordCandidateInput, RecordedCandidate,
+    ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
+    UploadCandidateArtifactChunkInput,
+};
+use agentforge_domain::{
+    ActorId, AggregateVersion, AttemptId, CandidateArtifactId, CommandId, CorrelationId, EventId,
+    IdempotencyKey, LeaseId, PackageId, ProjectId,
+};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
+};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::ui::ControlPlaneState;
+
+const IDEMPOTENCY_KEY: &str = "idempotency-key";
+const COMMAND_ID: &str = "x-agentforge-command-id";
+const CORRELATION_ID: &str = "x-agentforge-correlation-id";
+const CAUSATION_ID: &str = "x-agentforge-causation-id";
+
+pub(crate) fn routes() -> Router<ControlPlaneState> {
+    Router::new()
+        .route("/api/v1/projects", post(create_project))
+        .route(
+            "/api/v1/projects/{project_id}/packages",
+            post(publish_package),
+        )
+        .route("/api/v1/projects/{project_id}/offers", get(list_offers))
+        .route(
+            "/api/v1/projects/{project_id}/packages/{package_id}/claim",
+            post(claim_package),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/leases/{lease_id}",
+            get(get_lease),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/leases/{lease_id}/renew",
+            post(renew_lease),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/leases/{lease_id}/release",
+            post(release_lease),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/attempts/{attempt_id}/progress",
+            post(report_attempt_progress),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/attempts/{attempt_id}/candidate-artifacts",
+            post(init_candidate_artifact),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/chunks/{chunk_index}",
+            put(upload_candidate_artifact_chunk),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/complete",
+            post(complete_candidate_artifact),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/attempts/{attempt_id}/candidates",
+            post(record_candidate),
+        )
+}
+
+async fn create_project(
+    State(state): State<ControlPlaneState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateProjectInput>,
+) -> Result<(StatusCode, Json<ProjectView>), ApiError> {
+    let actor = authorize(&state, &headers, input.project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, false)?,
+        input,
+    };
+    let response = service(&state)?.create_project(&command).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn publish_package(
+    State(state): State<ControlPlaneState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Json(input): Json<PublishPackageInput>,
+) -> Result<(StatusCode, Json<PublishedPackage>), ApiError> {
+    let project_id = parse_project(&project_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, false)?,
+        input,
+    };
+    let response = service(&state)?.publish_package(&command).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct OffersQuery {
+    limit: Option<u16>,
+}
+
+async fn list_offers(
+    State(state): State<ControlPlaneState>,
+    Path(project_id): Path<String>,
+    headers: HeaderMap,
+    Query(query): Query<OffersQuery>,
+) -> Result<Json<Vec<OfferView>>, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    authorize(&state, &headers, project_id).await?;
+    let response = service(&state)?
+        .list_offers(ListOffersQuery {
+            project_id,
+            limit: query.limit.unwrap_or(50),
+        })
+        .await?;
+    Ok(Json(response))
+}
+
+async fn claim_package(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, package_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<ClaimPackageInput>,
+) -> Result<(StatusCode, Json<agentforge_application::ClaimedWork>), ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let package_id = parse_package(&package_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(package_id, input.package_id, "package_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    let response = service(&state)?.claim_package(&command).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn get_lease(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, lease_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<LeaseView>, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let lease_id = parse_lease(&lease_id)?;
+    authorize(&state, &headers, project_id).await?;
+    Ok(Json(
+        service(&state)?.get_lease(project_id, lease_id).await?,
+    ))
+}
+
+async fn renew_lease(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, lease_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<RenewLeaseInput>,
+) -> Result<Json<LeaseView>, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let lease_id = parse_lease(&lease_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(lease_id, input.lease_id, "lease_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    Ok(Json(service(&state)?.renew_lease(&command).await?))
+}
+
+async fn release_lease(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, lease_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<ReleaseLeaseInput>,
+) -> Result<Json<LeaseView>, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let lease_id = parse_lease(&lease_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(lease_id, input.lease_id, "lease_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    Ok(Json(service(&state)?.release_lease(&command).await?))
+}
+
+async fn report_attempt_progress(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, attempt_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<ReportAttemptProgressInput>,
+) -> Result<Json<AttemptProgressView>, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let attempt_id = parse_attempt(&attempt_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(attempt_id, input.attempt_id, "attempt_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    Ok(Json(
+        service(&state)?.report_attempt_progress(&command).await?,
+    ))
+}
+
+async fn init_candidate_artifact(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, attempt_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<InitCandidateArtifactInput>,
+) -> Result<(StatusCode, Json<CandidateArtifactView>), ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let attempt_id = parse_attempt(&attempt_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(attempt_id, input.attempt_id, "attempt_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    let response = service(&state)?.init_candidate_artifact(&command).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+async fn upload_candidate_artifact_chunk(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, artifact_id, chunk_index)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<UploadCandidateArtifactChunkInput>,
+) -> Result<StatusCode, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let artifact_id = parse_candidate_artifact(&artifact_id)?;
+    let chunk_index = chunk_index
+        .parse::<u32>()
+        .map_err(|_| ApiError::InvalidPath)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(artifact_id, input.artifact_id, "artifact_id")?;
+    require_same(chunk_index, input.chunk_index, "chunk_index")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    let _: CandidateArtifactChunkReceipt = service(&state)?
+        .upload_candidate_artifact_chunk(&command)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn complete_candidate_artifact(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, artifact_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<CompleteCandidateArtifactInput>,
+) -> Result<Json<CandidateArtifactView>, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let artifact_id = parse_candidate_artifact(&artifact_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(artifact_id, input.artifact_id, "artifact_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    Ok(Json(
+        service(&state)?
+            .complete_candidate_artifact(&command)
+            .await?,
+    ))
+}
+
+async fn record_candidate(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, attempt_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<RecordCandidateInput>,
+) -> Result<(StatusCode, Json<RecordedCandidate>), ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let attempt_id = parse_attempt(&attempt_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(attempt_id, input.attempt_id, "attempt_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    let response = service(&state)?.record_candidate(&command).await?;
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+fn service(
+    state: &ControlPlaneState,
+) -> Result<std::sync::Arc<dyn agentforge_application::MvpControlPlane>, ApiError> {
+    state.command_service().ok_or(ApiError::NotConfigured)
+}
+
+async fn authorize(
+    state: &ControlPlaneState,
+    headers: &HeaderMap,
+    project_id: ProjectId,
+) -> Result<ActorId, ApiError> {
+    state
+        .authorize_command_actor(headers, project_id)
+        .await
+        .map_err(|()| ApiError::AccessDenied)
+}
+
+fn command_context(
+    headers: &HeaderMap,
+    actor_id: ActorId,
+    version_required: bool,
+) -> Result<MvpCommandContext, ApiError> {
+    let idempotency_key = required_header(headers, IDEMPOTENCY_KEY)?;
+    let expected_version = headers
+        .get(header::IF_MATCH)
+        .map(|value| {
+            let value = value.to_str().map_err(|_| ApiError::InvalidHeader)?;
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            let version = value
+                .parse::<u64>()
+                .ok()
+                .filter(|version| *version != 0)
+                .ok_or(ApiError::InvalidHeader)?;
+            Ok::<AggregateVersion, ApiError>(AggregateVersion::new(version))
+        })
+        .transpose()?;
+    if expected_version.is_some() == !version_required {
+        return Err(ApiError::InvalidHeader);
+    }
+    Ok(MvpCommandContext {
+        command_id: optional_uuid_header(headers, COMMAND_ID)?
+            .map(CommandId::from_uuid)
+            .unwrap_or_else(|| CommandId::from_uuid(Uuid::now_v7())),
+        actor_id,
+        idempotency_key: IdempotencyKey::new(idempotency_key)
+            .map_err(|_| ApiError::InvalidHeader)?,
+        correlation_id: optional_uuid_header(headers, CORRELATION_ID)?
+            .map(CorrelationId::from_uuid)
+            .unwrap_or_else(|| CorrelationId::from_uuid(Uuid::now_v7())),
+        causation_id: optional_uuid_header(headers, CAUSATION_ID)?.map(EventId::from_uuid),
+        expected_version,
+    })
+}
+
+fn required_header(headers: &HeaderMap, name: &'static str) -> Result<String, ApiError> {
+    headers
+        .get(name)
+        .ok_or(ApiError::InvalidHeader)?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::InvalidHeader)
+}
+
+fn optional_uuid_header(headers: &HeaderMap, name: &'static str) -> Result<Option<Uuid>, ApiError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::InvalidHeader)?
+                .parse::<Uuid>()
+                .map_err(|_| ApiError::InvalidHeader)
+        })
+        .transpose()
+}
+
+fn parse_project(value: &str) -> Result<ProjectId, ApiError> {
+    value.parse().map_err(|_| ApiError::InvalidPath)
+}
+
+fn parse_package(value: &str) -> Result<PackageId, ApiError> {
+    value.parse().map_err(|_| ApiError::InvalidPath)
+}
+
+fn parse_lease(value: &str) -> Result<LeaseId, ApiError> {
+    value.parse().map_err(|_| ApiError::InvalidPath)
+}
+
+fn parse_attempt(value: &str) -> Result<AttemptId, ApiError> {
+    value.parse().map_err(|_| ApiError::InvalidPath)
+}
+
+fn parse_candidate_artifact(value: &str) -> Result<CandidateArtifactId, ApiError> {
+    value.parse().map_err(|_| ApiError::InvalidPath)
+}
+
+fn require_same<T: Eq>(left: T, right: T, _field: &'static str) -> Result<(), ApiError> {
+    (left == right)
+        .then_some(())
+        .ok_or(ApiError::PathBodyMismatch)
+}
+
+#[derive(Debug)]
+enum ApiError {
+    InvalidPath,
+    InvalidHeader,
+    PathBodyMismatch,
+    AccessDenied,
+    NotConfigured,
+    Command(MvpError),
+}
+
+impl From<MvpError> for ApiError {
+    fn from(error: MvpError) -> Self {
+        Self::Command(error)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorBody {
+    code: &'static str,
+    message: &'static str,
+    retryable: bool,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message, retryable) = match self {
+            Self::InvalidPath => (
+                StatusCode::BAD_REQUEST,
+                "AF_RESOURCE_ID_INVALID",
+                "resource identifiers must be UUIDs",
+                false,
+            ),
+            Self::InvalidHeader => (
+                StatusCode::BAD_REQUEST,
+                "AF_COMMAND_HEADER_INVALID",
+                "Idempotency-Key and update If-Match headers must be valid",
+                false,
+            ),
+            Self::PathBodyMismatch => (
+                StatusCode::BAD_REQUEST,
+                "AF_PATH_BODY_MISMATCH",
+                "path and body resource identifiers must match",
+                false,
+            ),
+            Self::AccessDenied => (
+                StatusCode::FORBIDDEN,
+                "AF_PROJECT_ACCESS_DENIED",
+                "the request actor is not authorized for this project",
+                false,
+            ),
+            Self::NotConfigured => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AF_COMMAND_SERVICE_UNAVAILABLE",
+                "the command service is not configured",
+                true,
+            ),
+            Self::Command(error) => command_error_response(&error),
+        };
+        (
+            status,
+            Json(ErrorBody {
+                code,
+                message,
+                retryable,
+            }),
+        )
+            .into_response()
+    }
+}
+
+fn command_error_response(error: &MvpError) -> (StatusCode, &'static str, &'static str, bool) {
+    let code = error.code();
+    let status = match code {
+        "AF_NOT_FOUND" => StatusCode::NOT_FOUND,
+        "AF_LEASE_EXPIRED" => StatusCode::GONE,
+        "AF_POLICY_DENIED" => StatusCode::FORBIDDEN,
+        "AF_CONFLICT"
+        | "AF_LEASE_STALE"
+        | "AF_IDEMPOTENCY_KEY_REUSED"
+        | "AF_TRANSITION_INVALID"
+        | "AF_PACKAGE_NOT_CLAIMABLE"
+        | "AF_CANDIDATE_ARTIFACT_NOT_COMPLETE"
+        | "AF_IDEMPOTENCY_RESULT_EXPIRED"
+        | "AF_IDEMPOTENCY_RESULT_LEGACY" => StatusCode::CONFLICT,
+        "AF_VERSION_STALE" => StatusCode::PRECONDITION_FAILED,
+        "AF_UNAVAILABLE" => StatusCode::SERVICE_UNAVAILABLE,
+        "AF_STORAGE_INTEGRITY" | "AF_SERIALIZATION" => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    };
+    let message = if status.is_server_error() {
+        "the command could not be completed by the service"
+    } else if status == StatusCode::NOT_FOUND {
+        "the requested resource was not found"
+    } else if status == StatusCode::FORBIDDEN {
+        "the command is not authorized"
+    } else if status == StatusCode::GONE {
+        "the Lease authorization window has expired"
+    } else if status == StatusCode::CONFLICT {
+        "the command conflicts with current durable state"
+    } else {
+        "the command did not satisfy its validation contract"
+    };
+    (status, code, message, error.retryable())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use agentforge_application::{
+        AttemptProgressStage, AttemptProgressView, CandidateArtifactChunkReceipt,
+        CandidateArtifactView, ClaimedWork, CompleteCandidateArtifactInput,
+        InitCandidateArtifactInput, LeaseReconciliationReport, MvpControlPlane, MvpFuture,
+        ProjectView, ReconcileExpiredLeasesQuery, RecordCandidateInput, RecordedCandidate,
+        ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
+    };
+    use agentforge_domain::{
+        CandidateArtifactState, CandidateId, ExecutorId, FencingToken, GitObjectId, NodeId,
+        ProtocolKey, ServerInstant, Sha256Digest, VerificationRunId, attempt::AttemptState,
+        candidate::VerificationRunState,
+    };
+    use time::macros::datetime;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CreateOnlyService {
+        artifact_commands: Mutex<Vec<&'static str>>,
+    }
+
+    impl MvpControlPlane for CreateOnlyService {
+        fn ready(&self) -> MvpFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+
+        fn create_project<'a>(
+            &'a self,
+            command: &'a MvpCommand<CreateProjectInput>,
+        ) -> MvpFuture<'a, ProjectView> {
+            Box::pin(async move {
+                Ok(ProjectView {
+                    project_id: command.input.project_id,
+                    protocol_key: command.input.protocol_key.clone(),
+                    name: command.input.name.clone(),
+                    version: AggregateVersion::new(1),
+                })
+            })
+        }
+
+        fn publish_package<'a>(
+            &'a self,
+            _command: &'a MvpCommand<PublishPackageInput>,
+        ) -> MvpFuture<'a, PublishedPackage> {
+            unavailable()
+        }
+
+        fn list_offers(&self, _query: ListOffersQuery) -> MvpFuture<'_, Vec<OfferView>> {
+            unavailable()
+        }
+
+        fn claim_package<'a>(
+            &'a self,
+            _command: &'a MvpCommand<ClaimPackageInput>,
+        ) -> MvpFuture<'a, ClaimedWork> {
+            unavailable()
+        }
+
+        fn report_attempt_progress<'a>(
+            &'a self,
+            command: &'a MvpCommand<ReportAttemptProgressInput>,
+        ) -> MvpFuture<'a, AttemptProgressView> {
+            Box::pin(async move {
+                let (state, semantic_progress_seq) = match command.input.stage {
+                    AttemptProgressStage::Preparing => (AttemptState::Preparing, 1),
+                    AttemptProgressStage::Planning => (AttemptState::Planning, 2),
+                    AttemptProgressStage::Implementing => (AttemptState::Implementing, 3),
+                    AttemptProgressStage::LocalVerify => (AttemptState::LocalVerify, 4),
+                };
+                let expected = command.context.expected_version.expect("Attempt version");
+                Ok(AttemptProgressView {
+                    project_id: command.input.project_id,
+                    package_id: PackageId::from_uuid(Uuid::from_bytes([2; 16])),
+                    attempt_id: command.input.attempt_id,
+                    lease_id: command.input.lease_id,
+                    fencing_token: command.input.fencing_token,
+                    state,
+                    semantic_progress_seq,
+                    updated_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+                    version: AggregateVersion::new(expected.get() + 2),
+                })
+            })
+        }
+
+        fn init_candidate_artifact<'a>(
+            &'a self,
+            command: &'a MvpCommand<InitCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
+            self.artifact_commands
+                .lock()
+                .expect("artifact command lock")
+                .push("init");
+            Box::pin(async move { Ok(candidate_artifact_view(&command.input, 1)) })
+        }
+
+        fn upload_candidate_artifact_chunk<'a>(
+            &'a self,
+            command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+        ) -> MvpFuture<'a, CandidateArtifactChunkReceipt> {
+            self.artifact_commands
+                .lock()
+                .expect("artifact command lock")
+                .push("chunk");
+            Box::pin(async move {
+                Ok(CandidateArtifactChunkReceipt {
+                    artifact_id: command.input.artifact_id,
+                    chunk_index: command.input.chunk_index,
+                    digest: command.input.digest,
+                    size_bytes: u32::try_from(command.input.content.len()).expect("chunk size"),
+                    artifact_version: command.context.expected_version.expect("artifact version"),
+                })
+            })
+        }
+
+        fn complete_candidate_artifact<'a>(
+            &'a self,
+            command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
+            self.artifact_commands
+                .lock()
+                .expect("artifact command lock")
+                .push("complete");
+            Box::pin(async move {
+                let init = InitCandidateArtifactInput {
+                    project_id: command.input.project_id,
+                    attempt_id: AttemptId::from_uuid(Uuid::from_bytes([4; 16])),
+                    lease_id: command.input.lease_id,
+                    node_id: command.input.node_id,
+                    fencing_token: command.input.fencing_token,
+                    package_hash: Sha256Digest::of_bytes("package"),
+                    base_commit: GitObjectId::new("1".repeat(40)).expect("base"),
+                    candidate_commit: GitObjectId::new("2".repeat(40)).expect("candidate"),
+                    tree_hash: GitObjectId::new("3".repeat(40)).expect("tree"),
+                    author_evidence_digest: Sha256Digest::of_bytes("evidence"),
+                    expected_bundle_digest: Sha256Digest::of_bytes("bundle"),
+                    expected_bundle_size_bytes: 4,
+                    chunk_digests: vec![Sha256Digest::of_bytes([0_u8, 1, 2, 3])],
+                    upload_ttl_seconds: 60,
+                };
+                Ok(candidate_artifact_view(
+                    &init,
+                    command
+                        .context
+                        .expected_version
+                        .expect("artifact version")
+                        .get()
+                        + 2,
+                ))
+            })
+        }
+
+        fn record_candidate<'a>(
+            &'a self,
+            command: &'a MvpCommand<RecordCandidateInput>,
+        ) -> MvpFuture<'a, RecordedCandidate> {
+            self.artifact_commands
+                .lock()
+                .expect("artifact command lock")
+                .push("record");
+            Box::pin(async move {
+                let expected = command.context.expected_version.expect("Attempt version");
+                Ok(RecordedCandidate {
+                    project_id: command.input.project_id,
+                    package_id: PackageId::from_uuid(Uuid::from_bytes([2; 16])),
+                    revision_id: agentforge_domain::PackageRevisionId::from_uuid(Uuid::from_bytes(
+                        [3; 16],
+                    )),
+                    attempt_id: command.input.attempt_id,
+                    artifact_id: command.input.artifact_id,
+                    candidate_id: CandidateId::from_uuid(Uuid::from_bytes([21; 16])),
+                    verification_run_id: VerificationRunId::from_uuid(Uuid::from_bytes([22; 16])),
+                    candidate_commit: GitObjectId::new("2".repeat(40)).expect("candidate"),
+                    tree_hash: GitObjectId::new("3".repeat(40)).expect("tree"),
+                    branch: command.input.branch.clone(),
+                    verification_state: VerificationRunState::Queued,
+                    sealed_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+                    candidate_version: AggregateVersion::new(1),
+                    verification_run_version: AggregateVersion::new(1),
+                    attempt_version: AggregateVersion::new(expected.get() + 1),
+                    package_version: AggregateVersion::new(3),
+                    lease_version: AggregateVersion::new(2),
+                })
+            })
+        }
+
+        fn renew_lease<'a>(
+            &'a self,
+            _command: &'a MvpCommand<RenewLeaseInput>,
+        ) -> MvpFuture<'a, LeaseView> {
+            unavailable()
+        }
+
+        fn release_lease<'a>(
+            &'a self,
+            _command: &'a MvpCommand<ReleaseLeaseInput>,
+        ) -> MvpFuture<'a, LeaseView> {
+            unavailable()
+        }
+
+        fn get_lease(
+            &self,
+            _project_id: ProjectId,
+            _lease_id: LeaseId,
+        ) -> MvpFuture<'_, LeaseView> {
+            unavailable()
+        }
+
+        fn reconcile_expired_leases(
+            &self,
+            _query: ReconcileExpiredLeasesQuery,
+        ) -> MvpFuture<'_, LeaseReconciliationReport> {
+            unavailable()
+        }
+    }
+
+    fn unavailable<'a, T>() -> MvpFuture<'a, T> {
+        Box::pin(async {
+            Err(MvpError::Port(
+                agentforge_application::PortError::Unavailable,
+            ))
+        })
+    }
+
+    fn candidate_artifact_view(
+        input: &InitCandidateArtifactInput,
+        version: u64,
+    ) -> CandidateArtifactView {
+        CandidateArtifactView {
+            project_id: input.project_id,
+            artifact_id: CandidateArtifactId::from_uuid(Uuid::from_bytes([20; 16])),
+            candidate_id: CandidateId::from_uuid(Uuid::from_bytes([21; 16])),
+            attempt_id: input.attempt_id,
+            package_id: PackageId::from_uuid(Uuid::from_bytes([2; 16])),
+            revision_id: agentforge_domain::PackageRevisionId::from_uuid(Uuid::from_bytes([3; 16])),
+            lease_id: input.lease_id,
+            fencing_token: input.fencing_token,
+            candidate_commit: input.candidate_commit.clone(),
+            tree_hash: input.tree_hash.clone(),
+            state: if version == 1 {
+                CandidateArtifactState::Uploading
+            } else {
+                CandidateArtifactState::Complete
+            },
+            expected_bundle_digest: input.expected_bundle_digest,
+            expected_bundle_size_bytes: input.expected_bundle_size_bytes,
+            chunk_digests: input.chunk_digests.clone(),
+            bundle: None,
+            created_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+            expires_at: ServerInstant(datetime!(2026-08-10 00:01 UTC)),
+            updated_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+            version: AggregateVersion::new(version),
+        }
+    }
+
+    fn test_state_with_service(
+        project_id: ProjectId,
+    ) -> (ControlPlaneState, Arc<CreateOnlyService>) {
+        let (state, _) = ControlPlaneState::local_reference(
+            crate::ui::CursorCodec::from_hex(&"11".repeat(32)).expect("cursor key"),
+            [project_id],
+        )
+        .expect("local state");
+        let service = Arc::new(CreateOnlyService::default());
+        (state.with_commands(service.clone()), service)
+    }
+
+    fn test_state(project_id: ProjectId) -> ControlPlaneState {
+        test_state_with_service(project_id).0
+    }
+
+    #[test]
+    fn command_headers_are_server_actor_bound_and_require_if_match_for_updates() {
+        let actor = ActorId::from_uuid(Uuid::from_bytes([1; 16]));
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY, "claim-1".parse().expect("header"));
+        headers.insert(header::IF_MATCH, "\"2\"".parse().expect("header"));
+        let context = command_context(&headers, actor, true).expect("valid update context");
+        assert_eq!(context.actor_id, actor);
+        assert_eq!(context.expected_version, Some(AggregateVersion::new(2)));
+        assert!(command_context(&headers, actor, false).is_err());
+        headers.remove(header::IF_MATCH);
+        assert!(command_context(&headers, actor, true).is_err());
+        assert!(command_context(&headers, actor, false).is_ok());
+    }
+
+    #[test]
+    fn command_errors_have_stable_http_classes_without_internal_details() {
+        let error = MvpError::Domain(agentforge_domain::DomainError::StaleLease);
+        let (status, code, message, _) = command_error_response(&error);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "AF_LEASE_STALE");
+        assert!(!message.contains("token"));
+
+        let (status, code, _, retryable) = command_error_response(&MvpError::Domain(
+            agentforge_domain::DomainError::StaleVersion,
+        ));
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(code, "AF_VERSION_STALE");
+        assert!(!retryable);
+
+        let (status, code, _, retryable) = command_error_response(&MvpError::Domain(
+            agentforge_domain::DomainError::CandidateArtifactNotComplete,
+        ));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(code, "AF_CANDIDATE_ARTIFACT_NOT_COMPLETE");
+        assert!(retryable);
+    }
+
+    #[tokio::test]
+    async fn create_handler_uses_authorized_server_actor_and_returns_created() {
+        let project_id = ProjectId::from_uuid(Uuid::now_v7());
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY, "project-create".parse().expect("header"));
+        let input = CreateProjectInput {
+            project_id,
+            protocol_key: ProtocolKey::new(format!("project-{project_id}")).expect("key"),
+            name: "MVP".into(),
+        };
+        let (status, Json(view)) =
+            create_project(State(test_state(project_id)), headers, Json(input.clone()))
+                .await
+                .expect("create response");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(view.project_id, input.project_id);
+        assert_eq!(view.version, AggregateVersion::new(1));
+    }
+
+    #[tokio::test]
+    async fn claim_handler_rejects_path_body_mismatch_before_dispatch() {
+        let project_id = ProjectId::from_uuid(Uuid::now_v7());
+        let path_package = PackageId::from_uuid(Uuid::now_v7());
+        let body_package = PackageId::from_uuid(Uuid::now_v7());
+        let input = ClaimPackageInput {
+            project_id,
+            package_id: body_package,
+            executor_id: ExecutorId::from_uuid(Uuid::now_v7()),
+            node_id: NodeId::from_uuid(Uuid::now_v7()),
+            lease_seconds: 60,
+            max_lease_seconds: 600,
+        };
+        let error = claim_package(
+            State(test_state(project_id)),
+            Path((project_id.to_string(), path_package.to_string())),
+            HeaderMap::new(),
+            Json(input),
+        )
+        .await
+        .expect_err("mismatched package id");
+        assert!(matches!(error, ApiError::PathBodyMismatch));
+    }
+
+    #[tokio::test]
+    async fn attempt_progress_handler_enforces_path_cas_and_returns_typed_state() {
+        let project_id = ProjectId::from_uuid(Uuid::from_bytes([1; 16]));
+        let attempt_id = AttemptId::from_uuid(Uuid::from_bytes([4; 16]));
+        let input = ReportAttemptProgressInput {
+            project_id,
+            attempt_id,
+            lease_id: LeaseId::from_uuid(Uuid::from_bytes([5; 16])),
+            node_id: NodeId::from_uuid(Uuid::from_bytes([8; 16])),
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            stage: AttemptProgressStage::Preparing,
+            evidence_digest: Sha256Digest::of_bytes(b"preparation-evidence"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IDEMPOTENCY_KEY,
+            "attempt-progress-1".parse().expect("header"),
+        );
+        headers.insert(header::IF_MATCH, "\"1\"".parse().expect("header"));
+        let Json(view) = report_attempt_progress(
+            State(test_state(project_id)),
+            Path((project_id.to_string(), attempt_id.to_string())),
+            headers,
+            Json(input.clone()),
+        )
+        .await
+        .expect("progress response");
+        assert_eq!(view.state, AttemptState::Preparing);
+        assert_eq!(view.version, AggregateVersion::new(3));
+
+        let error = report_attempt_progress(
+            State(test_state(project_id)),
+            Path((
+                project_id.to_string(),
+                AttemptId::from_uuid(Uuid::from_bytes([9; 16])).to_string(),
+            )),
+            HeaderMap::new(),
+            Json(input),
+        )
+        .await
+        .expect_err("path/body Attempt mismatch");
+        assert!(matches!(error, ApiError::PathBodyMismatch));
+    }
+
+    #[tokio::test]
+    async fn candidate_artifact_handlers_enforce_path_cas_and_no_content_chunk_contract() {
+        let project_id = ProjectId::from_uuid(Uuid::from_bytes([1; 16]));
+        let attempt_id = AttemptId::from_uuid(Uuid::from_bytes([4; 16]));
+        let lease_id = LeaseId::from_uuid(Uuid::from_bytes([5; 16]));
+        let node_id = NodeId::from_uuid(Uuid::from_bytes([8; 16]));
+        let content = vec![0, 1, 2, 3];
+        let digest = Sha256Digest::of_bytes(&content);
+        let init = InitCandidateArtifactInput {
+            project_id,
+            attempt_id,
+            lease_id,
+            node_id,
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            package_hash: Sha256Digest::of_bytes("package"),
+            base_commit: GitObjectId::new("1".repeat(40)).expect("base"),
+            candidate_commit: GitObjectId::new("2".repeat(40)).expect("candidate"),
+            tree_hash: GitObjectId::new("3".repeat(40)).expect("tree"),
+            author_evidence_digest: Sha256Digest::of_bytes("evidence"),
+            expected_bundle_digest: digest,
+            expected_bundle_size_bytes: 4,
+            chunk_digests: vec![digest],
+            upload_ttl_seconds: 60,
+        };
+        let (state, service) = test_state_with_service(project_id);
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY, "artifact-init".parse().expect("header"));
+        headers.insert(header::IF_MATCH, "\"2\"".parse().expect("header"));
+        let (status, Json(view)) = init_candidate_artifact(
+            State(state.clone()),
+            Path((project_id.to_string(), attempt_id.to_string())),
+            headers,
+            Json(init),
+        )
+        .await
+        .expect("init response");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(view.state, CandidateArtifactState::Uploading);
+
+        let chunk = UploadCandidateArtifactChunkInput {
+            project_id,
+            artifact_id: view.artifact_id,
+            lease_id,
+            node_id,
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            chunk_index: 0,
+            digest,
+            content,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY, "artifact-chunk-0".parse().expect("header"));
+        headers.insert(header::IF_MATCH, "\"1\"".parse().expect("header"));
+        assert_eq!(
+            upload_candidate_artifact_chunk(
+                State(state.clone()),
+                Path((
+                    project_id.to_string(),
+                    view.artifact_id.to_string(),
+                    "0".into()
+                )),
+                headers,
+                Json(chunk),
+            )
+            .await
+            .expect("chunk response"),
+            StatusCode::NO_CONTENT
+        );
+
+        let complete = CompleteCandidateArtifactInput {
+            project_id,
+            artifact_id: view.artifact_id,
+            lease_id,
+            node_id,
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            bundle_protocol_key: ProtocolKey::new("candidate-bundle").expect("key"),
+            bundle_uri: format!("artifact://candidate-artifacts/{}", view.artifact_id),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IDEMPOTENCY_KEY,
+            "artifact-complete".parse().expect("header"),
+        );
+        headers.insert(header::IF_MATCH, "\"1\"".parse().expect("header"));
+        let Json(completed) = complete_candidate_artifact(
+            State(state.clone()),
+            Path((project_id.to_string(), view.artifact_id.to_string())),
+            headers,
+            Json(complete),
+        )
+        .await
+        .expect("complete response");
+        assert_eq!(completed.state, CandidateArtifactState::Complete);
+
+        let record = RecordCandidateInput {
+            project_id,
+            attempt_id,
+            artifact_id: completed.artifact_id,
+            lease_id,
+            node_id,
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            branch: format!("refs/heads/agentforge/{}", completed.candidate_id),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY, "candidate-record".parse().expect("header"));
+        headers.insert(header::IF_MATCH, "\"9\"".parse().expect("header"));
+        let (status, Json(recorded)) = record_candidate(
+            State(state.clone()),
+            Path((project_id.to_string(), attempt_id.to_string())),
+            headers,
+            Json(record.clone()),
+        )
+        .await
+        .expect("record Candidate response");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(recorded.candidate_id, completed.candidate_id);
+        assert_eq!(recorded.verification_state, VerificationRunState::Queued);
+        assert_eq!(recorded.attempt_version, AggregateVersion::new(10));
+
+        let error = record_candidate(
+            State(state),
+            Path((
+                project_id.to_string(),
+                AttemptId::from_uuid(Uuid::from_bytes([9; 16])).to_string(),
+            )),
+            HeaderMap::new(),
+            Json(record),
+        )
+        .await
+        .expect_err("path/body Attempt mismatch must fail before dispatch");
+        assert!(matches!(error, ApiError::PathBodyMismatch));
+        assert_eq!(
+            *service
+                .artifact_commands
+                .lock()
+                .expect("artifact command lock"),
+            ["init", "chunk", "complete", "record"]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_chunk_rejects_path_body_index_mismatch_before_dispatch() {
+        let project_id = ProjectId::from_uuid(Uuid::from_bytes([1; 16]));
+        let artifact_id = CandidateArtifactId::from_uuid(Uuid::from_bytes([20; 16]));
+        let (state, service) = test_state_with_service(project_id);
+        let input = UploadCandidateArtifactChunkInput {
+            project_id,
+            artifact_id,
+            lease_id: LeaseId::from_uuid(Uuid::from_bytes([5; 16])),
+            node_id: NodeId::from_uuid(Uuid::from_bytes([8; 16])),
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            chunk_index: 0,
+            digest: Sha256Digest::of_bytes("chunk"),
+            content: b"chunk".to_vec(),
+        };
+        let error = upload_candidate_artifact_chunk(
+            State(state),
+            Path((project_id.to_string(), artifact_id.to_string(), "1".into())),
+            HeaderMap::new(),
+            Json(input),
+        )
+        .await
+        .expect_err("mismatched chunk index");
+        assert!(matches!(error, ApiError::PathBodyMismatch));
+        assert!(
+            service
+                .artifact_commands
+                .lock()
+                .expect("artifact command lock")
+                .is_empty()
+        );
+    }
+}

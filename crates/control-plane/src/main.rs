@@ -1,9 +1,11 @@
-use std::{collections::BTreeSet, net::SocketAddr, str::FromStr};
+use std::{collections::BTreeSet, net::SocketAddr, str::FromStr, sync::Arc};
 
+use agentforge_application::{MvpControlPlane, ReconcileExpiredLeasesQuery};
 use agentforge_control_plane::ui::{ControlPlaneState, CursorCodec, router};
 use agentforge_domain::ProjectId;
+use agentforge_storage_postgres::PostgresMvpControlPlane;
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -27,16 +29,93 @@ async fn main() -> Result<()> {
         &std::env::var("AGENTFORGE_LOCAL_PROJECT_IDS")
             .context("AGENTFORGE_LOCAL_PROJECT_IDS must contain comma-separated Project UUIDs")?,
     )?;
-    let (state, _local_store) =
-        ControlPlaneState::local_reference(CursorCodec::from_hex(&cursor_key)?, allowed_projects)?;
+    let (state, _local_store) = ControlPlaneState::local_reference(
+        CursorCodec::from_hex(&cursor_key)?,
+        allowed_projects.clone(),
+    )?;
+    let database_url = std::env::var("AGENTFORGE_DATABASE_URL")
+        .context("AGENTFORGE_DATABASE_URL must point to the local/private PostgreSQL instance")?;
+    let database_schema =
+        std::env::var("AGENTFORGE_DATABASE_SCHEMA").unwrap_or_else(|_| "public".to_owned());
+    let commands = PostgresMvpControlPlane::new_local_no_tls(database_url, database_schema)
+        .context("configure the PostgreSQL MVP command service")?;
+    let reconcile_interval = bounded_env_u64("AGENTFORGE_LEASE_RECONCILE_SECONDS", 5, 1, 300)?;
+    let reconcile_batch = u16::try_from(bounded_env_u64(
+        "AGENTFORGE_LEASE_RECONCILE_BATCH",
+        100,
+        1,
+        1_000,
+    )?)
+    .expect("bounded batch fits u16");
+    let reconciliation_task = tokio::spawn(reconcile_expired_leases(
+        commands.clone(),
+        allowed_projects,
+        std::time::Duration::from_secs(reconcile_interval),
+        reconcile_batch,
+    ));
+    let state = state.with_commands(Arc::new(commands));
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .context("bind AgentForge control plane")?;
     info!(%address, "AgentForge control plane listening");
-    axum::serve(listener, router(state))
+    let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("serve AgentForge control plane")
+        .context("serve AgentForge control plane");
+    reconciliation_task.abort();
+    let _ = reconciliation_task.await;
+    result
+}
+
+async fn reconcile_expired_leases(
+    commands: PostgresMvpControlPlane,
+    projects: BTreeSet<ProjectId>,
+    interval: std::time::Duration,
+    batch: u16,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        for project_id in &projects {
+            match commands
+                .reconcile_expired_leases(ReconcileExpiredLeasesQuery {
+                    project_id: *project_id,
+                    limit: batch,
+                })
+                .await
+            {
+                Ok(report) if report.expired != 0 || report.conflicted != 0 => info!(
+                    project_id = %report.project_id,
+                    scanned = report.scanned,
+                    expired = report.expired,
+                    conflicted = report.conflicted,
+                    "Lease expiry reconciliation completed"
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(
+                    project_id = %project_id,
+                    code = error.code(),
+                    "Lease expiry reconciliation failed"
+                ),
+            }
+        }
+    }
+}
+
+fn bounded_env_u64(name: &'static str, default: u64, min: u64, max: u64) -> Result<u64> {
+    let value = match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("parse {name} as an integer"))?,
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => return Err(error).with_context(|| format!("read {name}")),
+    };
+    anyhow::ensure!(
+        (min..=max).contains(&value),
+        "{name} must be between {min} and {max}"
+    );
+    Ok(value)
 }
 
 fn parse_allowed_projects(value: &str) -> Result<BTreeSet<ProjectId>> {
@@ -76,7 +155,7 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_allowed_projects;
+    use super::{bounded_env_u64, parse_allowed_projects};
 
     #[test]
     fn local_project_allowlist_is_nonempty_typed_and_deduplicated() {
@@ -87,5 +166,13 @@ mod tests {
         assert_eq!(projects.len(), 2);
         assert!(parse_allowed_projects("").is_err());
         assert!(parse_allowed_projects("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn reconciliation_defaults_are_bounded() {
+        assert_eq!(
+            bounded_env_u64("AGENTFORGE_TEST_UNSET_RECONCILE", 5, 1, 300).expect("bounded default"),
+            5
+        );
     }
 }

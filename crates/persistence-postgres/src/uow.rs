@@ -128,7 +128,7 @@ pub struct PostgresUnitOfWork {
 }
 
 impl PostgresUnitOfWork {
-    fn client(&self) -> PortResult<&Client> {
+    pub(crate) fn client(&self) -> PortResult<&Client> {
         self.client.as_ref().ok_or(PortError::Integrity)
     }
 
@@ -1072,6 +1072,13 @@ fn aggregate_uuid(kind: AggregateType, id: AggregateId) -> PortResult<Uuid> {
         (AggregateType::WorkPackage, AggregateId::WorkPackage(value)) => Ok(value.into_uuid()),
         (AggregateType::Attempt, AggregateId::Attempt(value)) => Ok(value.into_uuid()),
         (AggregateType::Lease, AggregateId::Lease(value)) => Ok(value.into_uuid()),
+        (AggregateType::CandidateArtifact, AggregateId::CandidateArtifact(value)) => {
+            Ok(value.into_uuid())
+        }
+        (AggregateType::Candidate, AggregateId::Candidate(value)) => Ok(value.into_uuid()),
+        (AggregateType::VerificationRun, AggregateId::VerificationRun(value)) => {
+            Ok(value.into_uuid())
+        }
         (AggregateType::Submission, AggregateId::Submission(value)) => Ok(value.into_uuid()),
         (AggregateType::RunSignal, AggregateId::RunSignal(value)) => Ok(value.into_uuid()),
         (AggregateType::InvocationIntent, AggregateId::InvocationIntent(value)) => {
@@ -1101,6 +1108,9 @@ const fn aggregate_type_label(kind: AggregateType) -> &'static str {
         AggregateType::WorkPackage => "WORK_PACKAGE",
         AggregateType::Attempt => "ATTEMPT",
         AggregateType::Lease => "LEASE",
+        AggregateType::CandidateArtifact => "CANDIDATE_ARTIFACT",
+        AggregateType::Candidate => "CANDIDATE",
+        AggregateType::VerificationRun => "VERIFICATION_RUN",
         AggregateType::Submission => "SUBMISSION",
         AggregateType::RunSignal => "RUN_SIGNAL",
         AggregateType::InvocationIntent => "INVOCATION_INTENT",
@@ -1164,7 +1174,7 @@ where
     row.try_get(index).map_err(|_| PortError::Integrity)
 }
 
-fn map_database_error(error: tokio_postgres::Error) -> PortError {
+pub(crate) fn map_database_error(error: tokio_postgres::Error) -> PortError {
     match error.as_db_error().map(|error| error.code()) {
         Some(&SqlState::UNIQUE_VIOLATION)
         | Some(&SqlState::T_R_SERIALIZATION_FAILURE)

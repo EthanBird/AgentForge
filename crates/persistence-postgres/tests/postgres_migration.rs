@@ -266,7 +266,7 @@ async fn exercise_uow_upgrade(client: &mut Client) -> Result<()> {
 }
 
 async fn exercise_migrations(client: &mut Client) -> Result<()> {
-    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3, 4]);
+    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3, 4, 5, 6, 7]);
     assert!(migration::migrate(client).await?.is_empty());
 
     let installed: Vec<String> = client
@@ -283,7 +283,11 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         "agentforge_schema_migrations",
         "aggregate_event_heads",
         "attempts",
+        "attempt_progress",
         "budget_reservations",
+        "candidate_artifact_chunks",
+        "candidate_artifacts",
+        "candidates",
         "command_receipts",
         "domain_events",
         "governance_cases",
@@ -300,6 +304,7 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         "run_claims",
         "run_signals",
         "session_capsules",
+        "verification_runs",
         "work_packages",
     ] {
         assert!(
@@ -317,7 +322,7 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
 
     let required_indexes: i64 = client
         .query_one(
@@ -329,15 +334,185 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
                'governance_cases_inbox_idx',\
                'governance_execution_claims_one_active_idx',\
                'policy_revisions_one_active_idx',\
-               'projection_changes_resume_idx'\
+               'projection_changes_resume_idx',\
+               'candidate_artifacts_upload_idx',\
+               'verification_runs_queue_idx'\
              )",
             &[],
         )
         .await?
         .get(0);
-    assert_eq!(required_indexes, 7);
+    assert_eq!(required_indexes, 9);
     exercise_negative_contracts(client).await?;
+    exercise_candidate_first_contracts(client).await?;
     exercise_migration_prefix_rejection(client).await?;
+    Ok(())
+}
+
+async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
+    let project = Uuid::now_v7();
+    let package = Uuid::now_v7();
+    let revision = Uuid::now_v7();
+    let attempt = Uuid::now_v7();
+    let lease = Uuid::now_v7();
+    let artifact = Uuid::now_v7();
+    let candidate = Uuid::now_v7();
+    let verification_run = Uuid::now_v7();
+    let verification_obligation = Uuid::now_v7();
+    let executor = Uuid::now_v7();
+    let node = Uuid::now_v7();
+    let bundle_bytes = "decode('62756e646c652d6279746573','hex')";
+
+    client
+        .batch_execute(&format!(
+            r#"
+            INSERT INTO projects (id, protocol_key, name, state)
+            VALUES ('{project}', 'candidate-project-{project}', 'Candidate Project', 'ACTIVE');
+            INSERT INTO work_packages (id, project_id, protocol_key, state, max_attempts)
+            VALUES ('{package}', '{project}', 'candidate-package-{package}', 'ACTIVE', 3);
+            INSERT INTO package_revisions
+              (id, package_id, revision, schema_version, canonical_document, package_hash,
+               base_commit, git_object_format, input_snapshot, created_by)
+            VALUES
+              ('{revision}', '{package}', 1, '1', '{{}}', decode(repeat('11',32),'hex'),
+               repeat('a',40), 'sha1', '{{}}', '{executor}');
+            UPDATE work_packages SET selected_revision_id='{revision}' WHERE id='{package}';
+            INSERT INTO attempts
+              (id, protocol_key, package_id, revision_id, executor_id, node_id, state,
+               fencing_token, base_commit)
+            VALUES
+              ('{attempt}', 'candidate-attempt-{attempt}', '{package}', '{revision}',
+               '{executor}', '{node}', 'LOCAL_VERIFY', 1, repeat('a',40));
+            INSERT INTO leases
+              (id, protocol_key, package_id, revision_id, attempt_id, holder_node_id,
+               fencing_token, state, granted_at, expires_at, max_expires_at)
+            VALUES
+              ('{lease}', 'candidate-lease-{lease}', '{package}', '{revision}', '{attempt}',
+               '{node}', 1, 'ACTIVE', clock_timestamp() - interval '1 minute',
+               clock_timestamp() + interval '30 minutes',
+               clock_timestamp() + interval '1 hour');
+            UPDATE attempts SET lease_id='{lease}' WHERE id='{attempt}';
+            UPDATE work_packages SET active_attempt_id='{attempt}' WHERE id='{package}';
+
+            INSERT INTO candidate_artifacts
+              (id, reserved_candidate_id, project_id, attempt_id, package_id, revision_id,
+               package_hash, lease_id, fencing_token, base_commit, candidate_commit,
+               tree_hash, author_evidence_digest, expected_bundle_digest,
+               expected_bundle_size_bytes, expected_chunk_digests, state, version, event_seq,
+               created_at, expires_at, updated_at)
+            VALUES
+              ('{artifact}', '{candidate}', '{project}', '{attempt}', '{package}', '{revision}',
+               decode(repeat('11',32),'hex'), '{lease}', 1, repeat('a',40), repeat('b',40),
+               repeat('c',40), decode(repeat('22',32),'hex'), sha256({bundle_bytes}),
+               octet_length({bundle_bytes}), ARRAY[sha256({bundle_bytes})], 'UPLOADING', 1, 1,
+               transaction_timestamp() - interval '50 seconds',
+               clock_timestamp() + interval '10 minutes',
+               transaction_timestamp() - interval '50 seconds');
+            INSERT INTO candidate_artifact_chunks
+              (artifact_id, chunk_index, digest, size_bytes, content, received_at)
+            VALUES
+              ('{artifact}', 0, sha256({bundle_bytes}), octet_length({bundle_bytes}),
+               {bundle_bytes}, clock_timestamp() - interval '40 seconds');
+            UPDATE candidate_artifacts
+               SET state='ASSEMBLING', version=2, event_seq=2,
+                   updated_at=clock_timestamp() - interval '30 seconds'
+             WHERE id='{artifact}';
+            UPDATE candidate_artifacts
+               SET state='COMPLETE', bundle_protocol_key='candidate-bundle-1',
+                   bundle_uri='artifact://candidate-artifacts/bundle',
+                   bundle_digest=expected_bundle_digest,
+                   bundle_size_bytes=expected_bundle_size_bytes,
+                   completed_at=transaction_timestamp() - interval '20 seconds',
+                   version=3, event_seq=3,
+                   updated_at=transaction_timestamp() - interval '20 seconds'
+             WHERE id='{artifact}';
+            BEGIN;
+            INSERT INTO candidates
+              (id, project_id, attempt_id, package_id, revision_id, package_hash, lease_id,
+               fencing_token, base_commit, candidate_commit, tree_hash, branch,
+               author_evidence_digest, bundle_artifact_id, bundle_protocol_key, bundle_uri,
+               bundle_digest, sealed_at, version, event_seq)
+            SELECT reserved_candidate_id, project_id, attempt_id, package_id, revision_id,
+                   package_hash, lease_id, fencing_token, base_commit, candidate_commit,
+                   tree_hash, 'refs/heads/agentforge/candidate-fixture',
+                   author_evidence_digest, id, bundle_protocol_key, bundle_uri, bundle_digest,
+                   transaction_timestamp(), 1, 1
+              FROM candidate_artifacts WHERE id='{artifact}';
+            INSERT INTO verification_runs
+              (id, project_id, candidate_id, candidate_commit, state, queued_at, updated_at,
+               version, event_seq)
+            VALUES
+              ('{verification_run}', '{project}', '{candidate}', repeat('b',40), 'QUEUED',
+               transaction_timestamp(), transaction_timestamp(), 1, 1);
+            INSERT INTO obligations
+              (id, project_id, subject_type, subject_id, obligation_type, state, due_at,
+               max_attempts, fingerprint, payload, version, created_at, updated_at)
+            VALUES
+              ('{verification_obligation}', '{project}', 'VERIFICATION_RUN',
+               '{verification_run}', 'VERIFY_CANDIDATE', 'PENDING', transaction_timestamp(),
+               10, decode(repeat('44',32),'hex'),
+               '{{"candidate_id":"{candidate}","verification_run_id":"{verification_run}",
+                  "attempt_id":"{attempt}","artifact_id":"{artifact}",
+                  "candidate_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}', 1,
+               transaction_timestamp(), transaction_timestamp());
+            UPDATE attempts
+               SET state='CANDIDATE', candidate_commit=repeat('b',40), version=1, event_seq=1,
+                   updated_at=transaction_timestamp()
+             WHERE id='{attempt}';
+            UPDATE work_packages
+               SET state='VERIFYING', version=1, event_seq=1,
+                   updated_at=transaction_timestamp()
+             WHERE id='{package}';
+            UPDATE leases
+               SET state='RELEASED', version=1, event_seq=1,
+                   updated_at=transaction_timestamp()
+             WHERE id='{lease}';
+            INSERT INTO aggregate_event_heads
+              (project_id, aggregate_type, aggregate_id, aggregate_version, last_event_seq)
+            VALUES
+              ('{project}', 'CANDIDATE_ARTIFACT', '{artifact}', 3, 3),
+              ('{project}', 'CANDIDATE', '{candidate}', 1, 1),
+              ('{project}', 'VERIFICATION_RUN', '{verification_run}', 1, 1);
+            COMMIT;
+            "#
+        ))
+        .await
+        .context("install Candidate-first persistence fixture")?;
+
+    client
+        .execute(
+            "UPDATE candidate_artifacts
+             SET state='REJECTED', version=4, event_seq=4, updated_at=$2,
+                 bundle_protocol_key=NULL, bundle_uri=NULL, bundle_digest=NULL,
+                 bundle_size_bytes=NULL, completed_at=NULL
+             WHERE id=$1",
+            &[&artifact, &time::OffsetDateTime::now_utc()],
+        )
+        .await
+        .expect_err("a COMPLETE Candidate Artifact must be immutable");
+    client
+        .execute(
+            "UPDATE candidates SET branch='refs/heads/agentforge/changed' WHERE id=$1",
+            &[&candidate],
+        )
+        .await
+        .expect_err("a sealed Candidate must be immutable");
+    client
+        .execute(
+            "UPDATE verification_runs
+             SET state='PASS', terminal_stage='REPRODUCING', terminal_stage_result_id=$2,
+                 reviewed_head=candidate_commit, tested_head=candidate_commit,
+                 evidence_digest=decode(repeat('33',32),'hex'), terminalized_at=$3,
+                 updated_at=$3, version=2, event_seq=2
+             WHERE id=$1",
+            &[
+                &verification_run,
+                &Uuid::now_v7(),
+                &time::OffsetDateTime::now_utc(),
+            ],
+        )
+        .await
+        .expect_err("verification cannot skip directly from QUEUED to PASS");
     Ok(())
 }
 

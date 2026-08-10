@@ -21,10 +21,11 @@ pub use event::{
 };
 pub use ids::*;
 pub use state::{
-    Attempt, BudgetReservation, Decision, GovernanceCase, InvocationIntent, InvocationRun, Lease,
-    PolicyRevision, RunClaim, RunSignal, SessionCapsule, Submission, Transition, WorkPackage,
-    attempt, budget, governance, invocation, lease, policy, run_claim, run_signal, session,
-    submission, work_package,
+    Attempt, BudgetReservation, Candidate, CandidateArtifact, CandidateArtifactState, Decision,
+    GovernanceCase, InvocationIntent, InvocationRun, Lease, PolicyRevision, RunClaim, RunSignal,
+    SessionCapsule, Submission, Transition, VerificationRun, WorkPackage, attempt, budget,
+    candidate, governance, invocation, lease, policy, run_claim, run_signal, session, submission,
+    work_package,
 };
 
 /// Package name used by dependency-boundary tests.

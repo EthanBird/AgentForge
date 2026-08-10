@@ -133,6 +133,10 @@ pub fn check_receipt<'a, R>(
 // here to provide a single discoverable command surface.
 pub use crate::state::attempt::{AttemptCommand, AttemptCommandKind};
 pub use crate::state::budget::{BudgetReservationCommand, BudgetReservationCommandKind};
+pub use crate::state::candidate::{
+    CandidateArtifactCommand, CandidateArtifactCommandKind, CandidateCommandKind,
+    VerificationRunCommand, VerificationRunCommandKind,
+};
 pub use crate::state::governance::{
     DecisionCommand, DecisionCommandKind, GovernanceCaseCommand, GovernanceCaseCommandKind,
 };

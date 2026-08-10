@@ -1,11 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use agentforge_application::{
+    ClaimPackageInput, CreateProjectInput, ListOffersQuery, MvpCommand as CommandEnvelope,
+    MvpControlPlane, PublishPackageInput, ReconcileExpiredLeasesQuery, ReleaseLeaseInput,
+    RenewLeaseInput,
+};
+use agentforge_domain::{LeaseId, ProjectId};
 use agentforge_protocol::{
     lint_candidate_ready, lint_publish, lint_work_graph_json, package_hash, schema,
 };
+use agentforge_storage_postgres::PostgresMvpControlPlane;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Parser)]
 #[command(name = "af-cli", version, about = "AgentForge protocol utility")]
@@ -35,6 +43,17 @@ enum Command {
     Graph {
         #[command(subcommand)]
         command: GraphCommand,
+    },
+    /// Execute the local MVP command surface directly against PostgreSQL.
+    Mvp {
+        /// Loopback PostgreSQL connection string; defaults to AGENTFORGE_DATABASE_URL.
+        #[arg(long)]
+        database_url: Option<String>,
+        /// Trusted PostgreSQL schema containing AgentForge migrations.
+        #[arg(long, default_value = "public")]
+        database_schema: String,
+        #[command(subcommand)]
+        command: MvpAdminCommand,
     },
 }
 
@@ -82,6 +101,37 @@ enum GraphCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum MvpAdminCommand {
+    /// Create a Project from a versioned command-envelope JSON file.
+    ProjectCreate { request: PathBuf },
+    /// Publish a typed Work Package from a command-envelope JSON file.
+    PackagePublish { request: PathBuf },
+    /// List claimable Offers for a Project.
+    Offers {
+        project_id: ProjectId,
+        #[arg(long, default_value_t = 50)]
+        limit: u16,
+    },
+    /// Atomically Claim one Package and create its Attempt and Lease.
+    PackageClaim { request: PathBuf },
+    /// Read a Lease by Project and Lease ID.
+    LeaseGet {
+        project_id: ProjectId,
+        lease_id: LeaseId,
+    },
+    /// Renew a Lease from a command-envelope JSON file.
+    LeaseRenew { request: PathBuf },
+    /// Release a Lease from a command-envelope JSON file.
+    LeaseRelease { request: PathBuf },
+    /// Reconcile a bounded batch of database-clock-expired Leases.
+    LeaseReconcileExpired {
+        project_id: ProjectId,
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+    },
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Profile {
     Publish,
@@ -92,7 +142,8 @@ enum SubmissionProfile {
     CandidateReady,
 }
 
-fn main() -> Result<ExitCode> {
+#[tokio::main]
+async fn main() -> Result<ExitCode> {
     match Cli::parse().command {
         Command::Schema {
             command: SchemaCommand::List,
@@ -147,9 +198,82 @@ fn main() -> Result<ExitCode> {
                 ExitCode::FAILURE
             })
         }
+        Command::Mvp {
+            database_url,
+            database_schema,
+            command,
+        } => {
+            let database_url = database_url
+                .or_else(|| std::env::var("AGENTFORGE_DATABASE_URL").ok())
+                .context(
+                    "--database-url or AGENTFORGE_DATABASE_URL is required for MVP commands",
+                )?;
+            let control = PostgresMvpControlPlane::new_local_no_tls(database_url, database_schema)
+                .context("configure PostgreSQL MVP command adapter")?;
+            match command {
+                MvpAdminCommand::ProjectCreate { request } => {
+                    let command = read_json::<CommandEnvelope<CreateProjectInput>>(&request)?;
+                    print_json(&control.create_project(&command).await?)?;
+                }
+                MvpAdminCommand::PackagePublish { request } => {
+                    let command = read_json::<CommandEnvelope<PublishPackageInput>>(&request)?;
+                    print_json(&control.publish_package(&command).await?)?;
+                }
+                MvpAdminCommand::Offers { project_id, limit } => {
+                    print_json(
+                        &control
+                            .list_offers(ListOffersQuery { project_id, limit })
+                            .await?,
+                    )?;
+                }
+                MvpAdminCommand::PackageClaim { request } => {
+                    let command = read_json::<CommandEnvelope<ClaimPackageInput>>(&request)?;
+                    print_json(&control.claim_package(&command).await?)?;
+                }
+                MvpAdminCommand::LeaseGet {
+                    project_id,
+                    lease_id,
+                } => {
+                    print_json(&control.get_lease(project_id, lease_id).await?)?;
+                }
+                MvpAdminCommand::LeaseRenew { request } => {
+                    let command = read_json::<CommandEnvelope<RenewLeaseInput>>(&request)?;
+                    print_json(&control.renew_lease(&command).await?)?;
+                }
+                MvpAdminCommand::LeaseRelease { request } => {
+                    let command = read_json::<CommandEnvelope<ReleaseLeaseInput>>(&request)?;
+                    print_json(&control.release_lease(&command).await?)?;
+                }
+                MvpAdminCommand::LeaseReconcileExpired { project_id, limit } => {
+                    print_json(
+                        &control
+                            .reconcile_expired_leases(ReconcileExpiredLeasesQuery {
+                                project_id,
+                                limit,
+                            })
+                            .await?,
+                    )?;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    serde_json::from_slice(&read(path)?).with_context(|| {
+        format!(
+            "failed to decode strict command JSON from {}",
+            path.display()
+        )
+    })
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }

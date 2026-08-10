@@ -56,7 +56,7 @@ async fn transactional_uow_phase1_contract() -> Result<()> {
 }
 
 async fn exercise_uow(admin: &mut Client, database_url: &str, schema: &str) -> Result<()> {
-    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4]);
+    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4, 5, 6, 7]);
     let factory = LocalNoTlsPostgresUnitOfWorkFactory::new_local_no_tls(database_url, schema)?;
     let project_id = ProjectId::from_uuid(Uuid::now_v7());
     admin
