@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use agentforge_application::{
     ClaimPackageInput, CreateProjectInput, ListOffersQuery, MvpCommand, MvpCommandContext,
-    MvpControlPlane, PublishPackageInput, ReleaseLeaseInput, RenewLeaseInput,
+    MvpControlPlane, PublishPackageInput, ReconcileExpiredLeasesQuery, ReleaseLeaseInput,
+    RenewLeaseInput,
 };
 use agentforge_domain::{
     ActorId, AggregateVersion, CommandId, CorrelationId, ExecutorId, GitObjectId, IdempotencyKey,
@@ -63,6 +64,31 @@ async fn exercise_mvp(
         database_url,
         schema,
     )?);
+    assert!(
+        control.ready().await?,
+        "migrated typed schema must be ready"
+    );
+    let current = migration::MIGRATIONS.last().expect("MVP migration");
+    admin
+        .execute(
+            "UPDATE agentforge_schema_migrations SET source_digest = $1 WHERE version = $2",
+            &[
+                &format!("sha256:{}", "0".repeat(64)),
+                &i32::try_from(current.version)?,
+            ],
+        )
+        .await?;
+    assert!(
+        !control.ready().await?,
+        "migration digest drift must fail readiness"
+    );
+    admin
+        .execute(
+            "UPDATE agentforge_schema_migrations SET source_digest = $1 WHERE version = $2",
+            &[&current.digest(), &i32::try_from(current.version)?],
+        )
+        .await?;
+    assert!(control.ready().await?, "restored manifest must be ready");
 
     let project_id = ProjectId::from_uuid(Uuid::now_v7());
     let project_command = MvpCommand {
@@ -228,6 +254,72 @@ async fn exercise_mvp(
         "AF_TRANSITION_INVALID"
     );
 
+    let reoffers = control
+        .list_offers(ListOffersQuery {
+            project_id,
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(reoffers.len(), 1);
+    assert_eq!(reoffers[0].package_id, package_id);
+    let second_claim_command = MvpCommand {
+        context: context("claim-after-release", Some(reoffers[0].version)),
+        input: ClaimPackageInput {
+            project_id,
+            package_id,
+            executor_id: ExecutorId::from_uuid(Uuid::now_v7()),
+            node_id: NodeId::from_uuid(Uuid::now_v7()),
+            lease_seconds: 5,
+            max_lease_seconds: 60,
+        },
+    };
+    let second_claim = control.claim_package(&second_claim_command).await?;
+    assert_eq!(second_claim.fencing_token.get(), 2);
+    assert_ne!(second_claim.attempt_id, claimed.attempt_id);
+    assert_ne!(second_claim.lease_id, claimed.lease_id);
+    admin.query_one("SELECT pg_sleep(5.2)", &[]).await?;
+    let expiry = control
+        .reconcile_expired_leases(ReconcileExpiredLeasesQuery {
+            project_id,
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(expiry.scanned, 1);
+    assert_eq!(expiry.expired, 1);
+    assert_eq!(expiry.conflicted, 0);
+    assert_eq!(
+        control
+            .reconcile_expired_leases(ReconcileExpiredLeasesQuery {
+                project_id,
+                limit: 10,
+            })
+            .await?
+            .scanned,
+        0
+    );
+
+    let after_expiry = control
+        .list_offers(ListOffersQuery {
+            project_id,
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(after_expiry.len(), 1);
+    let third_claim = control
+        .claim_package(&MvpCommand {
+            context: context("claim-after-expiry", Some(after_expiry[0].version)),
+            input: ClaimPackageInput {
+                project_id,
+                package_id,
+                executor_id: ExecutorId::from_uuid(Uuid::now_v7()),
+                node_id: NodeId::from_uuid(Uuid::now_v7()),
+                lease_seconds: 60,
+                max_lease_seconds: 600,
+            },
+        })
+        .await?;
+    assert_eq!(third_claim.fencing_token.get(), 3);
+
     let row = admin
         .query_one(
             "SELECT \
@@ -236,16 +328,20 @@ async fn exercise_mvp(
                (SELECT count(*) FROM leases WHERE package_id=$1 AND state='ACTIVE'), \
                (SELECT count(*) FROM domain_events WHERE project_id=$2), \
                (SELECT count(*) FROM outbox_messages WHERE project_id=$2), \
-               (SELECT count(*) FROM command_receipts WHERE project_id=$2)",
+               (SELECT count(*) FROM command_receipts WHERE project_id=$2), \
+               (SELECT count(*) FROM attempts WHERE package_id=$1 AND state='LOST'), \
+               (SELECT next_fencing_token FROM work_packages WHERE id=$1)",
             &[package_id.as_uuid(), project_id.as_uuid()],
         )
         .await?;
-    assert_eq!(row.get::<_, i64>(0), 1);
-    assert_eq!(row.get::<_, i64>(1), 1);
-    assert_eq!(row.get::<_, i64>(2), 0);
-    assert_eq!(row.get::<_, i64>(3), 7);
-    assert_eq!(row.get::<_, i64>(4), 7);
-    assert_eq!(row.get::<_, i64>(5), 5);
+    assert_eq!(row.get::<_, i64>(0), 3);
+    assert_eq!(row.get::<_, i64>(1), 3);
+    assert_eq!(row.get::<_, i64>(2), 1);
+    assert_eq!(row.get::<_, i64>(3), 18);
+    assert_eq!(row.get::<_, i64>(4), 18);
+    assert_eq!(row.get::<_, i64>(5), 8);
+    assert_eq!(row.get::<_, i64>(6), 2);
+    assert_eq!(row.get::<_, i64>(7), 3);
     Ok(())
 }
 

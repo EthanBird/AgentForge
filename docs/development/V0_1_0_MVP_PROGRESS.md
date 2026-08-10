@@ -41,13 +41,13 @@ cargo fmt --all -- --check                                  PASS
 git diff --check                                             PASS
 ```
 
-限制与下一步：
+检查点 A 当时的限制（已由 Checkpoint B 关闭）：
 
 - 当前机器没有 PostgreSQL/docker；真实事务与并发断言的权威证据为上述 PostgreSQL 17 CI；
-- HTTP `/api/v1`、管理 CLI、Lease expiry/reconciliation 以及 Worker Attempt 进度命令尚未完成；
-- Release 当前只终结 Lease；在 Checkpoint B 中必须加入 typed reconciliation，使仍为 ACTIVE 的
-  WorkPackage/Attempt 收敛到 `REWORK_READY`/`LOST`，不得把该中间状态当作 MVP 完成态；
-- Checkpoint B 完成后再宣布 MVP-01 退出条件通过。
+- HTTP `/api/v1`、管理 CLI 与 Lease expiry/reconciliation 当时尚未完成；
+- Release 当时只终结 Lease，尚未把 ACTIVE WorkPackage/Attempt 收敛到
+  `REWORK_READY`/`LOST`。这两项现已由 Checkpoint B 的实现关闭；
+- Worker Attempt 进度命令仍属于 MVP-02。
 
 ## MVP-01 / Checkpoint B：HTTP、管理 CLI 与 Lease 收敛
 
@@ -60,6 +60,11 @@ git diff --check                                             PASS
 - 稳定且不泄露内部细节的 HTTP 错误 envelope；
 - `af-cli mvp` 等价管理命令，直接使用同一 application port 与 PostgreSQL adapter；
 - control-plane 启动时显式装配 typed PostgreSQL command service。
+- 主动 Release 在一个事务内把 Lease/Attempt/WorkPackage 收敛为
+  `RELEASED`/`LOST`/`REWORK_READY`，随后可用更高 fencing generation 再次 Claim；
+- 基于 PostgreSQL 时钟的有界 expiry sweeper 复用同一跨聚合事务路径，并提供 CLI 手动触发入口。
+- `/readyz` 同时核验投影源和命令数据库；数据库检查覆盖迁移版本、名称、源码摘要及 MVP 所需
+  typed tables，不能以单纯 TCP/`SELECT 1` 冒充就绪。
 
-本检查点剩余：HTTP handler 合同测试、Lease expiry/release reconciliation、API/CLI 使用说明和完整
-workspace 门禁。
+HTTP handler 合同测试、API/CLI 使用说明和本地完整 workspace 门禁已通过。剩余：远端 PostgreSQL
+17 对 Release→re-Claim、Expire→re-Claim 和数据库 readiness 的真实合同。

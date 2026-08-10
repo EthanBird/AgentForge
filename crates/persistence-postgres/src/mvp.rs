@@ -2,16 +2,16 @@
 
 use agentforge_application::{
     ClaimPackageInput, ClaimedWork, CreateProjectInput, EventAppendPort, EventRecord, Isolation,
-    LeaseView, ListOffersQuery, MvpCommand, MvpControlPlane, MvpError, MvpFuture, MvpResult,
-    OfferView, ProjectView, PublishPackageInput, PublishedPackage, ReleaseLeaseInput,
-    RenewLeaseInput, UnitOfWork, UnitOfWorkFactory,
+    LeaseReconciliationReport, LeaseView, ListOffersQuery, MvpCommand, MvpControlPlane, MvpError,
+    MvpFuture, MvpResult, OfferView, ProjectView, PublishPackageInput, PublishedPackage,
+    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, UnitOfWork, UnitOfWorkFactory,
 };
 use agentforge_domain::{
-    AggregateId, AggregateVersion, Attempt, AttemptId, CommandMetadata, CommandReceipt,
-    DomainEventEnvelope, EventContext, EventId, FencingToken, GitObjectId, IdempotencyScope, Lease,
-    LeaseId, PackageRevision, PackageRevisionId, ProjectId, ProtocolKey, ServerInstant,
-    Sha256Digest, WorkPackage,
-    attempt::{AttemptCommand, NewAttempt},
+    ActorId, AggregateId, AggregateVersion, Attempt, AttemptId, CommandId, CommandMetadata,
+    CommandReceipt, CorrelationId, DomainEventEnvelope, EventContext, EventId, FencingToken,
+    GitObjectId, IdempotencyKey, IdempotencyScope, Lease, LeaseId, PackageRevision,
+    PackageRevisionId, ProjectId, ProtocolKey, ServerInstant, Sha256Digest, WorkPackage,
+    attempt::{AttemptCommand, AttemptState, NewAttempt, WakeCondition},
     command::ReceiptDecision,
     lease::{GrantLease, LeaseCommand, LeaseState},
     work_package::{
@@ -24,6 +24,7 @@ use time::Duration;
 use tokio_postgres::{Row, types::Json};
 use uuid::Uuid;
 
+use crate::migration::MIGRATIONS;
 use crate::uow::{
     CommandReceiptLookup, LocalNoTlsPostgresUnitOfWorkFactory, OutboxMessage, OutboxMessageId,
     PostgresUnitOfWork, map_database_error,
@@ -32,6 +33,35 @@ use crate::uow::{
 const RECEIPT_REPLAY_HOURS: i64 = 24;
 const EVENT_SCHEMA_VERSION: u16 = 1;
 const DOMAIN_EVENT_TOPIC: &str = "agentforge.domain.v1";
+
+#[derive(Clone, Copy, Debug)]
+enum LeaseTermination {
+    Release {
+        holder_node_id: agentforge_domain::NodeId,
+        fencing_token: FencingToken,
+    },
+    Expire,
+}
+
+impl LeaseTermination {
+    fn command(self, expected_version: AggregateVersion, now: ServerInstant) -> LeaseCommand {
+        match self {
+            Self::Release {
+                holder_node_id,
+                fencing_token,
+            } => LeaseCommand::ReleaseLease {
+                expected_version,
+                holder_node_id,
+                fencing_token,
+                now,
+            },
+            Self::Expire => LeaseCommand::ExpireLease {
+                expected_version,
+                now,
+            },
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct PostgresMvpControlPlane {
@@ -49,6 +79,64 @@ impl PostgresMvpControlPlane {
                 trusted_schema,
             )?,
         })
+    }
+
+    async fn ready_inner(&self) -> MvpResult<bool> {
+        let uow = self.factory.begin(Isolation::ReadCommitted).await?;
+        let result = async {
+            let rows = uow
+                .client()?
+                .query(
+                    "SELECT version, name, source_digest \
+                     FROM agentforge_schema_migrations ORDER BY version",
+                    &[],
+                )
+                .await
+                .map_err(map_database_error)?;
+            if rows.len() != MIGRATIONS.len() {
+                return Ok(false);
+            }
+            for (row, expected) in rows.iter().zip(MIGRATIONS) {
+                let version: i32 = row
+                    .try_get(0)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?;
+                let name: String = row
+                    .try_get(1)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?;
+                let digest: String = row
+                    .try_get(2)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?;
+                if u32::try_from(version).ok() != Some(expected.version)
+                    || name != expected.name
+                    || digest != expected.digest()
+                {
+                    return Ok(false);
+                }
+            }
+
+            let row = uow
+                .client()?
+                .query_one(
+                    "SELECT ARRAY[
+                       to_regclass('projects'),
+                       to_regclass('work_packages'),
+                       to_regclass('attempts'),
+                       to_regclass('leases'),
+                       to_regclass('domain_events'),
+                       to_regclass('outbox_messages'),
+                       to_regclass('command_receipts')
+                     ]::text[]",
+                    &[],
+                )
+                .await
+                .map_err(map_database_error)?;
+            let required_tables: Vec<Option<String>> = row
+                .try_get(0)
+                .map_err(|_| agentforge_application::PortError::Integrity)?;
+            Ok(required_tables.len() == 7 && required_tables.iter().all(Option::is_some))
+        }
+        .await;
+        finish(uow, result).await
     }
 
     async fn create_project_inner(
@@ -261,7 +349,7 @@ impl PostgresMvpControlPlane {
             }
 
             let loaded =
-                load_claimable_package(&uow, command.input.project_id, command.input.package_id)
+                load_package_for_update(&uow, command.input.project_id, command.input.package_id)
                     .await?;
             metadata.require_version(loaded.package.version)?;
 
@@ -446,19 +534,141 @@ impl PostgresMvpControlPlane {
         &self,
         command: &MvpCommand<ReleaseLeaseInput>,
     ) -> MvpResult<LeaseView> {
-        self.mutate_lease(
+        let metadata = command.context.metadata(&command.input)?;
+        self.terminate_lease_inner(
             command.input.project_id,
             command.input.lease_id,
             "lease.release",
-            command.context.metadata(&command.input)?,
-            |_lease, now, expected_version| LeaseCommand::ReleaseLease {
-                expected_version,
+            metadata,
+            LeaseTermination::Release {
                 holder_node_id: command.input.node_id,
                 fencing_token: command.input.fencing_token,
-                now,
             },
         )
         .await
+    }
+
+    async fn terminate_lease_inner(
+        &self,
+        project_id: ProjectId,
+        lease_id: LeaseId,
+        command_type: &'static str,
+        metadata: CommandMetadata,
+        termination: LeaseTermination,
+    ) -> MvpResult<LeaseView> {
+        let scope = scope(project_id, command_type, &metadata)?;
+        let mut uow = self.factory.begin(Isolation::Serializable).await?;
+        let result = async {
+            if let Some(response) = replay::<LeaseView>(&mut uow, &scope, &metadata).await? {
+                return Ok(response);
+            }
+
+            // The preliminary read acquires no row lock. Lease bindings are
+            // immutable, so it is safe to use them to acquire the canonical
+            // Package -> Attempt -> Lease lock order below.
+            let preview = load_lease(&uow, project_id, lease_id, false).await?;
+            let package =
+                load_package_for_update(&uow, project_id, preview.lease.package_id).await?;
+            let attempt =
+                load_attempt_for_update(&uow, preview.lease.package_id, preview.lease.attempt_id)
+                    .await?;
+            let loaded = load_lease(&uow, project_id, lease_id, true).await?;
+            let now = uow.server_now().await?;
+            let lease_transition = Lease::transition(
+                Some(&loaded.lease),
+                &termination.command(required_expected_version(&metadata)?, now),
+            )?;
+            validate_active_work_binding(&package.package, &attempt.attempt, &loaded.lease)?;
+            let attempt_transition = attempt.attempt.transition(&AttemptCommand::MarkLost {
+                expected_version: attempt.attempt.version,
+            })?;
+            let package_transition =
+                package
+                    .package
+                    .transition(&WorkPackageCommand::LoseAttempt {
+                        expected_version: package.package.version,
+                        attempt_id: attempt.attempt.id,
+                        recoverable: true,
+                    })?;
+
+            let package_event_seq = next_event_seq(package.event_seq)?;
+            let attempt_event_seq = next_event_seq(attempt.event_seq)?;
+            let lease_event_seq = next_event_seq(loaded.event_seq)?;
+            update_attempt_after_loss(
+                &uow,
+                &attempt,
+                &attempt_transition.aggregate,
+                attempt_event_seq,
+            )
+            .await?;
+            update_lease(&uow, &loaded, &lease_transition.aggregate, lease_event_seq).await?;
+            update_package_after_loss(
+                &uow,
+                &package,
+                &package_transition.aggregate,
+                package_event_seq,
+            )
+            .await?;
+
+            let package_event = build_event(
+                project_id,
+                AggregateId::WorkPackage(package.package.id),
+                package_transition.aggregate.version,
+                package_event_seq,
+                &metadata,
+                now,
+                package_transition.events[0].clone(),
+            )?;
+            let attempt_event = build_event(
+                project_id,
+                AggregateId::Attempt(attempt.attempt.id),
+                attempt_transition.aggregate.version,
+                attempt_event_seq,
+                &metadata,
+                now,
+                attempt_transition.events[0].clone(),
+            )?;
+            let lease_event = build_event(
+                project_id,
+                AggregateId::Lease(loaded.lease.id),
+                lease_transition.aggregate.version,
+                lease_event_seq,
+                &metadata,
+                now,
+                lease_transition.events[0].clone(),
+            )?;
+            let records = [
+                package_event.record.clone(),
+                attempt_event.record.clone(),
+                lease_event.record.clone(),
+            ];
+            uow.append_events(&records).await?;
+            uow.enqueue_outbox(&[
+                package_event.outbox(now, package.package.id.to_string()),
+                attempt_event.outbox(now, attempt.attempt.id.to_string()),
+                lease_event.outbox(now, loaded.lease.id.to_string()),
+            ])
+            .await?;
+
+            let response = lease_view(project_id, &lease_transition.aggregate);
+            store_receipt(
+                &mut uow,
+                scope,
+                &metadata,
+                response.clone(),
+                response.version,
+                effect_digest(&json!({
+                    "package_id": package.package.id,
+                    "attempt_id": attempt.attempt.id,
+                    "lease_id": response.lease_id,
+                    "event_ids": records.map(|record| record.event_id),
+                }))?,
+            )
+            .await?;
+            Ok(response)
+        }
+        .await;
+        finish(uow, result).await
     }
 
     async fn mutate_lease<F>(
@@ -479,12 +689,7 @@ impl PostgresMvpControlPlane {
                 return Ok(response);
             }
             let loaded = load_lease(&uow, project_id, lease_id, true).await?;
-            let expected_version = metadata.expected_version.ok_or_else(|| {
-                agentforge_domain::DomainError::InvalidArgument {
-                    field: "expected_version".into(),
-                    reason: "is required for aggregate updates".into(),
-                }
-            })?;
+            let expected_version = required_expected_version(&metadata)?;
             let now = uow.server_now().await?;
             let transition = Lease::transition(
                 Some(&loaded.lease),
@@ -541,9 +746,110 @@ impl PostgresMvpControlPlane {
         .await;
         finish(uow, result).await
     }
+
+    async fn reconcile_expired_leases_inner(
+        &self,
+        query: ReconcileExpiredLeasesQuery,
+    ) -> MvpResult<LeaseReconciliationReport> {
+        if query.limit == 0 || query.limit > 1_000 {
+            return Err(agentforge_domain::DomainError::InvalidArgument {
+                field: "limit".into(),
+                reason: "must be between 1 and 1000".into(),
+            }
+            .into());
+        }
+        let uow = self.factory.begin(Isolation::ReadCommitted).await?;
+        let candidates = async {
+            let limit = i64::from(query.limit);
+            let rows = uow
+                .client()?
+                .query(
+                    "SELECT l.id, l.version \
+                     FROM leases l JOIN work_packages w ON w.id = l.package_id \
+                     WHERE w.project_id = $1 AND l.state = 'ACTIVE' \
+                       AND l.expires_at <= clock_timestamp() \
+                     ORDER BY l.expires_at, l.id LIMIT $2",
+                    &[query.project_id.as_uuid(), &limit],
+                )
+                .await
+                .map_err(map_database_error)?;
+            rows.into_iter()
+                .map(|row| {
+                    let lease_id = LeaseId::from_uuid(
+                        row.try_get(0)
+                            .map_err(|_| agentforge_application::PortError::Integrity)?,
+                    );
+                    let version = version_from_i64(
+                        row.try_get(1)
+                            .map_err(|_| agentforge_application::PortError::Integrity)?,
+                    )?;
+                    Ok((lease_id, version))
+                })
+                .collect::<MvpResult<Vec<_>>>()
+        }
+        .await;
+        let candidates = finish(uow, candidates).await?;
+        let scanned = u16::try_from(candidates.len())
+            .map_err(|_| agentforge_application::PortError::Integrity)?;
+        let mut expired = 0_u16;
+        let mut conflicted = 0_u16;
+        for (lease_id, expected_version) in candidates {
+            let payload = json!({
+                "project_id": query.project_id,
+                "lease_id": lease_id,
+                "expected_version": expected_version,
+            });
+            let metadata = CommandMetadata {
+                command_id: CommandId::from_uuid(Uuid::now_v7()),
+                actor_id: expiry_reconciler_actor(),
+                idempotency_key: IdempotencyKey::new(format!(
+                    "lease-expire:{lease_id}:v{}",
+                    expected_version.get()
+                ))?,
+                correlation_id: CorrelationId::from_uuid(Uuid::now_v7()),
+                causation_id: None,
+                expected_version: Some(expected_version),
+                payload_digest: effect_digest(&payload)?,
+            };
+            match self
+                .terminate_lease_inner(
+                    query.project_id,
+                    lease_id,
+                    "lease.expire",
+                    metadata,
+                    LeaseTermination::Expire,
+                )
+                .await
+            {
+                Ok(_) => expired = expired.saturating_add(1),
+                Err(error)
+                    if matches!(
+                        error.code(),
+                        "AF_CONFLICT"
+                            | "AF_NOT_FOUND"
+                            | "AF_STALE_VERSION"
+                            | "AF_TRANSITION_INVALID"
+                    ) =>
+                {
+                    conflicted = conflicted.saturating_add(1);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(LeaseReconciliationReport {
+            project_id: query.project_id,
+            scanned,
+            expired,
+            conflicted,
+        })
+    }
 }
 
 impl MvpControlPlane for PostgresMvpControlPlane {
+    fn ready(&self) -> MvpFuture<'_, bool> {
+        Box::pin(self.ready_inner())
+    }
+
     fn create_project<'a>(
         &'a self,
         command: &'a MvpCommand<CreateProjectInput>,
@@ -585,6 +891,13 @@ impl MvpControlPlane for PostgresMvpControlPlane {
 
     fn get_lease(&self, project_id: ProjectId, lease_id: LeaseId) -> MvpFuture<'_, LeaseView> {
         Box::pin(self.get_lease_inner(project_id, lease_id))
+    }
+
+    fn reconcile_expired_leases(
+        &self,
+        query: ReconcileExpiredLeasesQuery,
+    ) -> MvpFuture<'_, LeaseReconciliationReport> {
+        Box::pin(self.reconcile_expired_leases_inner(query))
     }
 }
 
@@ -749,7 +1062,118 @@ struct LoadedPackage {
     dependencies_satisfied: bool,
 }
 
-async fn load_claimable_package(
+struct LoadedAttempt {
+    attempt: Attempt,
+    event_seq: u64,
+}
+
+async fn load_attempt_for_update(
+    uow: &PostgresUnitOfWork,
+    package_id: agentforge_domain::PackageId,
+    attempt_id: AttemptId,
+) -> MvpResult<LoadedAttempt> {
+    let row = uow
+        .client()?
+        .query_opt(
+            "SELECT revision_id, executor_id, node_id, state, lease_id, fencing_token, \
+                    base_commit, wake_condition, resume_state, semantic_progress_seq, \
+                    last_checkpoint_digest, candidate_commit, version, event_seq \
+             FROM attempts WHERE id = $1 AND package_id = $2 FOR UPDATE",
+            &[attempt_id.as_uuid(), package_id.as_uuid()],
+        )
+        .await
+        .map_err(map_database_error)?
+        .ok_or(agentforge_application::PortError::NotFound)?;
+    let wake_condition = row
+        .try_get::<_, Option<Json<Value>>>(7)
+        .map_err(|_| agentforge_application::PortError::Integrity)?
+        .map(|Json(value)| {
+            serde_json::from_value::<WakeCondition>(value)
+                .map_err(|_| agentforge_application::PortError::Integrity)
+        })
+        .transpose()?;
+    let resume_state = row
+        .try_get::<_, Option<String>>(8)
+        .map_err(|_| agentforge_application::PortError::Integrity)?
+        .map(|state| parse_attempt_state(&state))
+        .transpose()?;
+    let checkpoint = row
+        .try_get::<_, Option<Vec<u8>>>(10)
+        .map_err(|_| agentforge_application::PortError::Integrity)?
+        .map(|bytes| {
+            let bytes: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| agentforge_application::PortError::Integrity)?;
+            Ok::<Sha256Digest, agentforge_application::PortError>(Sha256Digest::from_bytes(bytes))
+        })
+        .transpose()?;
+    let candidate_commit = row
+        .try_get::<_, Option<String>>(11)
+        .map_err(|_| agentforge_application::PortError::Integrity)?
+        .map(GitObjectId::new)
+        .transpose()?;
+    let version = version_from_i64(
+        row.try_get(12)
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+    )?;
+    let event_seq = u64::try_from(
+        row.try_get::<_, i64>(13)
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+    )
+    .map_err(|_| agentforge_application::PortError::Integrity)?;
+    Ok(LoadedAttempt {
+        attempt: Attempt {
+            id: attempt_id,
+            package_id,
+            revision_id: PackageRevisionId::from_uuid(
+                row.try_get(0)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            ),
+            executor_id: agentforge_domain::ExecutorId::from_uuid(
+                row.try_get(1)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            ),
+            node_id: agentforge_domain::NodeId::from_uuid(
+                row.try_get(2)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            ),
+            state: parse_attempt_state(
+                &row.try_get::<_, String>(3)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            )?,
+            lease_id: row
+                .try_get::<_, Option<Uuid>>(4)
+                .map_err(|_| agentforge_application::PortError::Integrity)?
+                .map(LeaseId::from_uuid),
+            fencing_token: FencingToken::new(
+                u64::try_from(
+                    row.try_get::<_, i64>(5)
+                        .map_err(|_| agentforge_application::PortError::Integrity)?,
+                )
+                .map_err(|_| agentforge_application::PortError::Integrity)?,
+            )?,
+            base_commit: GitObjectId::new(
+                row.try_get::<_, String>(6)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            )?,
+            wake_condition,
+            resume_state,
+            semantic_progress_seq: u64::try_from(
+                row.try_get::<_, i64>(9)
+                    .map_err(|_| agentforge_application::PortError::Integrity)?,
+            )
+            .map_err(|_| agentforge_application::PortError::Integrity)?,
+            last_checkpoint_digest: checkpoint,
+            candidate_commit,
+            submission_id: None,
+            submission_outcome: None,
+            version,
+        },
+        event_seq,
+    })
+}
+
+async fn load_package_for_update(
     uow: &PostgresUnitOfWork,
     project_id: ProjectId,
     package_id: agentforge_domain::PackageId,
@@ -997,6 +1421,107 @@ async fn insert_claim_rows(
     Ok(())
 }
 
+fn validate_active_work_binding(
+    package: &WorkPackage,
+    attempt: &Attempt,
+    lease: &Lease,
+) -> MvpResult<()> {
+    if package.state != WorkPackageState::Active
+        || package.active_attempt_id != Some(attempt.id)
+        || package.active_lease_id != Some(lease.id)
+        || package.active_fencing_token != Some(lease.fencing_token)
+        || attempt.package_id != package.id
+        || attempt.revision_id != package.selected_revision_id
+        || attempt.lease_id != Some(lease.id)
+        || attempt.fencing_token != lease.fencing_token
+        || lease.package_id != package.id
+        || lease.revision_id != package.selected_revision_id
+        || lease.attempt_id != attempt.id
+    {
+        return Err(agentforge_domain::DomainError::StaleLease.into());
+    }
+    Ok(())
+}
+
+async fn update_attempt_after_loss(
+    uow: &PostgresUnitOfWork,
+    loaded: &LoadedAttempt,
+    attempt: &Attempt,
+    event_seq: u64,
+) -> MvpResult<()> {
+    let version = version_to_i64(attempt.version)?;
+    let previous_version = version_to_i64(loaded.attempt.version)?;
+    let event_seq = u64_to_i64(event_seq)?;
+    let previous_event_seq = u64_to_i64(loaded.event_seq)?;
+    let changed = uow
+        .client()?
+        .execute(
+            "UPDATE attempts \
+             SET state = 'LOST', wake_condition = NULL, resume_state = NULL, \
+                 version = $3, event_seq = $4, updated_at = clock_timestamp() \
+             WHERE id = $1 AND package_id = $2 AND version = $5 AND event_seq = $6 \
+               AND state NOT IN ('CANDIDATE', 'ISOLATED_REVIEW', 'CLEAN_REPRODUCE', \
+                                 'SUBMITTED', 'PASSED', 'REJECTED', 'LOST', 'FAILED', \
+                                 'CANCELLED')",
+            &[
+                attempt.id.as_uuid(),
+                attempt.package_id.as_uuid(),
+                &version,
+                &event_seq,
+                &previous_version,
+                &previous_event_seq,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+async fn update_package_after_loss(
+    uow: &PostgresUnitOfWork,
+    loaded: &LoadedPackage,
+    package: &WorkPackage,
+    event_seq: u64,
+) -> MvpResult<()> {
+    let version = version_to_i64(package.version)?;
+    let previous_version = version_to_i64(loaded.package.version)?;
+    let event_seq = u64_to_i64(event_seq)?;
+    let previous_event_seq = u64_to_i64(loaded.event_seq)?;
+    let state = package.state.as_str().to_ascii_uppercase();
+    let active_attempt = loaded
+        .package
+        .active_attempt_id
+        .ok_or(agentforge_application::PortError::Integrity)?;
+    let changed = uow
+        .client()?
+        .execute(
+            "UPDATE work_packages \
+             SET state = $3, active_attempt_id = NULL, version = $4, event_seq = $5, \
+                 updated_at = clock_timestamp() \
+             WHERE id = $1 AND project_id = $2 AND state = 'ACTIVE' \
+               AND active_attempt_id = $6 AND version = $7 AND event_seq = $8",
+            &[
+                package.id.as_uuid(),
+                package.project_id.as_uuid(),
+                &state,
+                &version,
+                &event_seq,
+                active_attempt.as_uuid(),
+                &previous_version,
+                &previous_event_seq,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
 struct LoadedLease {
     lease: Lease,
     event_seq: u64,
@@ -1146,6 +1671,54 @@ fn parse_lease_state(value: &str) -> MvpResult<LeaseState> {
         "EXPIRED" => Ok(LeaseState::Expired),
         _ => Err(agentforge_application::PortError::Integrity.into()),
     }
+}
+
+fn parse_attempt_state(value: &str) -> MvpResult<AttemptState> {
+    let state = match value {
+        "CREATED" => AttemptState::Created,
+        "LEASED" => AttemptState::Leased,
+        "PREPARING" => AttemptState::Preparing,
+        "PLANNING" => AttemptState::Planning,
+        "IMPLEMENTING" => AttemptState::Implementing,
+        "LOCAL_VERIFY" => AttemptState::LocalVerify,
+        "WAITING_INPUT" => AttemptState::WaitingInput,
+        "CANDIDATE" => AttemptState::Candidate,
+        "ISOLATED_REVIEW" => AttemptState::IsolatedReview,
+        "CLEAN_REPRODUCE" => AttemptState::CleanReproduce,
+        "SUBMITTED" => AttemptState::Submitted,
+        "PASSED" => AttemptState::Passed,
+        "REJECTED" => AttemptState::Rejected,
+        "LOST" => AttemptState::Lost,
+        "FAILED" => AttemptState::Failed,
+        "CANCELLED" => AttemptState::Cancelled,
+        _ => return Err(agentforge_application::PortError::Integrity.into()),
+    };
+    Ok(state)
+}
+
+fn required_expected_version(metadata: &CommandMetadata) -> MvpResult<AggregateVersion> {
+    metadata
+        .expected_version
+        .ok_or_else(|| agentforge_domain::DomainError::InvalidArgument {
+            field: "expected_version".into(),
+            reason: "is required for aggregate updates".into(),
+        })
+        .map_err(MvpError::from)
+}
+
+fn next_event_seq(current: u64) -> MvpResult<u64> {
+    current
+        .checked_add(1)
+        .ok_or_else(|| agentforge_application::PortError::Integrity.into())
+}
+
+fn expiry_reconciler_actor() -> ActorId {
+    // UUIDv8-shaped stable service identity. It is not a credential; the
+    // control-plane composition authorizes this internal scheduler capability.
+    let mut bytes = *b"AF-LEASE-EXPIRY!";
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ActorId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 async fn insert_published_package(

@@ -208,8 +208,28 @@ pub struct LeaseView {
     pub version: AggregateVersion,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReconcileExpiredLeasesQuery {
+    pub project_id: ProjectId,
+    pub limit: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LeaseReconciliationReport {
+    pub project_id: ProjectId,
+    pub scanned: u16,
+    pub expired: u16,
+    pub conflicted: u16,
+}
+
 /// Versioned MVP command/query surface used by HTTP, CLI, and Worker adapters.
 pub trait MvpControlPlane: Send + Sync {
+    /// Reports whether the command service can safely accept MVP traffic.
+    ///
+    /// A durable adapter must verify its schema contract as well as basic
+    /// connectivity; a successful socket connection alone is not sufficient.
+    fn ready(&self) -> MvpFuture<'_, bool>;
+
     fn create_project<'a>(
         &'a self,
         command: &'a MvpCommand<CreateProjectInput>,
@@ -238,6 +258,14 @@ pub trait MvpControlPlane: Send + Sync {
     ) -> MvpFuture<'a, LeaseView>;
 
     fn get_lease(&self, project_id: ProjectId, lease_id: LeaseId) -> MvpFuture<'_, LeaseView>;
+
+    /// Reconciles a bounded, database-clock-selected batch of expired Leases.
+    /// Implementations must use the same Package -> Attempt -> Lease atomic
+    /// terminalization path as an explicit Release.
+    fn reconcile_expired_leases(
+        &self,
+        query: ReconcileExpiredLeasesQuery,
+    ) -> MvpFuture<'_, LeaseReconciliationReport>;
 }
 
 #[cfg(test)]

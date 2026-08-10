@@ -3,7 +3,8 @@ use std::process::ExitCode;
 
 use agentforge_application::{
     ClaimPackageInput, CreateProjectInput, ListOffersQuery, MvpCommand as CommandEnvelope,
-    MvpControlPlane, PublishPackageInput, ReleaseLeaseInput, RenewLeaseInput,
+    MvpControlPlane, PublishPackageInput, ReconcileExpiredLeasesQuery, ReleaseLeaseInput,
+    RenewLeaseInput,
 };
 use agentforge_domain::{LeaseId, ProjectId};
 use agentforge_protocol::{
@@ -123,6 +124,12 @@ enum MvpAdminCommand {
     LeaseRenew { request: PathBuf },
     /// Release a Lease from a command-envelope JSON file.
     LeaseRelease { request: PathBuf },
+    /// Reconcile a bounded batch of database-clock-expired Leases.
+    LeaseReconcileExpired {
+        project_id: ProjectId,
+        #[arg(long, default_value_t = 100)]
+        limit: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -236,6 +243,16 @@ async fn main() -> Result<ExitCode> {
                 MvpAdminCommand::LeaseRelease { request } => {
                     let command = read_json::<CommandEnvelope<ReleaseLeaseInput>>(&request)?;
                     print_json(&control.release_lease(&command).await?)?;
+                }
+                MvpAdminCommand::LeaseReconcileExpired { project_id, limit } => {
+                    print_json(
+                        &control
+                            .reconcile_expired_leases(ReconcileExpiredLeasesQuery {
+                                project_id,
+                                limit,
+                            })
+                            .await?,
+                    )?;
                 }
             }
             Ok(ExitCode::SUCCESS)

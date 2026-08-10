@@ -15,6 +15,8 @@ export AGENTFORGE_BIND='127.0.0.1:8080'
 export AGENTFORGE_DATABASE_SCHEMA='public'
 export AGENTFORGE_CURSOR_HMAC_KEY='<64 lowercase hex characters>'
 export AGENTFORGE_LOCAL_PROJECT_IDS='<comma-separated Project UUIDs>'
+export AGENTFORGE_LEASE_RECONCILE_SECONDS='5'
+export AGENTFORGE_LEASE_RECONCILE_BATCH='100'
 cargo run --locked -p agentforge-control-plane --bin agentforge-control-plane
 ```
 
@@ -70,7 +72,28 @@ cargo run --locked -p agentforge-control-plane --bin af-cli -- \
 
 cargo run --locked -p agentforge-control-plane --bin af-cli -- \
   mvp lease-get <project-uuid> <lease-uuid>
+
+cargo run --locked -p agentforge-control-plane --bin af-cli -- \
+  mvp lease-reconcile-expired <project-uuid> --limit 100
 ```
 
 如果未传 `--database-url`，CLI 使用 `AGENTFORGE_DATABASE_URL`。连接器只接受 loopback PostgreSQL；
 远程生产数据库需要 TLS/身份 adapter，本 MVP 不做不安全降级。
+
+## 4. Lease 收敛
+
+主动 Release 与数据库时钟判定的 Expire 使用同一条事务路径，并按 Package → Attempt → Lease 固定
+顺序加锁。成功后在一个事务内：
+
+1. Lease 进入 `RELEASED` 或 `EXPIRED`；
+2. 作者 Attempt 进入 `LOST`；
+3. WorkPackage 在仍有尝试预算时进入 `REWORK_READY`，否则进入 `FAILED`；
+4. 三个聚合各自追加 Event，并写出对应 Outbox；
+5. 下一次 Claim 创建新 Attempt/Lease，fencing token 必须严格递增。
+
+后台 sweeper 使用 PostgreSQL `clock_timestamp()` 选择到期 Lease，单批 1–1000 条。并发 Renew、Release
+或其他 sweeper 实例只会产生 CAS/状态冲突，不会重复终结或复用旧 fencing token。
+
+`GET /readyz` 只有在投影源与 PostgreSQL 命令面同时就绪时才返回 `204`。数据库检查会核对全部
+迁移的版本、名称与源码摘要，并确认 MVP 所依赖的 typed tables 存在；未装配命令面、迁移漂移或
+数据库不可达均返回 `503`。

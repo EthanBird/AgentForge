@@ -413,10 +413,16 @@ async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn ready(State(state): State<ControlPlaneState>) -> StatusCode {
-    match state.source.ready().await {
-        Ok(true) => StatusCode::NO_CONTENT,
-        Ok(false) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+pub(crate) async fn ready(State(state): State<ControlPlaneState>) -> StatusCode {
+    let projections_ready = matches!(state.source.ready().await, Ok(true));
+    let commands_ready = match state.command_service() {
+        Some(commands) => matches!(commands.ready().await, Ok(true)),
+        None => false,
+    };
+    if projections_ready && commands_ready {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 

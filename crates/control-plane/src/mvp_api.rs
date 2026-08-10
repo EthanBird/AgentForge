@@ -378,7 +378,10 @@ fn command_error_response(error: &MvpError) -> (StatusCode, &'static str, &'stat
 mod tests {
     use std::sync::Arc;
 
-    use agentforge_application::{ClaimedWork, MvpControlPlane, MvpFuture, ProjectView};
+    use agentforge_application::{
+        ClaimedWork, LeaseReconciliationReport, MvpControlPlane, MvpFuture, ProjectView,
+        ReconcileExpiredLeasesQuery,
+    };
     use agentforge_domain::{ExecutorId, NodeId, ProtocolKey};
 
     use super::*;
@@ -386,6 +389,10 @@ mod tests {
     struct CreateOnlyService;
 
     impl MvpControlPlane for CreateOnlyService {
+        fn ready(&self) -> MvpFuture<'_, bool> {
+            Box::pin(async { Ok(true) })
+        }
+
         fn create_project<'a>(
             &'a self,
             command: &'a MvpCommand<CreateProjectInput>,
@@ -437,6 +444,13 @@ mod tests {
             _project_id: ProjectId,
             _lease_id: LeaseId,
         ) -> MvpFuture<'_, LeaseView> {
+            unavailable()
+        }
+
+        fn reconcile_expired_leases(
+            &self,
+            _query: ReconcileExpiredLeasesQuery,
+        ) -> MvpFuture<'_, LeaseReconciliationReport> {
             unavailable()
         }
     }
