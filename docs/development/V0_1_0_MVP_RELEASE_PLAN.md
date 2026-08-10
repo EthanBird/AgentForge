@@ -7,6 +7,7 @@
 - 当前状态：实施中
 - 最新进度：[V0_1_0_MVP_PROGRESS.md](V0_1_0_MVP_PROGRESS.md)
 - MVP 命令面：[13_MVP_HTTP_AND_CLI.md](13_MVP_HTTP_AND_CLI.md)
+- MVP Worker：[14_MVP_RECOVERABLE_WORKER.md](14_MVP_RECOVERABLE_WORKER.md)
 
 ## 1. 发布定义
 

@@ -2,7 +2,7 @@
 
 - 分支：`agent/v0.1.0-mvp`
 - 更新日期：2026-08-10
-- 总体状态：MVP-01 实施中
+- 总体状态：MVP-01 完成；MVP-02 基础层实施中
 - 发布计划：[V0_1_0_MVP_RELEASE_PLAN.md](V0_1_0_MVP_RELEASE_PLAN.md)
 
 ## MVP-01 / Checkpoint A：Typed Market 与 Lease 命令面
@@ -51,9 +51,15 @@ git diff --check                                             PASS
 
 ## MVP-01 / Checkpoint B：HTTP、管理 CLI 与 Lease 收敛
 
-状态：实施中。
+状态：完成；真实 PostgreSQL 17 与 workspace CI 均通过。
 
-当前已落盘但尚未形成远端检查点：
+- 远端提交：`84b4434929df06447ca7af66e09168481fff212d`
+- GitHub Actions：CI #53 / run `31345557078`
+- PostgreSQL 17 job：Release→re-Claim、expiry sweeper→re-Claim、generation 1→2→3 fencing、
+  migration digest readiness 失效/恢复全部通过
+- Rust job：format、metadata、workspace boundary、build、Clippy、workspace test 全部通过
+
+本检查点完成：
 
 - `/api/v1` Project、Package、Offer、Claim、Lease Read/Renew/Release 路由；
 - 请求级项目授权、服务器派生 Actor ID、强制 `Idempotency-Key` 与更新命令 `If-Match`；
@@ -66,5 +72,30 @@ git diff --check                                             PASS
 - `/readyz` 同时核验投影源和命令数据库；数据库检查覆盖迁移版本、名称、源码摘要及 MVP 所需
   typed tables，不能以单纯 TCP/`SELECT 1` 冒充就绪。
 
-HTTP handler 合同测试、API/CLI 使用说明和本地完整 workspace 门禁已通过。剩余：远端 PostgreSQL
-17 对 Release→re-Claim、Expire→re-Claim 和数据库 readiness 的真实合同。
+HTTP handler 合同测试、API/CLI 使用说明、本地完整 workspace 门禁与远端 PostgreSQL 17 合同均已
+通过。
+
+## MVP-02 / Checkpoint C：可恢复 Journal 与 Turn Pump
+
+状态：本地实现和定点门禁完成；等待本次远端检查点与 CI。
+
+当前完成：
+
+- 纯 replayable Worker Attempt 状态机和经过校验的状态反序列化；
+- SQLite WAL/FULL Journal，把不可变事实链、物化状态、Inbox、Outbox 和 operation completion 放在
+  单个 `BEGIN IMMEDIATE` 事务；
+- receipt-first exact replay、changed-payload key reuse 拒绝、JCS digest 和 previous-digest 完整性检查；
+- 外部副作用先登记 operation，再调用 Executor；非幂等 Turn 的 ACK 丢失只查询、不重启；
+- daemon 重启后恢复 Pending Turn/Verification，并核对 phase、kind、class、semantic key、输入摘要和
+  deadline；
+- 模型提前声称完成不能绕过 hard criteria；Turn budget 和 Lease expiry 在启动新副作用前生效；
+- 14 项 Worker 测试覆盖状态机、五个事务崩溃点、ACK-loss 和跨进程恢复。
+
+本检查点尚未完成：
+
+- Worker enrollment、Offer poll、远端 Claim/Renew/Release 与启动 Lease reconciliation；
+- workspace/日志/凭据隔离；
+- jcode bridge 和真实 Candidate Artifact handoff；
+- `worker-daemon` 二进制仍是组合根骨架。
+
+详细实现与恢复契约见 [14_MVP_RECOVERABLE_WORKER.md](14_MVP_RECOVERABLE_WORKER.md)。
