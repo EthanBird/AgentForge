@@ -6,8 +6,8 @@ use agentforge_application::{
     AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
     ClaimedWork, CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView,
     ListOffersQuery, MvpCommand, MvpError, MvpFuture, MvpRemoteError, MvpResult, OfferView,
-    PortError, ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
-    UploadCandidateArtifactChunkInput,
+    PortError, RecordCandidateInput, RecordedCandidate, ReleaseLeaseInput, RenewLeaseInput,
+    ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{LeaseId, ProjectId};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -286,6 +286,25 @@ impl WorkerControlPlane for LoopbackHttpControlPlane {
         })
     }
 
+    fn record_candidate<'a>(
+        &'a self,
+        command: &'a MvpCommand<RecordCandidateInput>,
+    ) -> MvpFuture<'a, RecordedCandidate> {
+        Box::pin(async move {
+            self.send(
+                "POST",
+                format!(
+                    "/api/v1/projects/{}/attempts/{}/candidates",
+                    command.input.project_id, command.input.attempt_id
+                ),
+                201,
+                Some(Self::command_body(command)?),
+                Some(&command.context),
+            )
+            .await
+        })
+    }
+
     fn get_lease(&self, project_id: ProjectId, lease_id: LeaseId) -> MvpFuture<'_, LeaseView> {
         Box::pin(async move {
             self.send(
@@ -505,9 +524,9 @@ mod tests {
     use agentforge_application::MvpCommandContext;
     use agentforge_domain::{
         ActorId, AggregateVersion, AttemptId, CandidateArtifactId, CandidateArtifactState,
-        CommandId, CorrelationId, ExecutorId, FencingToken, GitObjectId, IdempotencyKey, NodeId,
-        PackageRevision, PackageRevisionId, ProtocolKey, ServerInstant, Sha256Digest,
-        work_package::WorkPackageState,
+        CandidateId, CommandId, CorrelationId, ExecutorId, FencingToken, GitObjectId,
+        IdempotencyKey, NodeId, PackageRevision, PackageRevisionId, ProtocolKey, ServerInstant,
+        Sha256Digest, candidate::VerificationRunState, work_package::WorkPackageState,
     };
     use axum::{
         Json, Router,
@@ -691,6 +710,28 @@ mod tests {
         }
     }
 
+    fn recorded_candidate() -> RecordedCandidate {
+        RecordedCandidate {
+            project_id: id(1),
+            package_id: id(2),
+            revision_id: id(3),
+            attempt_id: id(4),
+            artifact_id: id(20),
+            candidate_id: id(21),
+            verification_run_id: id(22),
+            candidate_commit: GitObjectId::new("2".repeat(40)).expect("candidate"),
+            tree_hash: GitObjectId::new("3".repeat(40)).expect("tree"),
+            branch: format!("refs/heads/agentforge/{}", id::<CandidateId>(21)),
+            verification_state: VerificationRunState::Queued,
+            sealed_at: at(3),
+            candidate_version: AggregateVersion::new(1),
+            verification_run_version: AggregateVersion::new(1),
+            attempt_version: AggregateVersion::new(10),
+            package_version: AggregateVersion::new(3),
+            lease_version: AggregateVersion::new(2),
+        }
+    }
+
     async fn artifact_init_handler(
         Path((project, attempt)): Path<(String, String)>,
         headers: HeaderMap,
@@ -734,6 +775,31 @@ mod tests {
         assert_eq!(headers["idempotency-key"], "worker-artifact-complete");
         assert_eq!(headers["if-match"], "\"1\"");
         Json(artifact_view(CandidateArtifactState::Complete))
+    }
+
+    async fn candidate_record_handler(
+        Path((project, attempt)): Path<(String, String)>,
+        headers: HeaderMap,
+        Json(input): Json<RecordCandidateInput>,
+    ) -> (StatusCode, Json<RecordedCandidate>) {
+        assert_eq!(project, id::<ProjectId>(1).to_string());
+        assert_eq!(attempt, id::<AttemptId>(4).to_string());
+        assert_eq!(input.project_id, id(1));
+        assert_eq!(input.attempt_id, id(4));
+        assert_eq!(input.artifact_id, id(20));
+        assert_eq!(input.lease_id, id(5));
+        assert_eq!(input.node_id, id(8));
+        assert_eq!(
+            input.fencing_token,
+            FencingToken::new(1).expect("generation")
+        );
+        assert_eq!(
+            input.branch,
+            format!("refs/heads/agentforge/{}", id::<CandidateId>(21))
+        );
+        assert_eq!(headers["idempotency-key"], "worker-candidate-record");
+        assert_eq!(headers["if-match"], "\"9\"");
+        (StatusCode::CREATED, Json(recorded_candidate()))
     }
 
     async fn lease_error_handler() -> (StatusCode, Json<serde_json::Value>) {
@@ -793,6 +859,10 @@ mod tests {
             .route(
                 "/api/v1/projects/{project}/candidate-artifacts/{artifact}/complete",
                 post(artifact_complete_handler),
+            )
+            .route(
+                "/api/v1/projects/{project}/attempts/{attempt}/candidates",
+                post(candidate_record_handler),
             )
             .with_state(state.clone());
         let (address, server) = spawn_server(router).await;
@@ -973,6 +1043,33 @@ mod tests {
                 .await
                 .expect("artifact complete"),
             artifact_view(CandidateArtifactState::Complete)
+        );
+
+        let record = MvpCommand {
+            context: MvpCommandContext {
+                command_id: id(16),
+                actor_id: id(6),
+                idempotency_key: IdempotencyKey::new("worker-candidate-record").expect("key"),
+                correlation_id: id(13),
+                causation_id: None,
+                expected_version: Some(AggregateVersion::new(9)),
+            },
+            input: RecordCandidateInput {
+                project_id: id(1),
+                attempt_id: id(4),
+                artifact_id: id(20),
+                lease_id: id(5),
+                node_id: id(8),
+                fencing_token: FencingToken::new(1).expect("generation"),
+                branch: format!("refs/heads/agentforge/{}", id::<CandidateId>(21)),
+            },
+        };
+        assert_eq!(
+            adapter
+                .record_candidate(&record)
+                .await
+                .expect("record Candidate"),
+            recorded_candidate()
         );
         server.abort();
     }

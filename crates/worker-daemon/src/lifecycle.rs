@@ -4,8 +4,9 @@ use agentforge_application::{
     AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
     ClaimedWork, CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView,
     ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane, MvpError, MvpFuture,
-    OfferView, PackageExecutionSnapshot, ReleaseLeaseInput, RenewLeaseInput,
-    ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
+    OfferView, PackageExecutionSnapshot, RecordCandidateInput, RecordedCandidate,
+    ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, NodeId, ProjectId,
@@ -58,6 +59,11 @@ pub trait WorkerControlPlane: Send + Sync {
         &'a self,
         command: &'a MvpCommand<CompleteCandidateArtifactInput>,
     ) -> MvpFuture<'a, CandidateArtifactView>;
+
+    fn record_candidate<'a>(
+        &'a self,
+        command: &'a MvpCommand<RecordCandidateInput>,
+    ) -> MvpFuture<'a, RecordedCandidate>;
 
     fn get_lease(
         &self,
@@ -117,6 +123,13 @@ where
         command: &'a MvpCommand<CompleteCandidateArtifactInput>,
     ) -> MvpFuture<'a, CandidateArtifactView> {
         MvpControlPlane::complete_candidate_artifact(self, command)
+    }
+
+    fn record_candidate<'a>(
+        &'a self,
+        command: &'a MvpCommand<RecordCandidateInput>,
+    ) -> MvpFuture<'a, RecordedCandidate> {
+        MvpControlPlane::record_candidate(self, command)
     }
 
     fn get_lease(
@@ -1086,6 +1099,13 @@ mod tests {
             &'a self,
             _command: &'a MvpCommand<CompleteCandidateArtifactInput>,
         ) -> MvpFuture<'a, CandidateArtifactView> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+        }
+
+        fn record_candidate<'a>(
+            &'a self,
+            _command: &'a MvpCommand<RecordCandidateInput>,
+        ) -> MvpFuture<'a, RecordedCandidate> {
             Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
         }
 

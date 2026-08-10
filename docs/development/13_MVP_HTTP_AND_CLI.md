@@ -28,8 +28,8 @@ cargo run --locked -p agentforge-control-plane --bin agentforge-control-plane
 所有写命令必须带：
 
 - `Idempotency-Key`：同一 actor 内的稳定业务键；
-- `If-Match: "<version>"`：Claim、Attempt Progress、Renew、Release 以及 Candidate Artifact 的
-  Init、Chunk、Complete
+- `If-Match: "<version>"`：Claim、Attempt Progress、Renew、Release、Candidate Artifact 的
+  Init、Chunk、Complete 以及 `RecordCandidate`
   必须提供，创建 Project/Package 禁止提供；
 - `Content-Type: application/json`；
 - 可选 `X-AgentForge-Command-Id`、`X-AgentForge-Correlation-Id`、
@@ -50,6 +50,7 @@ HTTP actor 从已经验证的 request actor/Project grant 派生，客户端不�
 | `POST` | `/api/v1/projects/{project_id}/attempts/{attempt_id}/candidate-artifacts` | 预留 Candidate 与 Artifact，返回 `201` |
 | `PUT` | `/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/chunks/{chunk_index}` | 上传一个已声明 chunk，返回 `204` |
 | `POST` | `/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/complete` | 重组并复算 Bundle，返回 COMPLETE Artifact |
+| `POST` | `/api/v1/projects/{project_id}/attempts/{attempt_id}/candidates` | 原子绑定 COMPLETE Artifact、关闭作者 Lease 并返回 `201` Candidate + VerificationRun |
 
 Claim 成功响应除 Attempt/Lease/CAS 版本外，还包含 `granted_at`、`expires_at`、`max_expires_at` 与
 `execution`。`execution` 固定 revision、JCS package hash、base commit、Git object format、canonical
@@ -98,7 +99,19 @@ Complete 的 `If-Match` 是当前 Artifact version。服务端按声明顺序读
 
 CAS 过期固定返回 `AF_VERSION_STALE/412`，不得使用旧拼写 `AF_STALE_VERSION`。
 
-### 2.3 Worker Progress 与 Artifact command Journal
+### 2.3 RecordCandidate wire
+
+`RecordCandidateInput` 只携带 Project/Attempt/Artifact/Lease/node/fencing 和受
+`refs/heads/agentforge/` 命名空间约束的 branch；Candidate ID、commit、tree、Package/revision、Bundle 与
+Author Evidence 全部从 COMPLETE Artifact 读取，客户端不能在 handoff 时替换。路径中的 Project/Attempt
+必须与 body 相同，`If-Match` 是最终中心 `LOCAL_VERIFY` Attempt version。
+
+成功固定返回 `201 RecordedCandidate`，其中包含服务器预留的 Candidate ID、新建 VerificationRun ID、
+三条 Git head/binding、`QUEUED` 状态以及 Candidate/Run/Attempt/Package/Lease 的提交后版本。同一
+actor/key/body 的 ACK-loss 重试即使作者 Lease 已在首次提交中关闭，仍先返回首次 response；receipt miss 的
+新 key 必须重新通过当前 author Lease，不能创建第二条 Candidate lineage。
+
+### 2.4 Worker Progress 与 Artifact command Journal
 
 Worker SQLite Journal schema v5 增加 `candidate_artifact_command_intents`；schema v6 进一步把首次成功的
 完整 `ClaimedWork`（含 Package/Attempt/Lease CAS version 与 execution snapshot）保存进原 Claim intent。

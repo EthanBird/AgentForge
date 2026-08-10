@@ -721,8 +721,7 @@ Artifact、最终 Attempt version、Candidate commit/tree 与作者证据绑定�
 
 ## MVP-03 / Checkpoint P.5：原子 Candidate Handoff
 
-状态：application + PostgreSQL 实现完成，定点门禁与 PGlite 0001..0007 正反实跑通过；等待本检查点
-推送后的 GitHub Actions PostgreSQL 17 复验。
+状态：完成；CI #102 / run `31362864591` 的远端 workspace 与真实 PostgreSQL 17 job 全绿。
 
 当前完成：
 
@@ -741,6 +740,10 @@ Artifact、最终 Attempt version、Candidate commit/tree 与作者证据绑定�
   RELEASED Lease、QUEUED run 或 PENDING obligation，数据库直接拒绝整个事务；
 - Package loader 只把真正 ACTIVE 的 Lease 投影为 `active_lease_id/fencing_token`；进入 VERIFYING 后保留
   active Attempt，但不会把已经 RELEASED 的作者 Lease误报为仍可写。
+- CI #100 首次真实 PG 复验发现 Chunk 与 COMPLETE Artifact 两个 authority helper 的调用点颠倒；
+  独立修复提交把 Chunk 恢复为上传期 Lease/expiry 校验，把 `RecordCandidate` 收紧为 COMPLETE-only。
+  CI #102 随后通过 0001..0007 migration、transactional UoW、market/Lease/Progress/Artifact/Candidate
+  handoff 全链合同，以及 Rust build、Clippy 和 workspace tests。
 
 定点证据：
 
@@ -766,3 +769,39 @@ cargo fmt --all -- --check / git diff --check                               PASS
 Worker Journal 的 `HandingOffCandidate` 接到该命令。下一 checkpoint 必须先交付 wire/adapter，再新增 durable
 SQLite Candidate handoff intent 与 pending-first ACK-loss 恢复；独立 Verifier 仍是后续阶段，作者 Worker 绝不
 生成 Submission 或验收结论。
+
+## MVP-03 / Checkpoint P.6：RecordCandidate HTTP 与 Worker Adapter
+
+状态：实现完成；全工作区本地门禁通过，等待本检查点推送后的 GitHub Actions 复验。
+
+当前完成：
+
+- 控制面新增 `POST /api/v1/projects/{project_id}/attempts/{attempt_id}/candidates`；Project/Attempt 的
+  path/body 必须完全一致，request actor 必须拥有 Project grant，`Idempotency-Key` 与 Attempt
+  `If-Match` 缺失或格式错误均在 application 调用前 fail closed；成功固定返回 `201 + RecordedCandidate`；
+- Worker `WorkerControlPlane` 增加 typed `record_candidate` port，loopback HTTP adapter 使用同一路径、严格
+  JSON body、完整 command headers、`201` 状态与 JSON content type；远端稳定错误码继续经过既有
+  status/code/retryable 三元一致性校验，不能用 HTTP 状态替换领域错误；
+- 控制面合同覆盖 authorized actor、path/body/CAS、Queued VerificationRun 响应及 mismatch-before-dispatch；
+  Worker Axum fixture 覆盖实际 path、branch、Artifact/Lease/node/fencing、幂等键、If-Match 与完整响应解码。
+
+验证证据：
+
+```text
+cargo test -p agentforge-control-plane -p agentforge-worker-daemon \
+  --locked --offline                                                        PASS
+cargo clippy -p agentforge-control-plane -p agentforge-worker-daemon \
+  --all-targets --all-features --locked --offline -- -D warnings            PASS
+bash tests/contract/workspace_layout.sh                                      PASS
+cargo build --workspace --locked --all-targets --offline                     PASS
+cargo test --workspace --locked --offline                                    PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                   PASS
+node --check crates/control-plane/assets/app.js                              PASS
+cargo fmt --all -- --check / git diff --check                               PASS
+```
+
+明确边界：P.6 只交付 wire 与 adapter，不会在调用前临时生成 Candidate lineage。Worker 尚未把完整
+`RecordCandidateInput` 先写入 SQLite，也尚未在 startup pending-first 阶段重放，因此 daemon 仍停在
+`HandingOffCandidate`。下一 checkpoint 必须新增 schema v8 handoff intent、严格 response 绑定和 ACK-loss
+恢复，然后才允许 fixture daemon 自动关闭作者 Lease。

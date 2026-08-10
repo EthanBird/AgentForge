@@ -4,8 +4,9 @@ use agentforge_application::{
     AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
     CompleteCandidateArtifactInput, CreateProjectInput, InitCandidateArtifactInput, LeaseView,
     ListOffersQuery, MvpCommand, MvpCommandContext, MvpError, OfferView, ProjectView,
-    PublishPackageInput, PublishedPackage, ReleaseLeaseInput, RenewLeaseInput,
-    ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
+    PublishPackageInput, PublishedPackage, RecordCandidateInput, RecordedCandidate,
+    ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, AggregateVersion, AttemptId, CandidateArtifactId, CommandId, CorrelationId, EventId,
@@ -67,6 +68,10 @@ pub(crate) fn routes() -> Router<ControlPlaneState> {
         .route(
             "/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/complete",
             post(complete_candidate_artifact),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/attempts/{attempt_id}/candidates",
+            post(record_candidate),
         )
 }
 
@@ -275,6 +280,25 @@ async fn complete_candidate_artifact(
             .complete_candidate_artifact(&command)
             .await?,
     ))
+}
+
+async fn record_candidate(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, attempt_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<RecordCandidateInput>,
+) -> Result<(StatusCode, Json<RecordedCandidate>), ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let attempt_id = parse_attempt(&attempt_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(attempt_id, input.attempt_id, "attempt_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    let response = service(&state)?.record_candidate(&command).await?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 fn service(
@@ -502,7 +526,8 @@ mod tests {
     };
     use agentforge_domain::{
         CandidateArtifactState, CandidateId, ExecutorId, FencingToken, GitObjectId, NodeId,
-        ProtocolKey, ServerInstant, Sha256Digest, attempt::AttemptState,
+        ProtocolKey, ServerInstant, Sha256Digest, VerificationRunId, attempt::AttemptState,
+        candidate::VerificationRunState,
     };
     use time::macros::datetime;
 
@@ -645,9 +670,36 @@ mod tests {
 
         fn record_candidate<'a>(
             &'a self,
-            _command: &'a MvpCommand<RecordCandidateInput>,
+            command: &'a MvpCommand<RecordCandidateInput>,
         ) -> MvpFuture<'a, RecordedCandidate> {
-            unavailable()
+            self.artifact_commands
+                .lock()
+                .expect("artifact command lock")
+                .push("record");
+            Box::pin(async move {
+                let expected = command.context.expected_version.expect("Attempt version");
+                Ok(RecordedCandidate {
+                    project_id: command.input.project_id,
+                    package_id: PackageId::from_uuid(Uuid::from_bytes([2; 16])),
+                    revision_id: agentforge_domain::PackageRevisionId::from_uuid(Uuid::from_bytes(
+                        [3; 16],
+                    )),
+                    attempt_id: command.input.attempt_id,
+                    artifact_id: command.input.artifact_id,
+                    candidate_id: CandidateId::from_uuid(Uuid::from_bytes([21; 16])),
+                    verification_run_id: VerificationRunId::from_uuid(Uuid::from_bytes([22; 16])),
+                    candidate_commit: GitObjectId::new("2".repeat(40)).expect("candidate"),
+                    tree_hash: GitObjectId::new("3".repeat(40)).expect("tree"),
+                    branch: command.input.branch.clone(),
+                    verification_state: VerificationRunState::Queued,
+                    sealed_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+                    candidate_version: AggregateVersion::new(1),
+                    verification_run_version: AggregateVersion::new(1),
+                    attempt_version: AggregateVersion::new(expected.get() + 1),
+                    package_version: AggregateVersion::new(3),
+                    lease_version: AggregateVersion::new(2),
+                })
+            })
         }
 
         fn renew_lease<'a>(
@@ -944,7 +996,7 @@ mod tests {
         );
         headers.insert(header::IF_MATCH, "\"1\"".parse().expect("header"));
         let Json(completed) = complete_candidate_artifact(
-            State(state),
+            State(state.clone()),
             Path((project_id.to_string(), view.artifact_id.to_string())),
             headers,
             Json(complete),
@@ -952,12 +1004,50 @@ mod tests {
         .await
         .expect("complete response");
         assert_eq!(completed.state, CandidateArtifactState::Complete);
+
+        let record = RecordCandidateInput {
+            project_id,
+            attempt_id,
+            artifact_id: completed.artifact_id,
+            lease_id,
+            node_id,
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            branch: format!("refs/heads/agentforge/{}", completed.candidate_id),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY, "candidate-record".parse().expect("header"));
+        headers.insert(header::IF_MATCH, "\"9\"".parse().expect("header"));
+        let (status, Json(recorded)) = record_candidate(
+            State(state.clone()),
+            Path((project_id.to_string(), attempt_id.to_string())),
+            headers,
+            Json(record.clone()),
+        )
+        .await
+        .expect("record Candidate response");
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(recorded.candidate_id, completed.candidate_id);
+        assert_eq!(recorded.verification_state, VerificationRunState::Queued);
+        assert_eq!(recorded.attempt_version, AggregateVersion::new(10));
+
+        let error = record_candidate(
+            State(state),
+            Path((
+                project_id.to_string(),
+                AttemptId::from_uuid(Uuid::from_bytes([9; 16])).to_string(),
+            )),
+            HeaderMap::new(),
+            Json(record),
+        )
+        .await
+        .expect_err("path/body Attempt mismatch must fail before dispatch");
+        assert!(matches!(error, ApiError::PathBodyMismatch));
         assert_eq!(
             *service
                 .artifact_commands
                 .lock()
                 .expect("artifact command lock"),
-            ["init", "chunk", "complete"]
+            ["init", "chunk", "complete", "record"]
         );
     }
 
