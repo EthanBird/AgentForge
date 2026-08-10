@@ -1163,6 +1163,12 @@ mod tests {
         assert_eq!(state.phase(), WorkerPhase::LocalFailed);
         assert_eq!(lease.state, LeaseState::Released);
         assert_eq!(*control.releases.lock().expect("releases"), 1);
+        assert!(
+            journal
+                .lease_maintenance_attempts()
+                .expect("released terminal attempt leaves maintenance set")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

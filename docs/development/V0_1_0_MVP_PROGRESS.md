@@ -158,7 +158,10 @@ enrollment、sandbox 与 jcode bridge。
 
 ## MVP-02 / Checkpoint F：可恢复 Lease Maintenance
 
-状态：本地实现与完整 workspace 门禁通过；等待提交和远端 CI。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端提交：`d4f98e57543b8676be64c7641cb11aa33612b76d`
+- GitHub Actions：CI #61 / run `31349687337`
 
 当前完成：
 
@@ -174,4 +177,24 @@ enrollment、sandbox 与 jcode bridge。
 - Worker 定点测试增至 24 项，覆盖 scheduler window、Renew ACK-loss/restart、Release 和 response
   binding。
 
-仍待：daemon 定时组合根、HTTP/mTLS Worker adapter、enrollment、sandbox 与 jcode bridge。
+Checkpoint F 当时仍待 daemon 定时组合根（现由 G 关闭）；其余仍待 HTTP/mTLS Worker adapter、
+enrollment、sandbox 与 jcode bridge。
+
+## MVP-02 / Checkpoint G：Pending-first Worker Daemon 组合根
+
+状态：本地实现与完整 workspace 门禁通过；等待提交和远端 CI。
+
+当前完成：
+
+- `WorkerDaemonConfig` 严格限制 schema、大小、未知字段、绝对 Journal 路径、项目集合、容量、Lease
+  window 和 tick 周期；节点指纹使用 JCS 覆盖 runtime fingerprint 与调度策略；
+- `WorkerDaemon::tick` 固定先恢复 Pending Claim，再恢复 Pending Renew/Release，然后维护已有 Lease，
+  最后只对剩余 capacity 接单；任一远端错误停止本轮并保留 durable intent；
+- Project binding 只从已完成 Claim intent 反查；旧 Journal 若无法证明 Attempt 所属 Project 就返回
+  `AF_WORKER_PROJECT_BINDING_MISSING`，不会用配置猜测；
+- 多项目 polling 按配置顺序逐轮公平推进；慢 tick 使用 delay 语义，不产生追赶式 mutation burst；
+- 生产时钟与 UUID v7 只在 `SystemDaemonRuntime` 可信边界产生，测试可注入确定性时间/ID；
+- Worker 定点测试增至 29 项，覆盖 capacity、自动 Renew、Claim ACK-loss、重启 pending-first exact replay
+  和非法 runtime ID 在远端 mutation 前拒绝。
+
+仍待：HTTP/mTLS Worker adapter、enrollment、sandbox、jcode bridge 与 Candidate Artifact handoff。

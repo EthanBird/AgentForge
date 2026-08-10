@@ -12,7 +12,7 @@ use agentforge_application::{
 };
 use agentforge_domain::{
     ActorId, AttemptId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, LeaseId, NodeId,
-    ProtocolKey, ServerInstant, Sha256Digest, work_package::WorkPackageState,
+    ProjectId, ProtocolKey, ServerInstant, Sha256Digest, work_package::WorkPackageState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1682,6 +1682,62 @@ impl Journal {
             .into_iter()
             .map(|attempt_id| self.verify_attempt(attempt_id))
             .collect()
+    }
+
+    pub fn lease_maintenance_attempts(&self) -> JournalResult<Vec<WorkerAttemptState>> {
+        let mut statement = self.connection.prepare(
+            "SELECT a.attempt_id FROM attempts a \
+             WHERE a.phase <> 'salvaging' \
+               AND NOT (a.phase IN ('local_failed', 'local_cancelled') AND EXISTS ( \
+                 SELECT 1 FROM lease_command_intents i \
+                 WHERE i.attempt_id = a.attempt_id AND i.kind = 'release' \
+                   AND i.state = 'completed' \
+               )) \
+             ORDER BY a.attempt_id",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let attempt_ids = rows
+            .map(|row| AttemptId::from_str(&row?).map_err(|_| JournalError::Integrity))
+            .collect::<JournalResult<Vec<_>>>()?;
+        drop(statement);
+        attempt_ids
+            .into_iter()
+            .map(|attempt_id| self.verify_attempt(attempt_id))
+            .collect()
+    }
+
+    /// Resolves the immutable Project binding recorded by the successful
+    /// Claim handoff. Attempts created before durable Claim intents existed do
+    /// not have enough local evidence to infer this value and therefore fail
+    /// closed instead of guessing from daemon configuration.
+    pub fn project_for_attempt(&self, attempt_id: AttemptId) -> JournalResult<Option<ProjectId>> {
+        let state = self
+            .load_attempt(attempt_id)?
+            .ok_or(JournalError::Integrity)?;
+        let mut statement = self.connection.prepare(
+            "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
+                    created_at, attempt_id, lease_id, completed_at \
+             FROM claim_intents \
+             WHERE state = 'completed' AND attempt_id = ?1 \
+             ORDER BY intent_id",
+        )?;
+        let rows = statement.query_map([attempt_id.to_string()], raw_claim_intent_row)?;
+        let records = rows
+            .map(|row| decode_claim_intent(row?).map(|stored| stored.record))
+            .collect::<JournalResult<Vec<_>>>()?;
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let [record] = records.as_slice() else {
+            return Err(JournalError::Integrity);
+        };
+        if record.offer.package_id != state.package_id()
+            || record.command.input.package_id != state.package_id()
+            || record.command.input.project_id != record.offer.project_id
+        {
+            return Err(JournalError::Integrity);
+        }
+        Ok(Some(record.offer.project_id))
     }
 
     pub fn pending_outbox(&self, limit: u16) -> JournalResult<Vec<PendingOutbox>> {

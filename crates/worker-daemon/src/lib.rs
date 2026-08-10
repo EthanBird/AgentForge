@@ -1,5 +1,7 @@
 //! Recoverable Linux Worker runtime for the AgentForge MVP.
 
+pub mod config;
+pub mod daemon;
 pub mod journal;
 pub mod lifecycle;
 pub mod runtime;

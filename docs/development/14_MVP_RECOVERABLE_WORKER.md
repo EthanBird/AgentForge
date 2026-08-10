@@ -16,12 +16,15 @@
   Local Verification；
 - `lifecycle.rs`：Offer 选择、稳定 Claim intent、Claim 响应校验、本地 Grant handoff 与启动 Lease
   reconciliation；
+- `config.rs`：严格、限长、拒绝未知字段的 daemon 配置，以及包含 runtime/policy 的稳定节点指纹；
+- `daemon.rs`：单写者组合根，固定执行 pending Claim → pending Renew/Release → Lease maintenance →
+  capacity-bounded Claim；
 - `FakeTurnExecutor` / `FakeVerifier`：MVP 的确定性执行和故障注入边界，后续 jcode adapter 实现相同
   trait。
 
-本检查点已经提供 transport-independent 的 Offer/Claim/Lease 端口和轮询函数，但没有宣称完成
-HTTP/mTLS adapter、自动 Renew 调度、Worker enrollment、workspace sandbox 或 jcode 进程桥接；这些
-属于 MVP-02 后续纵切。
+本检查点已经提供 transport-independent 的 Offer/Claim/Lease 端口、可恢复调度循环和关闭边界，但没有
+宣称完成 HTTP/mTLS adapter、Worker enrollment、workspace sandbox 或 jcode 进程桥接；这些属于
+MVP-02 后续纵切。
 
 ## 2. 状态机边界
 
@@ -116,6 +119,18 @@ expiry。`LocalFailed`/`LocalCancelled` 使用相同机制 Release；`AuthorComp
 完成前仍按阈值 Renew，不能被维护循环错误地回收到 `REWORK_READY`。此时若 Lease 丢失，本地
 Candidate 只保留为 salvage 输入，正式 `candidate_id` 授权被清除。
 
+`WorkerDaemon::tick` 使用单个可信 `ServerInstant` 作为本轮观察时间，并按不可交换的顺序执行：
+
+1. 重放全部 Pending Claim intent；任何一个失败即停止本轮，不能越过未知 Claim 再接新工单；
+2. 重放全部 Pending Renew/Release intent；
+3. 对本地 Lease 做 reconciliation、阈值续租或终态释放；Project 必须来自成功 Claim 的不可变记录，
+   不能从多项目配置猜测；
+4. 重新计算非 salvage 执行容量，按项目轮转 Claim，达到 capacity 后停止。
+
+远端 mutation 之前一定已经存在 durable intent。正常 shutdown 只在一个 tick 完成后生效；硬崩溃或
+调用取消则由同一意图和 idempotency key 在下一次启动恢复。定时器采用 delay 语义，慢请求不会触发
+追赶式 mutation burst。
+
 ## 5. 外部副作用与重启恢复
 
 模型 Turn 属于 `NON_REPEATABLE`：
@@ -153,6 +168,7 @@ cargo fmt --all -- --check
 - Worker 重启后查询原非幂等 Turn，并恢复 Pending Verification；
 - Claim 响应执行快照的双端摘要校验、远端调用前 durable intent、ACK-loss/restart exact replay、漏收
   Renew 导入、阈值续租、终态 Release 和 Revoke 停止；
+- daemon 严格配置、节点指纹、pending-first 启动顺序、容量门禁、Claim ACK-loss 后重启恢复与自动续租；
 - Turn budget 与 Lease expiry 在启动 Executor 前阻止新副作用。
 
 ## 7. 下一纵切
@@ -160,10 +176,9 @@ cargo fmt --all -- --check
 MVP-02 的下一检查点按顺序接入：
 
 1. Worker enrollment、本地节点身份与 loopback HTTP / LAN mTLS 控制面 adapter；
-2. daemon 定时循环与 pending intent 启动恢复的组合根；
-3. workspace/日志/凭据目录隔离与受控命令执行；
-4. jcode bridge 版本握手、能力探测、operation query 与 sanitized transcript；
-5. Candidate Artifact 上传及 `RecordCandidate` handoff。
+2. workspace/日志/凭据目录隔离与受控命令执行；
+3. jcode bridge 版本握手、能力探测、operation query 与 sanitized transcript；
+4. Candidate Artifact 上传及 `RecordCandidate` handoff。
 
-在这些入口完成前，`worker-daemon` 二进制仍是组合根骨架；本检查点交付的是可复用且经过故障测试的
-runtime/library 边界，不是可以连接真实控制面的最终 daemon。
+在 transport 与 enrollment 完成前，`worker-daemon` 二进制仍未连接真实控制面；本检查点交付的是可复用、
+可定时运行且经过故障测试的 library composition root，不是最终可部署 daemon。
