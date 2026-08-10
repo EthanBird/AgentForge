@@ -11,7 +11,10 @@ use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::{
-    config::{ConfigError, WorkerDaemonConfig},
+    config::{ConfigError, WorkerDaemonConfig, WorkerDriverMode},
+    fixture_driver::{
+        FixtureDriveContext, FixtureDriveIds, FixtureDriverError, drive_fixture_attempt,
+    },
     journal::{Journal, JournalError},
     lifecycle::{
         ClaimIntent, LeaseMaintenanceIntent, LeaseMaintenanceOutcome, LifecycleError,
@@ -51,6 +54,8 @@ pub struct DaemonTickReport {
     pub stopped: u16,
     pub claimed: u16,
     pub active_attempts: u16,
+    pub driven_attempts: u16,
+    pub local_candidates_ready: u16,
 }
 
 #[derive(Debug, Error)]
@@ -61,6 +66,8 @@ pub enum DaemonError {
     Journal(#[from] JournalError),
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
+    #[error(transparent)]
+    FixtureDriver(#[from] FixtureDriverError),
     #[error("daemon runtime produced an invalid identifier")]
     InvalidRuntimeId,
     #[error("attempt {0} has no durable Project binding")]
@@ -76,6 +83,7 @@ impl DaemonError {
             Self::Config(error) => error.code(),
             Self::Journal(error) => error.code(),
             Self::Lifecycle(error) => error.code(),
+            Self::FixtureDriver(error) => error.code(),
             Self::InvalidRuntimeId => "AF_WORKER_RUNTIME_ID_INVALID",
             Self::MissingProjectBinding(_) => "AF_WORKER_PROJECT_BINDING_MISSING",
             Self::CounterOverflow => "AF_WORKER_COUNTER_OVERFLOW",
@@ -173,6 +181,45 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
             record_maintenance_outcome(&mut report, &outcome)?;
         }
 
+        if self.config.driver_mode == WorkerDriverMode::Fixture {
+            let runnable = self
+                .journal
+                .recover_nonterminal()?
+                .into_iter()
+                .filter(|state| {
+                    matches!(
+                        state.phase(),
+                        WorkerPhase::Granted
+                            | WorkerPhase::Preparing
+                            | WorkerPhase::Baseline
+                            | WorkerPhase::Planning
+                            | WorkerPhase::Implementing
+                            | WorkerPhase::LocalVerifying
+                    )
+                })
+                .collect::<Vec<_>>();
+            for state in runnable {
+                let context = FixtureDriveContext {
+                    observed_at,
+                    operation_timeout_seconds: self.config.operation_timeout_seconds,
+                    ids: self.fixture_drive_ids()?,
+                };
+                let outcome = drive_fixture_attempt(
+                    &mut self.journal,
+                    self.config.actor_id,
+                    state.attempt_id(),
+                    self.config.max_turns,
+                    context,
+                )?;
+                if outcome.cycle_executed {
+                    increment(&mut report.driven_attempts)?;
+                }
+                if outcome.local_candidate_ready {
+                    increment(&mut report.local_candidates_ready)?;
+                }
+            }
+        }
+
         let active = self
             .journal
             .recover_nonterminal()?
@@ -268,6 +315,17 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
             correlation_id: CorrelationId::from(self.next_uuid()?),
             idempotency_key: idempotency_key("worker-lease", intent_id)?,
             observed_at,
+        })
+    }
+
+    fn fixture_drive_ids(&mut self) -> DaemonResult<FixtureDriveIds> {
+        Ok(FixtureDriveIds {
+            preparation: self.next_uuid()?,
+            workspace: self.next_uuid()?,
+            baseline: self.next_uuid()?,
+            plan: self.next_uuid()?,
+            turn_operation: self.next_uuid()?,
+            verification_operation: self.next_uuid()?,
         })
     }
 
@@ -615,6 +673,9 @@ mod tests {
             renew_before_seconds: 15,
             extend_by_seconds: 30,
             tick_seconds: 5,
+            driver_mode: crate::config::WorkerDriverMode::LeaseOnly,
+            max_turns: 3,
+            operation_timeout_seconds: 60,
         }
     }
 
@@ -702,6 +763,41 @@ mod tests {
         );
         assert_eq!(*control.claims.lock().expect("claims"), 1);
         assert_eq!(control.offers.lock().expect("offers").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fixture_mode_drives_claimed_work_to_local_candidate_without_overclaiming() {
+        let (_directory, mut config, control, runtime) = fixture();
+        config.driver_mode = crate::config::WorkerDriverMode::Fixture;
+        let mut daemon = WorkerDaemon::open(control.clone(), config, runtime).expect("daemon");
+        assert_eq!(daemon.tick().await.expect("claim tick").claimed, 1);
+
+        daemon.runtime.now = at(1);
+        control.set_now(at(1));
+        let report = daemon.tick().await.expect("fixture drive tick");
+        assert_eq!(report.driven_attempts, 1);
+        assert_eq!(report.local_candidates_ready, 1);
+        assert_eq!(
+            report.claimed, 0,
+            "a local Candidate still owns its author Lease and capacity"
+        );
+        assert_eq!(report.active_attempts, 1);
+        assert_eq!(
+            daemon
+                .journal()
+                .load_attempt(id(10))
+                .expect("load first")
+                .expect("first attempt")
+                .phase(),
+            WorkerPhase::SealingCandidate
+        );
+        assert!(
+            daemon
+                .journal()
+                .load_attempt(id(12))
+                .expect("load second")
+                .is_none()
+        );
     }
 
     #[test]

@@ -18,14 +18,17 @@
   reconciliation；
 - `config.rs`：严格、限长、拒绝未知字段的 daemon 配置，以及包含 runtime/policy 的稳定节点指纹；
 - `daemon.rs`：单写者组合根，固定执行 pending Claim → pending Renew/Release → Lease maintenance →
-  capacity-bounded Claim；
+  configured driver → capacity-bounded Claim；
 - `http_control.rs`：有总超时、header/body 上限和严格错误契约的 loopback HTTP/1 adapter；
+- `fixture_driver.rs`：显式 opt-in 的确定性演示驱动，把已领取工单推进到本地 `SealingCandidate`，并复用
+  正式 Journal、Supervisor、operation ledger 和重启查询路径；
 - `FakeTurnExecutor` / `FakeVerifier`：MVP 的确定性执行和故障注入边界，后续 jcode adapter 实现相同
   trait。
 
 本检查点已经提供 transport-independent 的 Offer/Claim/Lease 端口、可恢复调度循环、loopback HTTP
-adapter 和可启动二进制，但没有宣称完成 LAN mTLS、Worker enrollment、workspace sandbox 或 jcode
-进程桥接；这些属于 MVP-02 后续纵切。
+adapter、可启动二进制和 fixture 端到端演示，但没有宣称 fixture 会调用 jcode、修改真实 workspace、
+生成真实 Git 对象或向服务器提交 Candidate。LAN mTLS、Worker enrollment、workspace sandbox、jcode
+进程桥接和 Candidate handoff 属于 MVP-02 后续纵切。
 
 ## 2. 状态机边界
 
@@ -126,7 +129,11 @@ Candidate 只保留为 salvage 输入，正式 `candidate_id` 授权被清除。
 2. 重放全部 Pending Renew/Release intent；
 3. 对本地 Lease 做 reconciliation、阈值续租或终态释放；Project 必须来自成功 Claim 的不可变记录，
    不能从多项目配置猜测；
-4. 重新计算非 salvage 执行容量，按项目轮转 Claim，达到 capacity 后停止。
+4. 若显式启用 fixture driver，把现有 runnable Attempt 推进到本地 `SealingCandidate`；
+5. 重新计算非 salvage 作者 Attempt 容量，按项目轮转 Claim，达到 capacity 后停止。
+
+`SealingCandidate` 仍占用 `capacity`：在 Artifact/Candidate handoff 尚未完成时，它继续持有作者 Lease，
+不能因为模型计算已经结束就无限积压本地候选并继续接单。
 
 远端 mutation 之前一定已经存在 durable intent。正常 shutdown 只在一个 tick 完成后生效；硬崩溃或
 调用取消则由同一意图和 idempotency key 在下一次启动恢复。定时器采用 delay 语义，慢请求不会触发
@@ -145,8 +152,9 @@ userinfo、path/query、端口 0 与非 loopback 地址一律在配置阶段拒�
 - Claim/Renew/Release 传递原 command/correlation/idempotency/If-Match，body 只包含服务器 API 规定的
   typed input，不能由客户端注入 actor。
 
-示例配置位于 `examples/worker-loopback.json`。复制后至少替换 Project/actor/executor/node ID、runtime
-fingerprint 与 Journal 路径，然后启动：
+安全默认示例位于 `examples/worker-loopback.json`，其 `driver_mode` 为 `lease_only`，只执行 Claim 与 Lease
+维护。确定性演示使用独立 Journal 的 `examples/worker-loopback-fixture.json`。复制任一示例后至少替换
+Project/actor/executor/node ID、runtime fingerprint 与 Journal 路径，然后启动：
 
 ```bash
 install -d -m 0700 /var/lib/agentforge
@@ -172,6 +180,24 @@ Local Verification 标记为 `IDEMPOTENT`。重启后使用原 operation ID 和�
 事务中完成 operation 与验证事实。Pending operation 与当前 Attempt phase、kind、class、semantic key、
 request digest 或 deadline 任一不一致时，稳定返回 `AF_WORKER_RECOVERY_CONFLICT`。
 
+### 5.1 Fixture driver 的诚实边界
+
+`driver_mode=fixture` 仅用于在同机 MVP 控制面上验证“领取 → 本地阶段 → Turn operation → 本地验收”
+这条可恢复调用链：
+
+- Preparation、workspace、baseline 与 plan 事实使用稳定 JCS/SHA-256 派生值；
+- 非幂等 Turn 的输出由已持久化 operation ID 确定性派生，因此 daemon 重启后的
+  `query(operation_id)` 不依赖进程内存，也不会重新启动一次 Turn；
+- Local Verification 始终产生一个显式 hard-pass evidence digest；
+- 生成的 tree 只是 SHA-1 形状的内容寻址测试值，不写入 Git；SHA-256 object-format 仓库会在任何阶段
+  变更前以 `AF_WORKER_FIXTURE_GIT_FORMAT_UNSUPPORTED` 拒绝；
+- 驱动最多到本地 `SealingCandidate`。它不创建中央 `Candidate`、不上传 Artifact、不释放作者 Lease，
+  更不代表独立 VerificationRun 或 `candidate_ready` 已通过。
+
+因此 fixture 模式不能用于不可信工单或生产开发。`lease_only` 是当前安全默认；后续 jcode bridge 将实现
+相同的 `TurnExecutor`/`LocalVerifier` 边界，并以真实 workspace sandbox 与 Git object evidence 取代
+fixture 值。
+
 ## 6. 当前验证证据
 
 本地定点门禁：
@@ -196,6 +222,8 @@ cargo fmt --all -- --check
   Renew 导入、阈值续租、终态 Release 和 Revoke 停止；
 - daemon 严格配置、节点指纹、pending-first 启动顺序、容量门禁、Claim ACK-loss 后重启恢复与自动续租；
 - loopback HTTP 的真实 Axum contract、command header、远端错误码、重复 JSON、body 上限和总 timeout；
+- fixture driver 的完整本地阶段推进、重启后确定性 operation query、SHA-256 仓库 fail-closed，以及
+  `SealingCandidate` 继续占用容量、防止无界接单；
 - Turn budget 与 Lease expiry 在启动 Executor 前阻止新副作用。
 
 ## 7. 下一纵切
@@ -207,5 +235,6 @@ MVP-02 的下一检查点按顺序接入：
 3. jcode bridge 版本握手、能力探测、operation query 与 sanitized transcript；
 4. Candidate Artifact 上传及 `RecordCandidate` handoff。
 
-当前二进制已经能连接同机控制面执行 Offer/Claim/Lease 循环；在 enrollment、执行桥和 sandbox 完成前，
-它仍不是可以接收不可信工单的最终部署形态。
+当前二进制已经能连接同机控制面执行 Offer/Claim/Lease 循环，并可在明确的 fixture 模式走到本地候选；
+在 enrollment、真实执行桥、sandbox 和 Candidate handoff 完成前，它仍不是可以接收不可信工单的最终
+部署形态。

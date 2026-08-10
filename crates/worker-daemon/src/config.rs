@@ -16,6 +16,13 @@ use crate::lifecycle::{LeaseMaintenancePolicy, WorkerIdentity};
 const CONFIG_SCHEMA_VERSION: u16 = 1;
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerDriverMode {
+    LeaseOnly,
+    Fixture,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerDaemonConfig {
@@ -36,6 +43,9 @@ pub struct WorkerDaemonConfig {
     pub renew_before_seconds: u32,
     pub extend_by_seconds: u32,
     pub tick_seconds: u32,
+    pub driver_mode: WorkerDriverMode,
+    pub max_turns: u32,
+    pub operation_timeout_seconds: u32,
 }
 
 impl WorkerDaemonConfig {
@@ -92,6 +102,9 @@ impl WorkerDaemonConfig {
             || self.extend_by_seconds > 86_400
             || self.tick_seconds == 0
             || self.tick_seconds > 300
+            || self.max_turns == 0
+            || self.max_turns > 100
+            || !(1..=3_600).contains(&self.operation_timeout_seconds)
         {
             return Err(ConfigError::Invalid);
         }
@@ -191,6 +204,9 @@ mod tests {
             renew_before_seconds: 15,
             extend_by_seconds: 30,
             tick_seconds: 5,
+            driver_mode: WorkerDriverMode::LeaseOnly,
+            max_turns: 3,
+            operation_timeout_seconds: 60,
         }
     }
 
@@ -258,6 +274,9 @@ mod tests {
             "renew_before_seconds": 15,
             "extend_by_seconds": 30,
             "tick_seconds": 5,
+            "driver_mode": "lease_only",
+            "max_turns": 3,
+            "operation_timeout_seconds": 60,
             "unexpected": true
         });
         fs::write(&path, serde_json::to_vec(&with_unknown).expect("JSON"))
@@ -276,9 +295,18 @@ mod tests {
             serde_json::from_slice(include_bytes!("../../../examples/worker-loopback.json"))
                 .expect("strictly typed example");
         example.validate().expect("release-valid example");
+        assert_eq!(example.driver_mode, WorkerDriverMode::LeaseOnly);
         assert_eq!(
             example.control_plane_address().expect("loopback address"),
             "127.0.0.1:8080".parse().expect("fixture address")
         );
+
+        let fixture: WorkerDaemonConfig = serde_json::from_slice(include_bytes!(
+            "../../../examples/worker-loopback-fixture.json"
+        ))
+        .expect("strictly typed fixture example");
+        fixture.validate().expect("release-valid fixture example");
+        assert_eq!(fixture.driver_mode, WorkerDriverMode::Fixture);
+        assert_ne!(fixture.journal_path, example.journal_path);
     }
 }

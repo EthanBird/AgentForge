@@ -205,7 +205,10 @@ sandbox、jcode bridge 与 Candidate Artifact handoff。
 
 ## MVP-02 / Checkpoint H：真实 Loopback HTTP Worker
 
-状态：本地实现与完整 workspace 门禁通过；等待提交和远端 CI。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端提交：`772da360533553632363d505e212343b875001ba`
+- GitHub Actions：CI #65 / run `31351154870`
 
 当前完成：
 
@@ -223,3 +226,35 @@ sandbox、jcode bridge 与 Candidate Artifact handoff。
 
 仍待：Worker enrollment、LAN mTLS、sandbox、jcode bridge、把 Turn Pump 接入 daemon，以及 Candidate
 Artifact handoff。
+
+## MVP-02 / Checkpoint I：确定性 Fixture 执行纵切
+
+状态：实现与本地完整门禁通过；本检查点提交后等待远端 CI。
+
+当前完成：
+
+- 新增显式 `driver_mode=fixture`，daemon 在 Lease maintenance 后驱动已领取 Attempt，并在下一轮 Claim
+  前重新计算容量；安全默认 `lease_only` 不执行任何模拟开发动作；
+- fixture 复用正式 Worker 状态机、SQLite Journal、Supervisor 与 operation ledger，依次持久化
+  Preparation、workspace、baseline、plan、Turn 和 Local Verification；
+- 非幂等 Turn 输出只由 durable operation ID 决定，进程重启后可查询相同结果，不依赖内存、不重复启动；
+- hard-pass 后到达本地 `SealingCandidate`，但明确不生成真实 Git 对象、不上传 Artifact、不创建中央
+  Candidate，也不冒充独立验收；
+- fixture 仅支持 SHA-1-shaped 测试 tree；SHA-256 object-format 仓库在任何 Attempt 变更前 fail closed；
+- `SealingCandidate` 在 handoff 完成前继续占用作者 Attempt capacity，防止 daemon 每轮继续接单造成无界
+  本地候选与 Lease 积压；
+- 新增独立 `examples/worker-loopback-fixture.json`，生产形态示例继续固定为 `lease_only`；
+- Worker 定点测试增至 39 项，其中包含关闭并重新打开 SQLite Journal 后按原 operation ID 恢复
+  非幂等 Turn 的端到端用例。
+
+本地证据：
+
+```text
+cargo test -p agentforge-worker-daemon --all-features --locked --offline  PASS (39)
+cargo clippy -p agentforge-worker-daemon --all-targets --all-features \
+  --locked --offline -- -D warnings                                      PASS
+cargo fmt --all -- --check                                               PASS
+```
+
+仍待：真实 workspace sandbox、jcode bridge、Candidate Artifact/`RecordCandidate` handoff、Worker
+enrollment 与 LAN mTLS。

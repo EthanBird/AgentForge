@@ -463,6 +463,9 @@ mod tests {
             renew_before_seconds: 15,
             extend_by_seconds: 30,
             tick_seconds: 5,
+            driver_mode: crate::config::WorkerDriverMode::LeaseOnly,
+            max_turns: 3,
+            operation_timeout_seconds: 60,
         }
     }
 

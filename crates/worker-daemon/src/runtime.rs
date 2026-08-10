@@ -336,6 +336,16 @@ impl WorkerAttemptState {
     }
 
     #[must_use]
+    pub const fn package_hash(&self) -> Sha256Digest {
+        self.package_hash
+    }
+
+    #[must_use]
+    pub const fn base_commit(&self) -> &GitObjectId {
+        &self.base_commit
+    }
+
+    #[must_use]
     pub const fn lease_id(&self) -> LeaseId {
         self.lease_id
     }
