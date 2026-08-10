@@ -808,7 +808,7 @@ impl PostgresMvpControlPlane {
             .await?;
             metadata.require_version(loaded.artifact.version())?;
             let now = uow.server_now().await?;
-            validate_completed_artifact_authority(
+            validate_artifact_authority(
                 &package,
                 &attempt,
                 &lease,
@@ -1054,7 +1054,7 @@ impl PostgresMvpControlPlane {
             .await?;
             metadata.require_version(attempt.attempt.version)?;
             let now = uow.server_now().await?;
-            validate_artifact_authority(
+            validate_completed_artifact_authority(
                 &package,
                 &attempt,
                 &lease,
