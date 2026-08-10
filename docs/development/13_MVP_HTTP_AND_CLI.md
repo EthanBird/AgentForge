@@ -84,6 +84,22 @@ Complete 的 `If-Match` 是当前 Artifact version。服务端按声明顺序读
 
 CAS 过期固定返回 `AF_VERSION_STALE/412`，不得使用旧拼写 `AF_STALE_VERSION`。
 
+### 2.2 Worker Artifact upload Journal
+
+Worker SQLite Journal schema v5 增加 `candidate_artifact_command_intents`。Init、每个 Chunk、Complete 都以
+完整 typed command、actor、idempotency key、Attempt binding、请求摘要和创建时间先于 HTTP 调用提交；
+成功后再以一个 SQLite 事务写入 typed response、响应摘要和完成时间。请求字段、完成回执和状态转换由
+触发器保护，不能 UPDATE 改写或 DELETE。
+
+重启时只允许按 `(created_at, intent_id)` 读取 pending intent，并重放原 command；不得重新生成 command ID、
+key、chunk 内容或 Bundle binding。即使 ACK 丢失后本地 Worker 已观察到 Lease 丢失，远端 receipt-first
+回放得到的原始成功响应仍可写入 Journal；但 receipt miss 的新命令必须重新通过当前 Lease/fencing 门禁。
+Init 回执固定 `UPLOADING/version=1`，Chunk 回执必须逐字段匹配声明和内容摘要，Complete 回执必须与 Init 的
+Candidate/Artifact/Bundle lineage 完全一致且为 `COMPLETE/version=3`。
+
+v2、v3、v4 Journal 在独占 SQLite 迁移事务内逐级升级到 v5；未知版本 fail closed。本阶段只交付 durable
+intent/receipt ledger，daemon 自动创建这些 intent 并驱动 fixture Bundle 上传属于下一检查点。
+
 ## 3. 管理 CLI
 
 CLI 与 HTTP 使用相同的 application port；它不会绕过领域状态机、typed rows、receipt、Event 或

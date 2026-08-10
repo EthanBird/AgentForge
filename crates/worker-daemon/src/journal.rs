@@ -7,12 +7,15 @@
 use std::{path::Path, str::FromStr};
 
 use agentforge_application::{
-    ClaimPackageInput, LeaseView, MvpCommand, OfferView, PackageExecutionSnapshot,
-    ReleaseLeaseInput, RenewLeaseInput,
+    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
+    CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, MvpCommand, OfferView,
+    PackageExecutionSnapshot, ReleaseLeaseInput, RenewLeaseInput,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
-    ActorId, AttemptId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, LeaseId, NodeId,
-    ProjectId, ProtocolKey, ServerInstant, Sha256Digest, work_package::WorkPackageState,
+    ActorId, AttemptId, CandidateArtifactId, CandidateArtifactState, CommandId, CorrelationId,
+    ExecutorId, IdempotencyKey, LeaseId, NodeId, ProjectId, ProtocolKey, ServerInstant,
+    Sha256Digest, work_package::WorkPackageState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -21,10 +24,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::runtime::{
-    AttemptGrant, WorkerAttemptState, WorkerCommandEnvelope, WorkerError, WorkerFact, grant_fact,
+    AttemptGrant, WorkerAttemptState, WorkerCommandEnvelope, WorkerError, WorkerFact, WorkerPhase,
+    grant_fact,
 };
 
-const JOURNAL_SCHEMA_VERSION: i64 = 4;
+const JOURNAL_SCHEMA_VERSION: i64 = 5;
 const OUTBOX_DESTINATION: &str = "control-plane.worker-events";
 const MAX_INLINE_EXECUTION_BYTES: usize = 1_048_576;
 
@@ -153,6 +157,26 @@ CREATE TABLE lease_command_intents (
           AND completed_at IS NOT NULL))
 );
 
+CREATE TABLE candidate_artifact_command_intents (
+  intent_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('init', 'upload_chunk', 'complete')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  response_json TEXT,
+  response_digest TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  CHECK ((state = 'pending' AND response_json IS NULL AND response_digest IS NULL
+          AND completed_at IS NULL)
+      OR (state = 'completed' AND response_json IS NOT NULL AND response_digest IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
 CREATE INDEX operations_pending_idx
   ON operations (attempt_id, planned_at, operation_id)
   WHERE state = 'pending';
@@ -167,6 +191,10 @@ CREATE INDEX claim_intents_pending_idx
 
 CREATE INDEX lease_command_intents_pending_idx
   ON lease_command_intents (created_at, intent_id)
+  WHERE state = 'pending';
+
+CREATE INDEX candidate_artifact_command_intents_pending_idx
+  ON candidate_artifact_command_intents (created_at, intent_id)
   WHERE state = 'pending';
 
 CREATE TRIGGER attempts_binding_is_immutable
@@ -326,6 +354,37 @@ BEFORE DELETE ON lease_command_intents
 BEGIN
   SELECT RAISE(ABORT, 'lease command intents cannot be deleted');
 END;
+
+CREATE TRIGGER candidate_artifact_command_intents_request_is_immutable
+BEFORE UPDATE ON candidate_artifact_command_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.attempt_id <> OLD.attempt_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.kind <> OLD.kind
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'candidate artifact command intent request is immutable');
+END;
+
+CREATE TRIGGER candidate_artifact_command_intents_state_is_monotonic
+BEFORE UPDATE ON candidate_artifact_command_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'candidate artifact command intent state is monotonic');
+END;
+
+CREATE TRIGGER candidate_artifact_command_intents_cannot_be_deleted
+BEFORE DELETE ON candidate_artifact_command_intents
+BEGIN
+  SELECT RAISE(ABORT, 'candidate artifact command intents cannot be deleted');
+END;
 "#;
 
 const MIGRATE_V2_TO_V3: &str = r#"
@@ -434,6 +493,63 @@ CREATE TRIGGER lease_command_intents_cannot_be_deleted
 BEFORE DELETE ON lease_command_intents
 BEGIN
   SELECT RAISE(ABORT, 'lease command intents cannot be deleted');
+END;
+"#;
+
+const MIGRATE_V4_TO_V5: &str = r#"
+CREATE TABLE candidate_artifact_command_intents (
+  intent_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('init', 'upload_chunk', 'complete')),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  response_json TEXT,
+  response_digest TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  CHECK ((state = 'pending' AND response_json IS NULL AND response_digest IS NULL
+          AND completed_at IS NULL)
+      OR (state = 'completed' AND response_json IS NOT NULL AND response_digest IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
+CREATE INDEX candidate_artifact_command_intents_pending_idx
+  ON candidate_artifact_command_intents (created_at, intent_id)
+  WHERE state = 'pending';
+
+CREATE TRIGGER candidate_artifact_command_intents_request_is_immutable
+BEFORE UPDATE ON candidate_artifact_command_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.attempt_id <> OLD.attempt_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.kind <> OLD.kind
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'candidate artifact command intent request is immutable');
+END;
+
+CREATE TRIGGER candidate_artifact_command_intents_state_is_monotonic
+BEFORE UPDATE ON candidate_artifact_command_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.response_json IS NULL
+  OR NEW.response_digest IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'candidate artifact command intent state is monotonic');
+END;
+
+CREATE TRIGGER candidate_artifact_command_intents_cannot_be_deleted
+BEFORE DELETE ON candidate_artifact_command_intents
+BEGIN
+  SELECT RAISE(ABORT, 'candidate artifact command intents cannot be deleted');
 END;
 "#;
 
@@ -666,6 +782,221 @@ pub enum LeaseCommandRegistration {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LeaseCommandCompletion {
+    Completed,
+    Existing,
+}
+
+/// Durable author-side Candidate Artifact mutation. Each command is written to
+/// SQLite before the Worker performs the HTTP effect, so a crash or lost ACK
+/// can only replay the exact actor/key/body tuple.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateArtifactControlCommand {
+    Init {
+        command: MvpCommand<InitCandidateArtifactInput>,
+    },
+    UploadChunk {
+        command: MvpCommand<UploadCandidateArtifactChunkInput>,
+    },
+    Complete {
+        command: MvpCommand<CompleteCandidateArtifactInput>,
+    },
+}
+
+impl CandidateArtifactControlCommand {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Init { .. } => "init",
+            Self::UploadChunk { .. } => "upload_chunk",
+            Self::Complete { .. } => "complete",
+        }
+    }
+
+    #[must_use]
+    pub const fn actor_id(&self) -> ActorId {
+        match self {
+            Self::Init { command } => command.context.actor_id,
+            Self::UploadChunk { command } => command.context.actor_id,
+            Self::Complete { command } => command.context.actor_id,
+        }
+    }
+
+    fn idempotency_key(&self) -> &IdempotencyKey {
+        match self {
+            Self::Init { command } => &command.context.idempotency_key,
+            Self::UploadChunk { command } => &command.context.idempotency_key,
+            Self::Complete { command } => &command.context.idempotency_key,
+        }
+    }
+
+    const fn project_id(&self) -> ProjectId {
+        match self {
+            Self::Init { command } => command.input.project_id,
+            Self::UploadChunk { command } => command.input.project_id,
+            Self::Complete { command } => command.input.project_id,
+        }
+    }
+
+    const fn lease_id(&self) -> LeaseId {
+        match self {
+            Self::Init { command } => command.input.lease_id,
+            Self::UploadChunk { command } => command.input.lease_id,
+            Self::Complete { command } => command.input.lease_id,
+        }
+    }
+
+    const fn node_id(&self) -> NodeId {
+        match self {
+            Self::Init { command } => command.input.node_id,
+            Self::UploadChunk { command } => command.input.node_id,
+            Self::Complete { command } => command.input.node_id,
+        }
+    }
+
+    const fn fencing_token(&self) -> agentforge_domain::FencingToken {
+        match self {
+            Self::Init { command } => command.input.fencing_token,
+            Self::UploadChunk { command } => command.input.fencing_token,
+            Self::Complete { command } => command.input.fencing_token,
+        }
+    }
+
+    const fn expected_version(&self) -> Option<agentforge_domain::AggregateVersion> {
+        match self {
+            Self::Init { command } => command.context.expected_version,
+            Self::UploadChunk { command } => command.context.expected_version,
+            Self::Complete { command } => command.context.expected_version,
+        }
+    }
+
+    fn validate(&self) -> JournalResult<()> {
+        let (command_id, correlation_id) = match self {
+            Self::Init { command } => (command.context.command_id, command.context.correlation_id),
+            Self::UploadChunk { command } => {
+                (command.context.command_id, command.context.correlation_id)
+            }
+            Self::Complete { command } => {
+                (command.context.command_id, command.context.correlation_id)
+            }
+        };
+        if command_id.as_uuid().is_nil()
+            || self.actor_id().as_uuid().is_nil()
+            || correlation_id.as_uuid().is_nil()
+            || self.expected_version().is_none()
+            || self.project_id().as_uuid().is_nil()
+            || self.lease_id().as_uuid().is_nil()
+            || self.node_id().as_uuid().is_nil()
+        {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "candidate_artifact_control_command",
+            )));
+        }
+        match self {
+            Self::Init { command }
+                if command.input.attempt_id.as_uuid().is_nil()
+                    || command.input.chunk_digests.is_empty()
+                    || command.input.chunk_digests.len() > 16_384
+                    || command.input.expected_bundle_size_bytes == 0
+                    || command.input.expected_bundle_size_bytes > 16 * 1_048_576
+                    || !(60..=86_400).contains(&command.input.upload_ttl_seconds)
+                    || command.input.chunk_digests.iter().any(digest_is_zero) =>
+            {
+                Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                    "candidate_artifact_init",
+                )))
+            }
+            Self::UploadChunk { command }
+                if command.input.artifact_id.as_uuid().is_nil()
+                    || command.input.content.is_empty()
+                    || command.input.content.len() > 1_048_576
+                    || command.input.digest != Sha256Digest::of_bytes(&command.input.content) =>
+            {
+                Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                    "candidate_artifact_chunk",
+                )))
+            }
+            Self::Complete { command }
+                if command.input.artifact_id.as_uuid().is_nil()
+                    || command.input.bundle_uri.trim().is_empty()
+                    || command.input.bundle_uri.len() > 2_048
+                    || command.input.bundle_uri.chars().any(char::is_control) =>
+            {
+                Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                    "candidate_artifact_complete",
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateArtifactCommandResponse {
+    Init {
+        artifact: CandidateArtifactView,
+    },
+    UploadChunk {
+        receipt: CandidateArtifactChunkReceipt,
+    },
+    Complete {
+        artifact: CandidateArtifactView,
+    },
+}
+
+impl CandidateArtifactCommandResponse {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Init { .. } => "init",
+            Self::UploadChunk { .. } => "upload_chunk",
+            Self::Complete { .. } => "complete",
+        }
+    }
+
+    const fn artifact_id(&self) -> CandidateArtifactId {
+        match self {
+            Self::Init { artifact } | Self::Complete { artifact } => artifact.artifact_id,
+            Self::UploadChunk { receipt } => receipt.artifact_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateArtifactCommandIntentRecord {
+    pub intent_id: Uuid,
+    pub attempt_id: AttemptId,
+    pub command: CandidateArtifactControlCommand,
+    pub created_at: ServerInstant,
+}
+
+impl CandidateArtifactCommandIntentRecord {
+    fn validate(&self) -> JournalResult<()> {
+        if self.intent_id.is_nil() || self.attempt_id.as_uuid().is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "candidate_artifact_command_intent",
+            )));
+        }
+        self.command.validate()?;
+        if let CandidateArtifactControlCommand::Init { command } = &self.command
+            && command.input.attempt_id != self.attempt_id
+        {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "candidate_artifact_command_intent",
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateArtifactCommandRegistration {
+    Registered,
+    Existing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CandidateArtifactCommandCompletion {
     Completed,
     Existing,
 }
@@ -1179,6 +1510,459 @@ fn load_lease_command_by_key(
         .transpose()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateArtifactCommandState {
+    Pending,
+    Completed,
+}
+
+impl CandidateArtifactCommandState {
+    fn parse(value: &str) -> JournalResult<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            _ => Err(JournalError::Integrity),
+        }
+    }
+}
+
+struct StoredCandidateArtifactCommand {
+    record: CandidateArtifactCommandIntentRecord,
+    state: CandidateArtifactCommandState,
+    response: Option<CandidateArtifactCommandResponse>,
+    completed_at: Option<ServerInstant>,
+}
+
+struct RawCandidateArtifactCommand {
+    intent_id: String,
+    attempt_id: String,
+    actor_id: String,
+    idempotency_key: String,
+    kind: String,
+    state: String,
+    intent_json: String,
+    intent_digest: String,
+    created_at: String,
+    response_json: Option<String>,
+    response_digest: Option<String>,
+    completed_at: Option<String>,
+}
+
+fn raw_candidate_artifact_command_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawCandidateArtifactCommand> {
+    Ok(RawCandidateArtifactCommand {
+        intent_id: row.get(0)?,
+        attempt_id: row.get(1)?,
+        actor_id: row.get(2)?,
+        idempotency_key: row.get(3)?,
+        kind: row.get(4)?,
+        state: row.get(5)?,
+        intent_json: row.get(6)?,
+        intent_digest: row.get(7)?,
+        created_at: row.get(8)?,
+        response_json: row.get(9)?,
+        response_digest: row.get(10)?,
+        completed_at: row.get(11)?,
+    })
+}
+
+fn decode_candidate_artifact_command(
+    raw: RawCandidateArtifactCommand,
+) -> JournalResult<StoredCandidateArtifactCommand> {
+    let record: CandidateArtifactCommandIntentRecord = decode_stored(&raw.intent_json)?;
+    record.validate()?;
+    let state = CandidateArtifactCommandState::parse(&raw.state)?;
+    let response = raw
+        .response_json
+        .as_deref()
+        .map(decode_stored::<CandidateArtifactCommandResponse>)
+        .transpose()?;
+    let completed_at = raw
+        .completed_at
+        .map(|value| parse_instant(&value))
+        .transpose()?;
+    let completion_shape_is_valid = match state {
+        CandidateArtifactCommandState::Pending => {
+            response.is_none() && raw.response_digest.is_none() && completed_at.is_none()
+        }
+        CandidateArtifactCommandState::Completed => {
+            response.is_some() && raw.response_digest.is_some() && completed_at.is_some()
+        }
+    };
+    if let Some(response) = &response {
+        validate_candidate_artifact_response_shape(&record, response)?;
+    }
+    if record.intent_id.to_string() != raw.intent_id
+        || record.attempt_id.to_string() != raw.attempt_id
+        || record.command.actor_id().to_string() != raw.actor_id
+        || record.command.idempotency_key().as_str() != raw.idempotency_key
+        || record.command.kind() != raw.kind
+        || instant_text(record.created_at) != raw.created_at
+        || digest_json(&record)?.to_string() != raw.intent_digest
+        || response
+            .as_ref()
+            .zip(raw.response_digest.as_deref())
+            .is_some_and(|(value, digest)| {
+                digest_json(value).map(|d| d.to_string()).ok().as_deref() != Some(digest)
+            })
+        || !completion_shape_is_valid
+        || completed_at.is_some_and(|instant| instant < record.created_at)
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(StoredCandidateArtifactCommand {
+        record,
+        state,
+        response,
+        completed_at,
+    })
+}
+
+fn load_candidate_artifact_command_by_id(
+    connection: &Connection,
+    intent_id: Uuid,
+) -> JournalResult<Option<StoredCandidateArtifactCommand>> {
+    connection
+        .query_row(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM candidate_artifact_command_intents WHERE intent_id = ?1",
+            [intent_id.to_string()],
+            raw_candidate_artifact_command_row,
+        )
+        .optional()?
+        .map(decode_candidate_artifact_command)
+        .transpose()
+}
+
+fn load_candidate_artifact_command_by_key(
+    connection: &Connection,
+    actor_id: ActorId,
+    idempotency_key: &IdempotencyKey,
+) -> JournalResult<Option<StoredCandidateArtifactCommand>> {
+    connection
+        .query_row(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM candidate_artifact_command_intents \
+             WHERE actor_id = ?1 AND idempotency_key = ?2",
+            params![actor_id.to_string(), idempotency_key.as_str()],
+            raw_candidate_artifact_command_row,
+        )
+        .optional()?
+        .map(decode_candidate_artifact_command)
+        .transpose()
+}
+
+struct CompletedCandidateArtifactInit {
+    record: CandidateArtifactCommandIntentRecord,
+    artifact: CandidateArtifactView,
+}
+
+fn load_completed_candidate_artifact_init(
+    connection: &Connection,
+    attempt_id: AttemptId,
+    artifact_id: CandidateArtifactId,
+) -> JournalResult<Option<CompletedCandidateArtifactInit>> {
+    let mut statement = connection.prepare(
+        "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                intent_digest, created_at, response_json, response_digest, completed_at \
+         FROM candidate_artifact_command_intents \
+         WHERE attempt_id = ?1 AND kind = 'init' AND state = 'completed' \
+         ORDER BY created_at, intent_id",
+    )?;
+    let rows = statement.query_map([attempt_id.to_string()], raw_candidate_artifact_command_row)?;
+    let matches = rows
+        .map(|row| {
+            let stored = decode_candidate_artifact_command(row?)?;
+            match stored.response {
+                Some(CandidateArtifactCommandResponse::Init { artifact })
+                    if artifact.artifact_id == artifact_id =>
+                {
+                    Ok(Some(CompletedCandidateArtifactInit {
+                        record: stored.record,
+                        artifact,
+                    }))
+                }
+                Some(CandidateArtifactCommandResponse::Init { .. }) => Ok(None),
+                _ => Err(JournalError::Integrity),
+            }
+        })
+        .collect::<JournalResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [init] => Ok(Some(CompletedCandidateArtifactInit {
+            record: init.record.clone(),
+            artifact: init.artifact.clone(),
+        })),
+        _ => Err(JournalError::Integrity),
+    }
+}
+
+struct CompletedClaimIntent {
+    record: ClaimIntentRecord,
+    lease_id: LeaseId,
+}
+
+fn load_completed_claim_for_attempt(
+    connection: &Connection,
+    attempt_id: AttemptId,
+) -> JournalResult<Option<CompletedClaimIntent>> {
+    let mut statement = connection.prepare(
+        "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
+                created_at, attempt_id, lease_id, completed_at \
+         FROM claim_intents WHERE state = 'completed' AND attempt_id = ?1 ORDER BY intent_id",
+    )?;
+    let rows = statement.query_map([attempt_id.to_string()], raw_claim_intent_row)?;
+    let records = rows
+        .map(|row| {
+            let stored = decode_claim_intent(row?)?;
+            let lease_id = stored.lease_id.ok_or(JournalError::Integrity)?;
+            if stored.state != ClaimIntentState::Completed || stored.attempt_id != Some(attempt_id)
+            {
+                return Err(JournalError::Integrity);
+            }
+            Ok(CompletedClaimIntent {
+                record: stored.record,
+                lease_id,
+            })
+        })
+        .collect::<JournalResult<Vec<_>>>()?;
+    match records.as_slice() {
+        [] => Ok(None),
+        [claim] => Ok(Some(CompletedClaimIntent {
+            record: claim.record.clone(),
+            lease_id: claim.lease_id,
+        })),
+        _ => Err(JournalError::Integrity),
+    }
+}
+
+fn validate_candidate_artifact_binding(
+    connection: &Connection,
+    record: &CandidateArtifactCommandIntentRecord,
+    state: &WorkerAttemptState,
+) -> JournalResult<CompletedClaimIntent> {
+    let claim = load_completed_claim_for_attempt(connection, record.attempt_id)?
+        .ok_or(JournalError::Integrity)?;
+    if record.command.project_id() != claim.record.offer.project_id
+        || record.command.actor_id() != claim.record.actor_id()
+        || record.command.node_id() != claim.record.node_id()
+        || record.command.lease_id() != state.lease_id()
+        || record.command.lease_id() != claim.lease_id
+        || record.command.fencing_token() != state.lease_generation()
+    {
+        return Err(JournalError::Runtime(WorkerError::LeaseStale));
+    }
+    Ok(claim)
+}
+
+fn validate_candidate_artifact_command_against_attempt(
+    connection: &Connection,
+    record: &CandidateArtifactCommandIntentRecord,
+    state: &WorkerAttemptState,
+) -> JournalResult<()> {
+    validate_candidate_artifact_binding(connection, record, state)?;
+    if !matches!(
+        state.phase(),
+        WorkerPhase::HandingOffCandidate | WorkerPhase::AuthorComplete
+    ) {
+        return Err(JournalError::Runtime(WorkerError::InvalidTransition));
+    }
+    match &record.command {
+        CandidateArtifactControlCommand::Init { command } => {
+            let candidate = state.candidate().ok_or(JournalError::Integrity)?;
+            if command.input.attempt_id != state.attempt_id()
+                || command.input.package_hash != state.package_hash()
+                || command.input.base_commit != *state.base_commit()
+                || command.input.candidate_commit != candidate.commit
+                || command.input.tree_hash != candidate.tree
+                || command.input.author_evidence_digest != candidate.author_evidence_digest
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+        CandidateArtifactControlCommand::UploadChunk { command } => {
+            let init = load_completed_candidate_artifact_init(
+                connection,
+                record.attempt_id,
+                command.input.artifact_id,
+            )?
+            .ok_or(JournalError::Integrity)?;
+            let index =
+                usize::try_from(command.input.chunk_index).map_err(|_| JournalError::Integrity)?;
+            if init.record.command.actor_id() != record.command.actor_id()
+                || command.context.expected_version != Some(init.artifact.version)
+                || init.artifact.chunk_digests.get(index) != Some(&command.input.digest)
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+        CandidateArtifactControlCommand::Complete { command } => {
+            let init = load_completed_candidate_artifact_init(
+                connection,
+                record.attempt_id,
+                command.input.artifact_id,
+            )?
+            .ok_or(JournalError::Integrity)?;
+            if init.record.command.actor_id() != record.command.actor_id()
+                || command.context.expected_version != Some(init.artifact.version)
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_candidate_artifact_response(
+    connection: &Connection,
+    record: &CandidateArtifactCommandIntentRecord,
+    state: &WorkerAttemptState,
+    response: &CandidateArtifactCommandResponse,
+) -> JournalResult<()> {
+    validate_candidate_artifact_response_shape(record, response)?;
+    let claim = validate_candidate_artifact_binding(connection, record, state)?;
+    match (&record.command, response) {
+        (
+            CandidateArtifactControlCommand::Init { .. },
+            CandidateArtifactCommandResponse::Init { artifact },
+        ) => {
+            if artifact.package_id != state.package_id()
+                || artifact.package_id != claim.record.offer.package_id
+                || artifact.revision_id != claim.record.offer.revision_id
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+        (
+            CandidateArtifactControlCommand::UploadChunk { command },
+            CandidateArtifactCommandResponse::UploadChunk { .. },
+        ) => {
+            load_completed_candidate_artifact_init(
+                connection,
+                record.attempt_id,
+                command.input.artifact_id,
+            )?
+            .ok_or(JournalError::Integrity)?;
+        }
+        (
+            CandidateArtifactControlCommand::Complete { command },
+            CandidateArtifactCommandResponse::Complete { artifact },
+        ) => {
+            let init = load_completed_candidate_artifact_init(
+                connection,
+                record.attempt_id,
+                command.input.artifact_id,
+            )?
+            .ok_or(JournalError::Integrity)?;
+            let bundle = artifact.bundle.as_ref().ok_or(JournalError::Integrity)?;
+            if artifact.candidate_id != init.artifact.candidate_id
+                || artifact.package_id != init.artifact.package_id
+                || artifact.revision_id != init.artifact.revision_id
+                || artifact.candidate_commit != init.artifact.candidate_commit
+                || artifact.tree_hash != init.artifact.tree_hash
+                || artifact.expected_bundle_digest != init.artifact.expected_bundle_digest
+                || artifact.expected_bundle_size_bytes != init.artifact.expected_bundle_size_bytes
+                || artifact.chunk_digests != init.artifact.chunk_digests
+                || artifact.created_at != init.artifact.created_at
+                || artifact.expires_at != init.artifact.expires_at
+                || bundle.digest != init.artifact.expected_bundle_digest
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+        _ => return Err(JournalError::Integrity),
+    }
+    Ok(())
+}
+
+fn validate_candidate_artifact_response_shape(
+    record: &CandidateArtifactCommandIntentRecord,
+    response: &CandidateArtifactCommandResponse,
+) -> JournalResult<()> {
+    if response.kind() != record.command.kind() || response.artifact_id().as_uuid().is_nil() {
+        return Err(JournalError::Integrity);
+    }
+    match (&record.command, response) {
+        (
+            CandidateArtifactControlCommand::Init { command },
+            CandidateArtifactCommandResponse::Init { artifact },
+        ) => {
+            if artifact.project_id != command.input.project_id
+                || artifact.attempt_id != record.attempt_id
+                || artifact.lease_id != command.input.lease_id
+                || artifact.fencing_token != command.input.fencing_token
+                || artifact.candidate_commit != command.input.candidate_commit
+                || artifact.tree_hash != command.input.tree_hash
+                || artifact.state != CandidateArtifactState::Uploading
+                || artifact.expected_bundle_digest != command.input.expected_bundle_digest
+                || artifact.expected_bundle_size_bytes != command.input.expected_bundle_size_bytes
+                || artifact.chunk_digests != command.input.chunk_digests
+                || artifact.bundle.is_some()
+                || artifact.version.get() != 1
+                || artifact.created_at != artifact.updated_at
+                || artifact.expires_at <= artifact.created_at
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+        (
+            CandidateArtifactControlCommand::UploadChunk { command },
+            CandidateArtifactCommandResponse::UploadChunk { receipt },
+        ) => {
+            let expected_version = command
+                .context
+                .expected_version
+                .ok_or(JournalError::Integrity)?;
+            if receipt.artifact_id != command.input.artifact_id
+                || receipt.chunk_index != command.input.chunk_index
+                || receipt.digest != command.input.digest
+                || u64::from(receipt.size_bytes)
+                    != u64::try_from(command.input.content.len())
+                        .map_err(|_| JournalError::Integrity)?
+                || receipt.artifact_version != expected_version
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+        (
+            CandidateArtifactControlCommand::Complete { command },
+            CandidateArtifactCommandResponse::Complete { artifact },
+        ) => {
+            let expected_version = command
+                .context
+                .expected_version
+                .ok_or(JournalError::Integrity)?;
+            if artifact.project_id != command.input.project_id
+                || artifact.artifact_id != command.input.artifact_id
+                || artifact.attempt_id != record.attempt_id
+                || artifact.lease_id != command.input.lease_id
+                || artifact.fencing_token != command.input.fencing_token
+                || artifact.state != CandidateArtifactState::Complete
+                || artifact.version.get() != expected_version.get().saturating_add(2)
+                || artifact.updated_at < artifact.created_at
+                || artifact.bundle.as_ref().is_none_or(|bundle| {
+                    bundle.artifact_id != command.input.bundle_protocol_key
+                        || bundle.uri != command.input.bundle_uri
+                })
+            {
+                return Err(JournalError::Integrity);
+            }
+        }
+        _ => return Err(JournalError::Integrity),
+    }
+    Ok(())
+}
+
+fn digest_is_zero(digest: &Sha256Digest) -> bool {
+    digest.as_bytes().iter().all(|byte| *byte == 0)
+}
+
 fn validate_lease_command_response(
     record: &LeaseCommandIntentRecord,
     state: &WorkerAttemptState,
@@ -1304,6 +2088,7 @@ impl Journal {
                 let migrated = connection
                     .execute_batch(MIGRATE_V2_TO_V3)
                     .and_then(|()| connection.execute_batch(MIGRATE_V3_TO_V4))
+                    .and_then(|()| connection.execute_batch(MIGRATE_V4_TO_V5))
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -1317,6 +2102,20 @@ impl Journal {
                 connection.execute_batch("BEGIN IMMEDIATE")?;
                 let migrated = connection
                     .execute_batch(MIGRATE_V3_TO_V4)
+                    .and_then(|()| connection.execute_batch(MIGRATE_V4_TO_V5))
+                    .and_then(|()| {
+                        connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
+                    })
+                    .and_then(|()| connection.execute_batch("COMMIT"));
+                if let Err(error) = migrated {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
+            4 => {
+                connection.execute_batch("BEGIN IMMEDIATE")?;
+                let migrated = connection
+                    .execute_batch(MIGRATE_V4_TO_V5)
                     .and_then(|()| {
                         connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
                     })
@@ -1574,6 +2373,157 @@ impl Journal {
         }
         transaction.commit()?;
         Ok(LeaseCommandCompletion::Completed)
+    }
+
+    pub fn register_candidate_artifact_command_intent(
+        &mut self,
+        intent: &CandidateArtifactCommandIntentRecord,
+    ) -> JournalResult<CandidateArtifactCommandRegistration> {
+        intent.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            load_candidate_artifact_command_by_id(&transaction, intent.intent_id)?
+        {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(CandidateArtifactCommandRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        if let Some(existing) = load_candidate_artifact_command_by_key(
+            &transaction,
+            intent.command.actor_id(),
+            intent.command.idempotency_key(),
+        )? {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(CandidateArtifactCommandRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        if matches!(intent.command, CandidateArtifactControlCommand::Init { .. }) {
+            let existing_init: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM candidate_artifact_command_intents \
+                 WHERE attempt_id = ?1 AND kind = 'init'",
+                [intent.attempt_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if existing_init != 0 {
+                return Err(JournalError::Runtime(WorkerError::InvalidTransition));
+            }
+        }
+        let state = load_state(&transaction, intent.attempt_id)?
+            .ok_or(JournalError::Runtime(WorkerError::HistoryEmpty))?;
+        validate_candidate_artifact_command_against_attempt(&transaction, intent, &state)?;
+        transaction.execute(
+            "INSERT INTO candidate_artifact_command_intents \
+             (intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+              intent_digest, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8)",
+            params![
+                intent.intent_id.to_string(),
+                intent.attempt_id.to_string(),
+                intent.command.actor_id().to_string(),
+                intent.command.idempotency_key().as_str(),
+                intent.command.kind(),
+                encode(intent)?,
+                digest_json(intent)?.to_string(),
+                instant_text(intent.created_at),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(CandidateArtifactCommandRegistration::Registered)
+    }
+
+    pub fn pending_candidate_artifact_command_intents(
+        &self,
+    ) -> JournalResult<Vec<CandidateArtifactCommandIntentRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT intent_id, attempt_id, actor_id, idempotency_key, kind, state, intent_json, \
+                    intent_digest, created_at, response_json, response_digest, completed_at \
+             FROM candidate_artifact_command_intents \
+             WHERE state = 'pending' ORDER BY created_at, intent_id",
+        )?;
+        let rows = statement.query_map([], raw_candidate_artifact_command_row)?;
+        rows.map(|row| decode_candidate_artifact_command(row?).map(|stored| stored.record))
+            .collect()
+    }
+
+    pub fn complete_candidate_artifact_command_intent(
+        &mut self,
+        intent_id: Uuid,
+        response: &CandidateArtifactCommandResponse,
+        completed_at: ServerInstant,
+    ) -> JournalResult<CandidateArtifactCommandCompletion> {
+        if intent_id.is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "candidate_artifact_command_completion",
+            )));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored = load_candidate_artifact_command_by_id(&transaction, intent_id)?
+            .ok_or(JournalError::Integrity)?;
+        let state =
+            load_state(&transaction, stored.record.attempt_id)?.ok_or(JournalError::Integrity)?;
+        validate_candidate_artifact_response(&transaction, &stored.record, &state, response)?;
+        if stored.state == CandidateArtifactCommandState::Completed {
+            if stored.response.as_ref() == Some(response)
+                && stored.completed_at == Some(completed_at)
+            {
+                transaction.commit()?;
+                return Ok(CandidateArtifactCommandCompletion::Existing);
+            }
+            return Err(JournalError::Integrity);
+        }
+        if completed_at < stored.record.created_at {
+            return Err(JournalError::Runtime(WorkerError::TimeRegressed));
+        }
+        let changed = transaction.execute(
+            "UPDATE candidate_artifact_command_intents \
+             SET state = 'completed', response_json = ?2, response_digest = ?3, completed_at = ?4 \
+             WHERE intent_id = ?1 AND state = 'pending'",
+            params![
+                intent_id.to_string(),
+                encode(response)?,
+                digest_json(response)?.to_string(),
+                instant_text(completed_at),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::Integrity);
+        }
+        transaction.commit()?;
+        Ok(CandidateArtifactCommandCompletion::Completed)
+    }
+
+    pub fn candidate_artifact_command_response(
+        &self,
+        intent_id: Uuid,
+    ) -> JournalResult<Option<CandidateArtifactCommandResponse>> {
+        let stored = load_candidate_artifact_command_by_id(&self.connection, intent_id)?;
+        match stored {
+            None
+            | Some(StoredCandidateArtifactCommand {
+                state: CandidateArtifactCommandState::Pending,
+                ..
+            }) => Ok(None),
+            Some(StoredCandidateArtifactCommand {
+                state: CandidateArtifactCommandState::Completed,
+                record,
+                response,
+                ..
+            }) => {
+                let response = response.ok_or(JournalError::Integrity)?;
+                let state = load_state(&self.connection, record.attempt_id)?
+                    .ok_or(JournalError::Integrity)?;
+                validate_candidate_artifact_response(&self.connection, &record, &state, &response)?;
+                Ok(Some(response))
+            }
+        }
     }
 
     pub fn plan_operation(
@@ -2350,8 +3300,8 @@ impl CrashPoint {
 mod tests {
     use agentforge_application::MvpCommandContext;
     use agentforge_domain::{
-        AggregateVersion, FencingToken, GitObjectId, LeaseId, PackageId, PackageRevision,
-        PackageRevisionId, ProjectId, ServerInstant,
+        AggregateVersion, ArtifactRef, CandidateId, FencingToken, GitObjectId, LeaseId, PackageId,
+        PackageRevision, PackageRevisionId, ProjectId, ServerInstant,
     };
     use tempfile::TempDir;
     use time::macros::datetime;
@@ -2570,6 +3520,252 @@ mod tests {
         state
     }
 
+    fn bring_to_candidate_handoff(journal: &mut Journal) -> WorkerAttemptState {
+        let claim = claim_intent();
+        journal
+            .register_claim_intent(&claim)
+            .expect("register claim intent");
+        let mut state = bring_to_implementing(journal);
+        journal
+            .complete_claim_intent(claim.intent_id, state.attempt_id(), state.lease_id(), at(1))
+            .expect("complete claim intent");
+        state = journal
+            .handle(&apply_request(
+                &state,
+                "turn-for-artifact",
+                60,
+                5,
+                WorkerCommandKind::TurnProducedChanges {
+                    turn_id: ProtocolKey::new("turn-for-artifact").expect("turn"),
+                    tree: GitObjectId::new("2".repeat(40)).expect("tree"),
+                    model_claimed_done: true,
+                },
+            ))
+            .expect("record turn")
+            .state()
+            .clone();
+        state = journal
+            .handle(&apply_request(
+                &state,
+                "verify-for-artifact",
+                61,
+                6,
+                WorkerCommandKind::VerificationFinished {
+                    passed: true,
+                    evidence_digest: Sha256Digest::of_bytes("local verification"),
+                    failure_code: None,
+                },
+            ))
+            .expect("verify")
+            .state()
+            .clone();
+        state = journal
+            .handle(&apply_request(
+                &state,
+                "seal-for-artifact",
+                62,
+                7,
+                WorkerCommandKind::SealCandidate {
+                    candidate: crate::runtime::CandidateSnapshot {
+                        commit: GitObjectId::new("3".repeat(40)).expect("commit"),
+                        tree: GitObjectId::new("2".repeat(40)).expect("tree"),
+                        author_evidence_digest: Sha256Digest::of_bytes("author evidence"),
+                    },
+                    observed_generation: state.lease_generation(),
+                },
+            ))
+            .expect("seal")
+            .state()
+            .clone();
+        assert_eq!(state.phase(), WorkerPhase::HandingOffCandidate);
+        state
+    }
+
+    fn artifact_bundle() -> Vec<u8> {
+        b"fixture-candidate-bundle".to_vec()
+    }
+
+    fn artifact_init_intent(state: &WorkerAttemptState) -> CandidateArtifactCommandIntentRecord {
+        let candidate = state.candidate().expect("candidate");
+        let bundle = artifact_bundle();
+        CandidateArtifactCommandIntentRecord {
+            intent_id: Uuid::from_bytes([63; 16]),
+            attempt_id: state.attempt_id(),
+            command: CandidateArtifactControlCommand::Init {
+                command: MvpCommand {
+                    context: MvpCommandContext {
+                        command_id: id(64),
+                        actor_id: id(9),
+                        idempotency_key: IdempotencyKey::new("artifact-init-fixture").expect("key"),
+                        correlation_id: id(65),
+                        causation_id: None,
+                        expected_version: Some(AggregateVersion::new(2)),
+                    },
+                    input: InitCandidateArtifactInput {
+                        project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+                        attempt_id: state.attempt_id(),
+                        lease_id: state.lease_id(),
+                        node_id: id(46),
+                        fencing_token: state.lease_generation(),
+                        package_hash: state.package_hash(),
+                        base_commit: state.base_commit().clone(),
+                        candidate_commit: candidate.commit.clone(),
+                        tree_hash: candidate.tree.clone(),
+                        author_evidence_digest: candidate.author_evidence_digest,
+                        expected_bundle_digest: Sha256Digest::of_bytes(&bundle),
+                        expected_bundle_size_bytes: u64::try_from(bundle.len())
+                            .expect("bundle size"),
+                        chunk_digests: vec![Sha256Digest::of_bytes(&bundle)],
+                        upload_ttl_seconds: 600,
+                    },
+                },
+            },
+            created_at: at(8),
+        }
+    }
+
+    fn artifact_init_response(state: &WorkerAttemptState) -> CandidateArtifactCommandResponse {
+        let CandidateArtifactControlCommand::Init { command } =
+            &artifact_init_intent(state).command
+        else {
+            panic!("init")
+        };
+        CandidateArtifactCommandResponse::Init {
+            artifact: CandidateArtifactView {
+                project_id: command.input.project_id,
+                artifact_id: CandidateArtifactId::from_uuid(Uuid::from_bytes([66; 16])),
+                candidate_id: CandidateId::from_uuid(Uuid::from_bytes([67; 16])),
+                attempt_id: state.attempt_id(),
+                package_id: state.package_id(),
+                revision_id: PackageRevisionId::from_uuid(Uuid::from_bytes([42; 16])),
+                lease_id: state.lease_id(),
+                fencing_token: state.lease_generation(),
+                candidate_commit: command.input.candidate_commit.clone(),
+                tree_hash: command.input.tree_hash.clone(),
+                state: CandidateArtifactState::Uploading,
+                expected_bundle_digest: command.input.expected_bundle_digest,
+                expected_bundle_size_bytes: command.input.expected_bundle_size_bytes,
+                chunk_digests: command.input.chunk_digests.clone(),
+                bundle: None,
+                created_at: at(9),
+                expires_at: at(609),
+                updated_at: at(9),
+                version: AggregateVersion::new(1),
+            },
+        }
+    }
+
+    fn artifact_chunk_intent(state: &WorkerAttemptState) -> CandidateArtifactCommandIntentRecord {
+        let CandidateArtifactCommandResponse::Init { artifact } = artifact_init_response(state)
+        else {
+            panic!("init response")
+        };
+        let content = artifact_bundle();
+        CandidateArtifactCommandIntentRecord {
+            intent_id: Uuid::from_bytes([68; 16]),
+            attempt_id: state.attempt_id(),
+            command: CandidateArtifactControlCommand::UploadChunk {
+                command: MvpCommand {
+                    context: MvpCommandContext {
+                        command_id: id(69),
+                        actor_id: id(9),
+                        idempotency_key: IdempotencyKey::new("artifact-chunk-fixture")
+                            .expect("key"),
+                        correlation_id: id(70),
+                        causation_id: Some(id(64)),
+                        expected_version: Some(artifact.version),
+                    },
+                    input: UploadCandidateArtifactChunkInput {
+                        project_id: artifact.project_id,
+                        artifact_id: artifact.artifact_id,
+                        lease_id: artifact.lease_id,
+                        node_id: id(46),
+                        fencing_token: artifact.fencing_token,
+                        chunk_index: 0,
+                        digest: Sha256Digest::of_bytes(&content),
+                        content,
+                    },
+                },
+            },
+            created_at: at(10),
+        }
+    }
+
+    fn artifact_chunk_response(state: &WorkerAttemptState) -> CandidateArtifactCommandResponse {
+        let CandidateArtifactControlCommand::UploadChunk { command } =
+            &artifact_chunk_intent(state).command
+        else {
+            panic!("chunk")
+        };
+        CandidateArtifactCommandResponse::UploadChunk {
+            receipt: CandidateArtifactChunkReceipt {
+                artifact_id: command.input.artifact_id,
+                chunk_index: command.input.chunk_index,
+                digest: command.input.digest,
+                size_bytes: u32::try_from(command.input.content.len()).expect("chunk size"),
+                artifact_version: command.context.expected_version.expect("version"),
+            },
+        }
+    }
+
+    fn artifact_complete_intent(
+        state: &WorkerAttemptState,
+    ) -> CandidateArtifactCommandIntentRecord {
+        let CandidateArtifactCommandResponse::Init { artifact } = artifact_init_response(state)
+        else {
+            panic!("init response")
+        };
+        CandidateArtifactCommandIntentRecord {
+            intent_id: Uuid::from_bytes([71; 16]),
+            attempt_id: state.attempt_id(),
+            command: CandidateArtifactControlCommand::Complete {
+                command: MvpCommand {
+                    context: MvpCommandContext {
+                        command_id: id(72),
+                        actor_id: id(9),
+                        idempotency_key: IdempotencyKey::new("artifact-complete-fixture")
+                            .expect("key"),
+                        correlation_id: id(73),
+                        causation_id: Some(id(69)),
+                        expected_version: Some(artifact.version),
+                    },
+                    input: CompleteCandidateArtifactInput {
+                        project_id: artifact.project_id,
+                        artifact_id: artifact.artifact_id,
+                        lease_id: artifact.lease_id,
+                        node_id: id(46),
+                        fencing_token: artifact.fencing_token,
+                        bundle_protocol_key: ProtocolKey::new("candidate-bundle-fixture")
+                            .expect("bundle key"),
+                        bundle_uri: "artifact://candidate-artifacts/fixture".to_owned(),
+                    },
+                },
+            },
+            created_at: at(12),
+        }
+    }
+
+    fn artifact_complete_response(state: &WorkerAttemptState) -> CandidateArtifactCommandResponse {
+        let CandidateArtifactCommandResponse::Init { mut artifact } = artifact_init_response(state)
+        else {
+            panic!("init response")
+        };
+        let CandidateArtifactControlCommand::Complete { command } =
+            &artifact_complete_intent(state).command
+        else {
+            panic!("complete")
+        };
+        artifact.state = CandidateArtifactState::Complete;
+        artifact.bundle = Some(ArtifactRef {
+            artifact_id: command.input.bundle_protocol_key.clone(),
+            uri: command.input.bundle_uri.clone(),
+            digest: artifact.expected_bundle_digest,
+        });
+        artifact.updated_at = at(13);
+        artifact.version = AggregateVersion::new(3);
+        CandidateArtifactCommandResponse::Complete { artifact }
+    }
+
     #[test]
     fn claim_intent_is_durable_exactly_replayable_and_completed_after_grant() {
         let (_directory, mut journal) = fixture();
@@ -2701,6 +3897,172 @@ mod tests {
     }
 
     #[test]
+    fn candidate_artifact_intents_survive_restart_and_preserve_each_remote_receipt() {
+        let (directory, mut journal) = fixture();
+        let state = bring_to_candidate_handoff(&mut journal);
+
+        let init = artifact_init_intent(&state);
+        assert_eq!(
+            journal
+                .register_candidate_artifact_command_intent(&init)
+                .expect("register init"),
+            CandidateArtifactCommandRegistration::Registered
+        );
+        assert_eq!(
+            journal
+                .register_candidate_artifact_command_intent(&init)
+                .expect("exact init replay"),
+            CandidateArtifactCommandRegistration::Existing
+        );
+        assert_eq!(
+            journal
+                .pending_candidate_artifact_command_intents()
+                .expect("pending init"),
+            vec![init.clone()]
+        );
+        let mut changed_init = init.clone();
+        let CandidateArtifactControlCommand::Init { command } = &mut changed_init.command else {
+            panic!("init")
+        };
+        command.input.upload_ttl_seconds += 1;
+        assert_eq!(
+            journal
+                .register_candidate_artifact_command_intent(&changed_init)
+                .expect_err("changed init reuses durable identity")
+                .code(),
+            "AF_IDEMPOTENCY_KEY_REUSED"
+        );
+        let init_response = artifact_init_response(&state);
+        assert_eq!(
+            journal
+                .complete_candidate_artifact_command_intent(init.intent_id, &init_response, at(9),)
+                .expect("complete init"),
+            CandidateArtifactCommandCompletion::Completed
+        );
+        assert_eq!(
+            journal
+                .candidate_artifact_command_response(init.intent_id)
+                .expect("load init response"),
+            Some(init_response)
+        );
+
+        let chunk = artifact_chunk_intent(&state);
+        journal
+            .register_candidate_artifact_command_intent(&chunk)
+            .expect("register chunk");
+        drop(journal);
+        let mut journal =
+            Journal::open(directory.path().join("worker.sqlite3")).expect("restart after chunk");
+        assert_eq!(
+            journal
+                .pending_candidate_artifact_command_intents()
+                .expect("recover exact chunk"),
+            vec![chunk.clone()]
+        );
+        assert_eq!(
+            journal
+                .register_candidate_artifact_command_intent(&chunk)
+                .expect("ACK-loss chunk replay"),
+            CandidateArtifactCommandRegistration::Existing
+        );
+        let chunk_response = artifact_chunk_response(&state);
+        journal
+            .complete_candidate_artifact_command_intent(chunk.intent_id, &chunk_response, at(11))
+            .expect("complete chunk");
+
+        let complete = artifact_complete_intent(&state);
+        journal
+            .register_candidate_artifact_command_intent(&complete)
+            .expect("register complete");
+        drop(journal);
+        let mut journal = Journal::open(directory.path().join("worker.sqlite3"))
+            .expect("restart before complete ACK");
+        assert_eq!(
+            journal
+                .pending_candidate_artifact_command_intents()
+                .expect("recover exact complete"),
+            vec![complete.clone()]
+        );
+        let live_state = journal
+            .load_attempt(state.attempt_id())
+            .expect("load live state")
+            .expect("attempt");
+        let salvaging = journal
+            .handle(&apply_request(
+                &live_state,
+                "lease-lost-after-remote-complete",
+                74,
+                14,
+                WorkerCommandKind::LoseLease {
+                    reason: crate::runtime::LeaseLossReason::Expired,
+                    observed_generation: live_state.lease_generation(),
+                },
+            ))
+            .expect("record local lease loss")
+            .state()
+            .clone();
+        assert_eq!(salvaging.phase(), WorkerPhase::Salvaging);
+        let complete_response = artifact_complete_response(&state);
+        assert_eq!(
+            journal
+                .complete_candidate_artifact_command_intent(
+                    complete.intent_id,
+                    &complete_response,
+                    at(15),
+                )
+                .expect("complete artifact"),
+            CandidateArtifactCommandCompletion::Completed
+        );
+        assert!(
+            journal
+                .pending_candidate_artifact_command_intents()
+                .expect("no pending artifact commands")
+                .is_empty()
+        );
+        assert_eq!(
+            journal
+                .candidate_artifact_command_response(complete.intent_id)
+                .expect("load complete receipt"),
+            Some(complete_response.clone())
+        );
+        let mut forged_response = complete_response;
+        let CandidateArtifactCommandResponse::Complete { artifact } = &mut forged_response else {
+            panic!("complete response")
+        };
+        artifact.expected_bundle_digest = Sha256Digest::of_bytes("forged");
+        assert_eq!(
+            journal
+                .complete_candidate_artifact_command_intent(
+                    complete.intent_id,
+                    &forged_response,
+                    at(15),
+                )
+                .expect_err("changed completion cannot replace receipt")
+                .code(),
+            "AF_WORKER_JOURNAL_INTEGRITY"
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "UPDATE candidate_artifact_command_intents SET intent_json = '{}' \
+                     WHERE intent_id = ?1",
+                    [init.intent_id.to_string()],
+                )
+                .is_err()
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "DELETE FROM candidate_artifact_command_intents WHERE intent_id = ?1",
+                    [complete.intent_id.to_string()],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn schema_v2_is_upgraded_without_losing_existing_attempts() {
         let (directory, mut journal) = fixture();
         let state = journal
@@ -2721,19 +4083,24 @@ mod tests {
                  DROP TRIGGER lease_command_intents_cannot_be_deleted;
                  DROP INDEX lease_command_intents_pending_idx;
                  DROP TABLE lease_command_intents;
+                 DROP TRIGGER candidate_artifact_command_intents_request_is_immutable;
+                 DROP TRIGGER candidate_artifact_command_intents_state_is_monotonic;
+                 DROP TRIGGER candidate_artifact_command_intents_cannot_be_deleted;
+                 DROP INDEX candidate_artifact_command_intents_pending_idx;
+                 DROP TABLE candidate_artifact_command_intents;
                  PRAGMA user_version = 2;",
             )
             .expect("downgrade fixture to the exact v2 delta");
         drop(journal);
 
         let mut reopened =
-            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v4");
+            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v5");
         assert_eq!(
             reopened
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            4
+            5
         );
         assert_eq!(
             reopened
@@ -2758,7 +4125,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            4
+            5
         );
         let applied = journal.handle(&request).expect("grant applied");
         assert!(matches!(applied, JournalDisposition::Applied(_)));

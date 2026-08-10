@@ -390,10 +390,10 @@ upload intent、`RecordCandidate + VerificationRun::Queued` 仍未接通，不�
 
 ## MVP-03 / Checkpoint M：Candidate Artifact HTTP 与 Worker adapter
 
-状态：实现完成，全工作区门禁与 CI #78 Rust job 通过。CI #78 的 PostgreSQL migration job 继续发现
-同类正向 fixture 问题：VerificationRun 初态要求 `queued_at == updated_at`，测试却分别调用两次 volatile
-`clock_timestamp()`；已在 Checkpoint M.1 改用同一 transaction timestamp，等待修复推送后的 PostgreSQL
-17 复验。
+状态：实现完成，全工作区门禁以及 CI #78/#80 Rust job 通过。真实 PostgreSQL 17 连续揭示正向 fixture
+中三组“必须相等”的字段使用了独立 volatile 时钟：Artifact 初态 `created_at/updated_at`、VerificationRun
+初态 `queued_at/updated_at`、Artifact COMPLETE 的 `completed_at/updated_at`。M、M.1、M.2 已逐组改用同一
+transaction timestamp；数据库的 fail-closed 强约束保持不变，等待 M.2 推送后的完整 PostgreSQL 复验。
 
 当前完成：
 
@@ -413,6 +413,8 @@ upload intent、`RecordCandidate + VerificationRun::Queued` 仍未接通，不�
   `created_at/updated_at` 改用相同 transaction timestamp，避免测试数据偶然违反真实数据库不变量。
 - CI #78 进一步证明 VerificationRun fixture 存在相同缺陷；`queued_at/updated_at` 也已改用相同
   transaction timestamp。两处都是测试数据修复，数据库的 fail-closed 时间不变量保持不变。
+- CI #80 继续捕获 COMPLETE Artifact 的 `completed_at/updated_at` 双时钟漂移；M.2 已把最后一组改为
+  同一 transaction timestamp，并独立推送触发真实 PostgreSQL 17 复验。
 
 本地证据：
 
@@ -429,3 +431,44 @@ git diff --check                                                       PASS
 
 当前边界：Worker 现在能按严格 wire 调用三条 Artifact API，但尚未把每个 init/chunk/complete intent 写入
 SQLite Journal，也未由 fixture driver 触发上传；因此本检查点不宣称跨重启 ACK-loss 恢复已经闭环。
+
+## MVP-03 / Checkpoint N：Worker Candidate Artifact Journal v5
+
+状态：实现完成，Worker 定点门禁与全工作区 build/test/Clippy 通过；等待推送后的 CI。
+
+当前完成：
+
+- SQLite Journal schema v5 新增 `candidate_artifact_command_intents`，把 Init、Chunk、Complete 的完整 typed
+  command、Attempt/actor/key、JCS 摘要、typed response 与完成时间持久化；pending/completed shape、请求
+  不可变、状态单调和禁止删除由 SQLite CHECK/trigger 双重保护；
+- v2→v3→v4→v5 与 v3→v4→v5、v4→v5 均在 `BEGIN IMMEDIATE` 内升级，旧 Attempt、hash-chain、Inbox、
+  Outbox、Claim 与 Lease command intent 不丢失，未知 schema version 继续 fail closed；
+- 注册 intent 时先做 exact ID/key replay，再核对 completed Claim 所固定的 Project、actor、node、Lease、
+  fencing，以及本地已 Seal Candidate 的 package/base/candidate/tree/evidence；同一 Attempt 不允许用新 key
+  建立第二个 Init；
+- Chunk 只接受 canonical Base64 解码后的 1 MiB 以内非空内容，并在落 Journal 前复算 SHA-256、匹配 Init
+  声明的序号和 digest；Complete 必须引用同一 Init 回执与 Artifact version；
+- 完成回执逐字段验证：Init 必须为 `UPLOADING/version=1`，Chunk receipt 必须匹配 index/digest/size/version，
+  Complete 必须为 `COMPLETE/version=3`，且 Candidate/Artifact/Bundle lineage、时间窗口和预声明摘要不能漂移；
+- 重启测试覆盖 Init 精确回放、Chunk pending 恢复、Complete pending 恢复、changed-body key reuse、回执
+  篡改、SQL UPDATE/DELETE 攻击；还覆盖远端 Complete 成功后本地转入 Salvaging，原 actor/key/body 的
+  receipt-first 回放仍能安全写入首次回执。
+
+定点证据：
+
+```text
+cargo test -p agentforge-worker-daemon --lib --locked --offline            PASS (40/40)
+cargo clippy -p agentforge-worker-daemon --all-targets --all-features \
+  --locked --offline -- -D warnings                                        PASS
+cargo fmt --all -- --check                                                  PASS
+cargo build --workspace --locked --all-targets --offline                    PASS
+cargo test --workspace --locked --offline                                   PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                   PASS
+node --check crates/control-plane/assets/app.js                              PASS
+git diff --check                                                             PASS
+```
+
+当前边界：本检查点提供 durable upload intent/receipt 与恢复原语，但 daemon 尚未自动从 fixture Candidate
+生成真实 Bundle、依次注册/执行三类 intent；`RecordCandidate + VerificationRun::Queued` 也仍在后续，
+因此不能宣称端到端 Candidate handoff 已闭环。

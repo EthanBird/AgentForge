@@ -386,6 +386,11 @@ impl WorkerAttemptState {
     }
 
     #[must_use]
+    pub const fn candidate(&self) -> Option<&CandidateSnapshot> {
+        self.candidate.as_ref()
+    }
+
+    #[must_use]
     pub const fn turns_completed(&self) -> u32 {
         self.turns_completed
     }
