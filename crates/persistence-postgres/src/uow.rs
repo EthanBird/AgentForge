@@ -1072,6 +1072,13 @@ fn aggregate_uuid(kind: AggregateType, id: AggregateId) -> PortResult<Uuid> {
         (AggregateType::WorkPackage, AggregateId::WorkPackage(value)) => Ok(value.into_uuid()),
         (AggregateType::Attempt, AggregateId::Attempt(value)) => Ok(value.into_uuid()),
         (AggregateType::Lease, AggregateId::Lease(value)) => Ok(value.into_uuid()),
+        (AggregateType::CandidateArtifact, AggregateId::CandidateArtifact(value)) => {
+            Ok(value.into_uuid())
+        }
+        (AggregateType::Candidate, AggregateId::Candidate(value)) => Ok(value.into_uuid()),
+        (AggregateType::VerificationRun, AggregateId::VerificationRun(value)) => {
+            Ok(value.into_uuid())
+        }
         (AggregateType::Submission, AggregateId::Submission(value)) => Ok(value.into_uuid()),
         (AggregateType::RunSignal, AggregateId::RunSignal(value)) => Ok(value.into_uuid()),
         (AggregateType::InvocationIntent, AggregateId::InvocationIntent(value)) => {
@@ -1101,6 +1108,9 @@ const fn aggregate_type_label(kind: AggregateType) -> &'static str {
         AggregateType::WorkPackage => "WORK_PACKAGE",
         AggregateType::Attempt => "ATTEMPT",
         AggregateType::Lease => "LEASE",
+        AggregateType::CandidateArtifact => "CANDIDATE_ARTIFACT",
+        AggregateType::Candidate => "CANDIDATE",
+        AggregateType::VerificationRun => "VERIFICATION_RUN",
         AggregateType::Submission => "SUBMISSION",
         AggregateType::RunSignal => "RUN_SIGNAL",
         AggregateType::InvocationIntent => "INVOCATION_INTENT",

@@ -264,7 +264,10 @@ enrollment 与 LAN mTLS。
 
 ## MVP-03 / Checkpoint J：Candidate-first 领域聚合
 
-状态：实现与本地定点门禁通过；本检查点提交后等待远端 CI。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端提交：`e288ce8c464fd64b617c3ca13aead22bbce98782`
+- GitHub Actions：CI #69 / run `31352832910`
 
 当前完成：
 
@@ -297,3 +300,44 @@ cargo fmt --all -- --check                                         PASS
 明确边界：本检查点只冻结纯领域语义，尚未把新 aggregate type 写入 durable event envelope/数据库；下一
 检查点必须通过 additive migration、typed PostgreSQL transaction 与 HTTP/Worker contract 原子接线，
 不能以通用 JSON snapshot 代替 canonical Candidate 表。
+
+## MVP-03 / Checkpoint K：Candidate-first PostgreSQL 事实源
+
+状态：实现与本地门禁通过；本检查点提交后等待 PostgreSQL 17 CI。
+
+当前完成：
+
+- 新增 additive `0005_mvp_candidates.sql`，以 `candidate_artifacts`、不可变 chunk ledger、`candidates`
+  和 `verification_runs` 四张 typed canonical 表承载领域事实；没有引入通用 JSON aggregate snapshot；
+- durable event head 在同一迁移事务内扩展 `CANDIDATE_ARTIFACT`、`CANDIDATE`、
+  `VERIFICATION_RUN`，Rust `AggregateType`/`AggregateId` 与 PostgreSQL label 同步，避免 wire/DB
+  类型漂移；
+- Artifact reservation 由复合外键绑定 Project、Package/revision/hash、Attempt、Lease/fencing；MVP
+  Bundle 上限 16 MiB、单 chunk 上限 1 MiB，chunk 序号、预声明 SHA-256、实际内容 SHA-256、数量和
+  总大小全部 fail closed；
+- Artifact 的 `UPLOADING -> ASSEMBLING -> COMPLETE` 与 Reject/Quarantine/Expire 由数据库状态转换、
+  单调 version/event sequence/time 和 terminal immutability 共同保护；COMPLETE 时重新核对当前作者
+  Lease、完整 chunk 集与 Bundle binding；
+- Candidate INSERT 重新读取并锁定 COMPLETE Artifact，逐字段核对 lineage、Bundle 与受限 branch；
+  Candidate 创建后 UPDATE/DELETE 均被拒绝；
+- VerificationRun 约束与领域状态机一致，禁止跳过阶段，PASS 必须三头相等；FAIL/INCONCLUSIVE 的
+  stage-aware head shape 以及 CANCELLED 的事实缺席在 SQL 层再次约束；
+- PostgreSQL readiness 已要求四张新表，迁移 manifest、typed label、升级文件清单与 CI migration
+  fixture 同步到 version 5；真实 PostgreSQL 条件测试新增正向完整链及终态 Artifact、Candidate 变更、
+  Verification 跳阶段负例。
+
+本地证据：
+
+```text
+cargo test -p agentforge-storage-postgres --all-features --locked --offline  PASS
+cargo clippy -p agentforge-storage-postgres --all-targets --all-features \
+  --locked --offline -- -D warnings                                       PASS
+cargo test -p agentforge-domain --locked --offline                       PASS
+PGlite 0001..0005 migration + Candidate/Artifact/Verification contract    PASS
+cargo fmt --all -- --check                                                PASS
+```
+
+本地 PostgreSQL 条件测试因没有 `AGENTFORGE_TEST_DATABASE_URL` 会显式 skip；PGlite 已实际执行迁移和
+正反例，但 PostgreSQL 17 仍以本检查点推送后的 GitHub Actions 为发布证据。下一检查点把 Artifact
+init/chunk/complete 与原子 `RecordCandidate + VerificationRun::Queued` 接入 application/HTTP/Worker，
+并遵守 receipt-first 与固定锁顺序。

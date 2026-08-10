@@ -44,6 +44,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "m1_uow",
         sql: include_str!("../../../migrations/0004_m1_uow.sql"),
     },
+    Migration {
+        version: 5,
+        name: "mvp_candidates",
+        sql: include_str!("../../../migrations/0005_mvp_candidates.sql"),
+    },
 ];
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -241,7 +246,7 @@ mod tests {
     #[test]
     fn migration_manifest_is_contiguous_transactional_and_additive() {
         validate_manifest().expect("repository migration manifest must be valid");
-        assert_eq!(MIGRATIONS.len(), 4);
+        assert_eq!(MIGRATIONS.len(), 5);
         assert!(MIGRATIONS.iter().all(|migration| {
             let digest = migration.digest();
             digest.len() == 71 && digest.starts_with("sha256:")
@@ -332,6 +337,30 @@ mod tests {
         assert!(
             !sql.contains("aggregate_snapshots"),
             "Phase 1 must not install a generic JSON aggregate authority"
+        );
+    }
+
+    #[test]
+    fn candidate_first_tables_and_event_heads_are_present() {
+        let sql = MIGRATIONS[4].sql;
+        for required in [
+            "CREATE TABLE candidate_artifacts",
+            "CREATE TABLE candidate_artifact_chunks",
+            "CREATE TABLE candidates",
+            "CREATE TABLE verification_runs",
+            "candidate_artifact_chunks_match_reservation",
+            "candidate_artifacts_binding_is_immutable",
+            "candidates_are_immutable",
+            "verification_runs_binding_is_immutable",
+            "'CANDIDATE_ARTIFACT'",
+            "'CANDIDATE'",
+            "'VERIFICATION_RUN'",
+        ] {
+            assert!(sql.contains(required), "missing SQL invariant: {required}");
+        }
+        assert!(
+            !sql.contains("aggregate_snapshots"),
+            "Candidate state must remain in typed canonical tables"
         );
     }
 }

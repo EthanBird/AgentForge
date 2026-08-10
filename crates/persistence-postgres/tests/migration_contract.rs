@@ -11,12 +11,36 @@ fn migration_manifest_and_repository_files_match() {
         "migrations/0002_m1_invocation_governance.sql",
         "migrations/0003_m1_events_projections.sql",
         "migrations/0004_m1_uow.sql",
+        "migrations/0005_mvp_candidates.sql",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     for (migration, relative_path) in MIGRATIONS.iter().zip(expected) {
         let bytes = fs::read(root.join(relative_path)).expect("migration file exists");
         assert_eq!(bytes, migration.sql.as_bytes(), "embedded SQL drifted");
     }
+}
+
+#[test]
+fn candidate_first_sql_is_typed_and_fail_closed() {
+    let candidates = MIGRATIONS[4].sql;
+    for required in [
+        "CREATE TABLE candidate_artifacts",
+        "expected_chunk_digests bytea[] NOT NULL",
+        "sha256(NEW.content) <> NEW.digest",
+        "CREATE TABLE candidates",
+        "CREATE TABLE verification_runs",
+        "Candidate Artifact % is not complete or its lineage changed",
+        "verification run transition is invalid",
+        "BEFORE UPDATE OR DELETE ON candidates",
+        "CANDIDATE_ARTIFACT",
+        "VERIFICATION_RUN",
+    ] {
+        assert!(
+            candidates.contains(required),
+            "missing Candidate-first SQL contract: {required}"
+        );
+    }
+    assert!(!candidates.contains("aggregate_snapshots"));
 }
 
 #[test]

@@ -126,7 +126,11 @@ impl PostgresMvpControlPlane {
                        to_regclass('leases'),
                        to_regclass('domain_events'),
                        to_regclass('outbox_messages'),
-                       to_regclass('command_receipts')
+                       to_regclass('command_receipts'),
+                       to_regclass('candidate_artifacts'),
+                       to_regclass('candidate_artifact_chunks'),
+                       to_regclass('candidates'),
+                       to_regclass('verification_runs')
                      ]::text[]",
                     &[],
                 )
@@ -135,7 +139,7 @@ impl PostgresMvpControlPlane {
             let required_tables: Vec<Option<String>> = row
                 .try_get(0)
                 .map_err(|_| agentforge_application::PortError::Integrity)?;
-            Ok(required_tables.len() == 7 && required_tables.iter().all(Option::is_some))
+            Ok(required_tables.len() == 11 && required_tables.iter().all(Option::is_some))
         }
         .await;
         finish(uow, result).await
