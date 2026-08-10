@@ -59,7 +59,7 @@ async fn exercise_mvp(
     database_url: &str,
     schema: &str,
 ) -> Result<()> {
-    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4]);
+    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4, 5]);
     let control = Arc::new(PostgresMvpControlPlane::new_local_no_tls(
         database_url,
         schema,
