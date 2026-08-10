@@ -277,6 +277,7 @@ fn is_reserved_key(key: &str) -> bool {
 
 pub use crate::state::attempt::AttemptEvent;
 pub use crate::state::budget::BudgetReservationEvent;
+pub use crate::state::candidate::{CandidateArtifactEvent, CandidateEvent, VerificationRunEvent};
 pub use crate::state::governance::{DecisionEvent, GovernanceCaseEvent};
 pub use crate::state::invocation::{
     InvocationIntentEvent, InvocationRunEvent, InvocationRunEventV1, UpcastInvocationRunEventV1,

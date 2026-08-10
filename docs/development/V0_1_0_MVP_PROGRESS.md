@@ -229,7 +229,10 @@ Artifact handoff。
 
 ## MVP-02 / Checkpoint I：确定性 Fixture 执行纵切
 
-状态：实现与本地完整门禁通过；本检查点提交后等待远端 CI。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端提交：`18a296bf902a0074747d73a5b2ba9d872bf8a4dd`
+- GitHub Actions：CI #67 / run `31351823881`
 
 当前完成：
 
@@ -258,3 +261,39 @@ cargo fmt --all -- --check                                               PASS
 
 仍待：真实 workspace sandbox、jcode bridge、Candidate Artifact/`RecordCandidate` handoff、Worker
 enrollment 与 LAN mTLS。
+
+## MVP-03 / Checkpoint J：Candidate-first 领域聚合
+
+状态：实现与本地定点门禁通过；本检查点提交后等待远端 CI。
+
+当前完成：
+
+- 新增 `CandidateArtifact` 聚合：`Uploading -> Assembling -> Complete`，并提供 Reject、Quarantine、Expire
+  终态；终态检查优先于 version CAS，COMPLETE 不可回退或替换；
+- Artifact reservation 永久绑定 Project 内 Package/revision/hash、Attempt、Lease/fencing、base/candidate/
+  tree、Author Evidence、Bundle digest/size/chunk digests 和过期窗口；
+- Complete 同时核对 `artifact://` 引用、非零 digest、精确大小、精确 chunk 顺序与未过期的单调服务端
+  时间；任一替换均 fail closed；
+- `Candidate` 只能从同一 COMPLETE Artifact 封存，复制并复核完整 lineage、Bundle 和受限任务 ref，创建后
+  无任何更新命令；
+- `VerificationRun` 只接受与不可变 Candidate 完全一致的 ID/commit，严格执行
+  `Queued -> ProvenanceCheck -> Reviewing -> Reproducing -> terminal`；
+- PASS 强制 `CandidateHead = ReviewedHead = TestedHead`；Provenance/Review/Reproduction 的 FAIL 或
+  INCONCLUSIVE 只允许携带当时真实存在的 Head，禁止未来阶段事实占位；
+- Candidate 与 VerificationRun 不实现直接 `Deserialize`，必须分别携带 COMPLETE Artifact/Candidate
+  重放；CandidateArtifact 使用经过完整 shape 校验的手写反序列化；
+- 新增 7 项领域正反例与 2 个 compile-fail 门禁；domain 当前为 70 unit + 2 property + 12 contract +
+  3 doc tests。
+
+本地证据：
+
+```text
+cargo test -p agentforge-domain --locked --offline                  PASS
+cargo clippy -p agentforge-domain --all-targets --locked --offline \
+  -- -D warnings                                                    PASS
+cargo fmt --all -- --check                                         PASS
+```
+
+明确边界：本检查点只冻结纯领域语义，尚未把新 aggregate type 写入 durable event envelope/数据库；下一
+检查点必须通过 additive migration、typed PostgreSQL transaction 与 HTTP/Worker contract 原子接线，
+不能以通用 JSON snapshot 代替 canonical Candidate 表。
