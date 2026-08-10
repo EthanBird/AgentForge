@@ -470,10 +470,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use agentforge_application::{
-        CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimedWork,
+        AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimedWork,
         CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseReconciliationReport,
         MvpControlPlane, MvpFuture, ProjectView, ReconcileExpiredLeasesQuery,
-        UploadCandidateArtifactChunkInput,
+        ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
     };
     use agentforge_domain::{
         CandidateArtifactState, CandidateId, ExecutorId, FencingToken, GitObjectId, NodeId,
@@ -522,6 +522,13 @@ mod tests {
             &'a self,
             _command: &'a MvpCommand<ClaimPackageInput>,
         ) -> MvpFuture<'a, ClaimedWork> {
+            unavailable()
+        }
+
+        fn report_attempt_progress<'a>(
+            &'a self,
+            _command: &'a MvpCommand<ReportAttemptProgressInput>,
+        ) -> MvpFuture<'a, AttemptProgressView> {
             unavailable()
         }
 

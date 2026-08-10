@@ -1,15 +1,16 @@
 use std::sync::Arc;
 
 use agentforge_application::{
-    ClaimPackageInput, ClaimedWork, CompleteCandidateArtifactInput, CreateProjectInput,
-    InitCandidateArtifactInput, ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane,
-    PublishPackageInput, ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput,
+    AttemptProgressStage, AttemptProgressView, ClaimPackageInput, ClaimedWork,
+    CompleteCandidateArtifactInput, CreateProjectInput, InitCandidateArtifactInput,
+    ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane, PublishPackageInput,
+    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
     UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, AggregateVersion, CandidateArtifactState, CommandId, CorrelationId, ExecutorId,
     GitObjectId, IdempotencyKey, NodeId, PackageId, PackageRevision, PackageRevisionId, ProjectId,
-    ProtocolKey, Sha256Digest, lease::LeaseState,
+    ProtocolKey, Sha256Digest, attempt::AttemptState, lease::LeaseState,
 };
 use agentforge_storage_postgres::{PostgresMvpControlPlane, migration};
 use anyhow::{Context, Result, anyhow};
@@ -60,7 +61,7 @@ async fn exercise_mvp(
     database_url: &str,
     schema: &str,
 ) -> Result<()> {
-    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4, 5]);
+    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4, 5, 6]);
     let control = Arc::new(PostgresMvpControlPlane::new_local_no_tls(
         database_url,
         schema,
@@ -329,12 +330,20 @@ async fn exercise_mvp(
     };
     let third_claim = control.claim_package(&third_claim_command).await?;
     assert_eq!(third_claim.fencing_token.get(), 3);
+    let local_verify = exercise_attempt_progress(
+        control.as_ref(),
+        project_id,
+        &third_claim,
+        third_claim_command.input.node_id,
+    )
+    .await?;
     exercise_candidate_artifact(
         admin,
         control.as_ref(),
         project_id,
         &third_claim,
         third_claim_command.input.node_id,
+        local_verify.version,
     )
     .await?;
 
@@ -351,21 +360,108 @@ async fn exercise_mvp(
                (SELECT next_fencing_token FROM work_packages WHERE id=$1), \
                (SELECT count(*) FROM candidate_artifacts WHERE package_id=$1 AND state='COMPLETE'), \
                (SELECT count(*) FROM candidate_artifact_chunks WHERE artifact_id IN \
-                    (SELECT id FROM candidate_artifacts WHERE package_id=$1))",
-            &[package_id.as_uuid(), project_id.as_uuid()],
+                    (SELECT id FROM candidate_artifacts WHERE package_id=$1)), \
+               (SELECT count(*) FROM attempt_progress WHERE attempt_id=$3)",
+            &[
+                package_id.as_uuid(),
+                project_id.as_uuid(),
+                third_claim.attempt_id.as_uuid(),
+            ],
         )
         .await?;
     assert_eq!(row.get::<_, i64>(0), 3);
     assert_eq!(row.get::<_, i64>(1), 3);
     assert_eq!(row.get::<_, i64>(2), 0);
-    assert_eq!(row.get::<_, i64>(3), 24);
-    assert_eq!(row.get::<_, i64>(4), 24);
-    assert_eq!(row.get::<_, i64>(5), 13);
+    assert_eq!(row.get::<_, i64>(3), 32);
+    assert_eq!(row.get::<_, i64>(4), 32);
+    assert_eq!(row.get::<_, i64>(5), 17);
     assert_eq!(row.get::<_, i64>(6), 3);
     assert_eq!(row.get::<_, i64>(7), 3);
     assert_eq!(row.get::<_, i64>(8), 1);
     assert_eq!(row.get::<_, i64>(9), 2);
+    assert_eq!(row.get::<_, i64>(10), 4);
     Ok(())
+}
+
+async fn exercise_attempt_progress(
+    control: &PostgresMvpControlPlane,
+    project_id: ProjectId,
+    claimed: &ClaimedWork,
+    node_id: NodeId,
+) -> Result<AttemptProgressView> {
+    let invalid_jump = MvpCommand {
+        context: context(
+            "attempt-progress-invalid-jump",
+            Some(claimed.attempt_version),
+        ),
+        input: ReportAttemptProgressInput {
+            project_id,
+            attempt_id: claimed.attempt_id,
+            lease_id: claimed.lease_id,
+            node_id,
+            fencing_token: claimed.fencing_token,
+            stage: AttemptProgressStage::LocalVerify,
+            evidence_digest: Sha256Digest::of_bytes(b"invalid-jump"),
+        },
+    };
+    assert_eq!(
+        control
+            .report_attempt_progress(&invalid_jump)
+            .await
+            .expect_err("author progress cannot skip central Attempt phases")
+            .code(),
+        "AF_TRANSITION_INVALID"
+    );
+
+    let stages = [
+        (AttemptProgressStage::Preparing, AttemptState::Preparing),
+        (AttemptProgressStage::Planning, AttemptState::Planning),
+        (
+            AttemptProgressStage::Implementing,
+            AttemptState::Implementing,
+        ),
+        (AttemptProgressStage::LocalVerify, AttemptState::LocalVerify),
+    ];
+    let mut expected_version = claimed.attempt_version;
+    let mut last = None;
+    for (index, (stage, expected_state)) in stages.into_iter().enumerate() {
+        let command = MvpCommand {
+            context: context(&format!("attempt-progress-{index}"), Some(expected_version)),
+            input: ReportAttemptProgressInput {
+                project_id,
+                attempt_id: claimed.attempt_id,
+                lease_id: claimed.lease_id,
+                node_id,
+                fencing_token: claimed.fencing_token,
+                stage,
+                evidence_digest: Sha256Digest::of_bytes(
+                    format!("attempt-progress-evidence-{index}").as_bytes(),
+                ),
+            },
+        };
+        let progress = control.report_attempt_progress(&command).await?;
+        assert_eq!(progress.state, expected_state);
+        assert_eq!(progress.semantic_progress_seq, u64::try_from(index + 1)?);
+        assert_eq!(progress.version.get(), expected_version.get() + 2);
+        assert_eq!(control.report_attempt_progress(&command).await?, progress);
+
+        if index == 0 {
+            let mut changed = command.clone();
+            changed.input.evidence_digest = Sha256Digest::of_bytes(b"changed-progress-evidence");
+            assert_eq!(
+                control
+                    .report_attempt_progress(&changed)
+                    .await
+                    .expect_err("same progress key with changed evidence must fail")
+                    .code(),
+                "AF_IDEMPOTENCY_KEY_REUSED"
+            );
+        }
+
+        expected_version = progress.version;
+        last = Some(progress);
+    }
+    Ok(last.expect("the four-stage progress path produces a final view"))
 }
 
 async fn exercise_candidate_artifact(
@@ -374,6 +470,7 @@ async fn exercise_candidate_artifact(
     project_id: ProjectId,
     claimed: &ClaimedWork,
     node_id: NodeId,
+    attempt_version: AggregateVersion,
 ) -> Result<()> {
     let chunks = [
         b"candidate-bundle-part-one".to_vec(),
@@ -386,7 +483,7 @@ async fn exercise_candidate_artifact(
     let bundle_bytes = chunks.concat();
     let bundle_digest = Sha256Digest::of_bytes(&bundle_bytes);
     let init = MvpCommand {
-        context: context("candidate-artifact-init", Some(claimed.attempt_version)),
+        context: context("candidate-artifact-init", Some(attempt_version)),
         input: InitCandidateArtifactInput {
             project_id,
             attempt_id: claimed.attempt_id,

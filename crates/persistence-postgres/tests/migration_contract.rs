@@ -12,12 +12,37 @@ fn migration_manifest_and_repository_files_match() {
         "migrations/0003_m1_events_projections.sql",
         "migrations/0004_m1_uow.sql",
         "migrations/0005_mvp_candidates.sql",
+        "migrations/0006_mvp_attempt_progress.sql",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     for (migration, relative_path) in MIGRATIONS.iter().zip(expected) {
         let bytes = fs::read(root.join(relative_path)).expect("migration file exists");
         assert_eq!(bytes, migration.sql.as_bytes(), "embedded SQL drifted");
     }
+}
+
+#[test]
+fn attempt_progress_sql_is_typed_immutable_and_authority_bound() {
+    let progress = MIGRATIONS[5].sql;
+    for required in [
+        "CREATE TABLE attempt_progress",
+        "evidence_digest bytea NOT NULL",
+        "UNIQUE (attempt_id, semantic_progress_seq)",
+        "UNIQUE (attempt_id, attempt_version)",
+        "attempt_progress_matches_current_authority",
+        "current_lease_state <> 'ACTIVE'",
+        "current_holder <> NEW.node_id",
+        "package.active_attempt_id = attempt.id",
+        "current_attempt_updated_at IS DISTINCT FROM NEW.recorded_at",
+        "clock_timestamp() >= current_lease_expiry",
+        "BEFORE UPDATE OR DELETE ON attempt_progress",
+    ] {
+        assert!(
+            progress.contains(required),
+            "missing Attempt progress SQL contract: {required}"
+        );
+    }
+    assert!(!progress.contains("aggregate_snapshots"));
 }
 
 #[test]

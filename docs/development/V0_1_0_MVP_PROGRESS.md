@@ -2,7 +2,7 @@
 
 - 分支：`agent/v0.1.0-mvp`
 - 更新日期：2026-08-10
-- 总体状态：MVP-01/MVP-02 完成；MVP-03 Candidate handoff 实施中
+- 总体状态：MVP-01 完成；MVP-02/MVP-03 试点纵切实施中，尚未达到可发布 MVP 门禁
 - 发布计划：[V0_1_0_MVP_RELEASE_PLAN.md](V0_1_0_MVP_RELEASE_PLAN.md)
 
 ## MVP-01 / Checkpoint A：Typed Market 与 Lease 命令面
@@ -476,7 +476,7 @@ git diff --check                                                             PAS
 
 ## MVP-03 / Checkpoint O.1：完整 Claim 回执与 Journal v6
 
-状态：实现完成，Worker 41 个定点测试与全工作区 build/test/Clippy 通过；等待推送后的 CI。
+状态：完成；Worker 41 个定点测试、全工作区门禁及 CI #86 / run `31357076090` 全绿。
 
 当前完成：
 
@@ -511,7 +511,7 @@ git diff --check                                                             PAS
 
 ## MVP-03 / Checkpoint O.2：可恢复 Fixture Artifact 自动上传
 
-状态：实现完成，Worker 42 个定点测试与全工作区 build/test/Clippy 通过；等待推送后的 CI。
+状态：完成；Worker 42 个定点测试、全工作区门禁及 CI #88 / run `31357863100` 全绿。
 
 当前完成：
 
@@ -550,3 +550,46 @@ git diff --check                                                             PAS
 Artifact Complete 后本地仍停在 `HandingOffCandidate`。下一纵切必须实现原子的
 `RecordCandidate + VerificationRun::Queued`，之后才能关闭作者 Lease；真实 workspace/jcode 产生 Git 对象、
 LAN mTLS/enrollment 与独立 verifier 仍不属于本检查点。
+
+## MVP-03 / Checkpoint P.1：中心 Attempt 进度与证据账本
+
+状态：实现完成，本地 application/storage 定点门禁与 PGlite 0001..0006 实跑通过；等待本检查点推送后的
+真实 PostgreSQL 17 CI。
+
+当前完成：
+
+- application 新增 `report_attempt_progress` typed use case；作者只能逐步上报
+  `PREPARING -> PLANNING -> IMPLEMENTING -> LOCAL_VERIFY`，不能从刚 Claim 的 `LEASED` 直接声称本地
+  验证完成；
+- PostgreSQL adapter 延续 receipt-first 与固定 Package → Attempt → Lease 锁顺序；receipt miss 时才复核
+  Attempt CAS、当前 ACTIVE WorkPackage/Lease、holder node、fencing token 与服务器时钟 Lease expiry；
+- 每次成功进度命令在同一 Serializable 事务内执行一个 phase transition 和一个
+  `SemanticProgressReported`，因此 Attempt version/event sequence 各前进两步，并原子追加两个 Domain
+  Event、两个 Outbox、一个 Command Receipt；
+- 新增 additive `0006_mvp_attempt_progress.sql`。`attempt_progress` 是 typed、不可变证据账本，以复合外键
+  绑定 Project、Package/revision、Attempt、Lease/fencing；数据库 trigger 再次核对当前 author authority、
+  phase shape、Attempt version/semantic sequence 以及同一 `updated_at/recorded_at`；
+- 阶段 `evidence_digest` 只进入进度账本，不冒充 `last_checkpoint_digest`；以后接入真实 workspace/jcode
+  checkpoint 时必须使用独立的内容寻址对象；
+- PostgreSQL 条件合同已扩展四阶段正向路径、跳阶段拒绝、exact ACK-loss replay 与 changed-evidence key
+  reuse；本机无 PostgreSQL 服务时测试明确 skip，不计作真实数据库证据；
+- PGlite 已实际顺序执行 0001..0006，并确认 `attempt_progress`、2 个业务 trigger 与 13 个约束均安装。
+
+本地证据：
+
+```text
+cargo check --workspace --all-targets --locked --offline                  PASS
+cargo test -p agentforge-application -p agentforge-storage-postgres \
+  --all-features --locked --offline                                        PASS
+PGlite 0001..0006 migration / attempt_progress triggers+constraints        PASS
+cargo build --workspace --locked --all-targets --offline                   PASS
+cargo test --workspace --locked --offline                                  PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                  PASS
+cargo fmt --all -- --check / workspace layout / node --check / diff-check  PASS
+```
+
+明确边界：P.1 只建立中心 Attempt 的权威阶段前置条件；HTTP wire 与 Worker Journal 尚未调用此命令，
+`RecordCandidate + VerificationRun::Queued` 也尚未实现。下一检查点必须先把四步进度接入 Worker 的
+pending-first durable intent，再以最终 `LOCAL_VERIFY` Attempt version 提交 Candidate，不能在 adapter 内
+伪造或跳过状态。

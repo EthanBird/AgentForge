@@ -266,7 +266,7 @@ async fn exercise_uow_upgrade(client: &mut Client) -> Result<()> {
 }
 
 async fn exercise_migrations(client: &mut Client) -> Result<()> {
-    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3, 4, 5]);
+    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3, 4, 5, 6]);
     assert!(migration::migrate(client).await?.is_empty());
 
     let installed: Vec<String> = client
@@ -283,6 +283,7 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         "agentforge_schema_migrations",
         "aggregate_event_heads",
         "attempts",
+        "attempt_progress",
         "budget_reservations",
         "candidate_artifact_chunks",
         "candidate_artifacts",
@@ -321,7 +322,7 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
 
     let required_indexes: i64 = client
         .query_one(

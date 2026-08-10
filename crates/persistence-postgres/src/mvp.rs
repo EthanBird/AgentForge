@@ -1,13 +1,13 @@
 //! PostgreSQL-backed typed command surface for the runnable MVP.
 
 use agentforge_application::{
-    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
-    CompleteCandidateArtifactInput, CreateProjectInput, EventAppendPort, EventRecord,
-    InitCandidateArtifactInput, Isolation, LeaseReconciliationReport, LeaseView, ListOffersQuery,
-    MvpCommand, MvpControlPlane, MvpError, MvpFuture, MvpResult, OfferView,
-    PackageExecutionSnapshot, ProjectView, PublishPackageInput, PublishedPackage,
-    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, UnitOfWork, UnitOfWorkFactory,
-    UploadCandidateArtifactChunkInput,
+    AttemptProgressStage, AttemptProgressView, CandidateArtifactChunkReceipt,
+    CandidateArtifactView, ClaimPackageInput, ClaimedWork, CompleteCandidateArtifactInput,
+    CreateProjectInput, EventAppendPort, EventRecord, InitCandidateArtifactInput, Isolation,
+    LeaseReconciliationReport, LeaseView, ListOffersQuery, MvpCommand, MvpControlPlane, MvpError,
+    MvpFuture, MvpResult, OfferView, PackageExecutionSnapshot, ProjectView, PublishPackageInput,
+    PublishedPackage, ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput,
+    ReportAttemptProgressInput, UnitOfWork, UnitOfWorkFactory, UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, AggregateId, AggregateVersion, ArtifactRef, Attempt, AttemptId, CandidateArtifact,
@@ -15,7 +15,7 @@ use agentforge_domain::{
     CommandReceipt, CorrelationId, DomainEventEnvelope, EventContext, EventId, FencingToken,
     GitObjectId, IdempotencyKey, IdempotencyScope, Lease, LeaseId, PackageRevision,
     PackageRevisionId, ProjectId, ProtocolKey, ServerInstant, Sha256Digest, WorkPackage,
-    attempt::{AttemptCommand, AttemptState, NewAttempt, WakeCondition},
+    attempt::{AttemptCommand, AttemptState, NewAttempt, SemanticProgress, WakeCondition},
     candidate::{CandidateArtifactCommand, CandidateArtifactSnapshot, ReserveCandidateArtifact},
     command::ReceiptDecision,
     lease::{GrantLease, LeaseCommand, LeaseState},
@@ -134,7 +134,8 @@ impl PostgresMvpControlPlane {
                        to_regclass('candidate_artifacts'),
                        to_regclass('candidate_artifact_chunks'),
                        to_regclass('candidates'),
-                       to_regclass('verification_runs')
+                       to_regclass('verification_runs'),
+                       to_regclass('attempt_progress')
                      ]::text[]",
                     &[],
                 )
@@ -143,7 +144,7 @@ impl PostgresMvpControlPlane {
             let required_tables: Vec<Option<String>> = row
                 .try_get(0)
                 .map_err(|_| agentforge_application::PortError::Integrity)?;
-            Ok(required_tables.len() == 11 && required_tables.iter().all(Option::is_some))
+            Ok(required_tables.len() == 12 && required_tables.iter().all(Option::is_some))
         }
         .await;
         finish(uow, result).await
@@ -505,6 +506,150 @@ impl PostgresMvpControlPlane {
                 response.clone(),
                 response.package_version,
                 effect,
+            )
+            .await?;
+            Ok(response)
+        }
+        .await;
+        finish(uow, result).await
+    }
+
+    async fn report_attempt_progress_inner(
+        &self,
+        command: &MvpCommand<ReportAttemptProgressInput>,
+    ) -> MvpResult<AttemptProgressView> {
+        validate_attempt_progress_input(&command.input)?;
+        let metadata = command.context.metadata(&command.input)?;
+        let scope = scope(command.input.project_id, "attempt.progress", &metadata)?;
+        let mut uow = self.factory.begin(Isolation::Serializable).await?;
+        let result = async {
+            if let Some(response) =
+                replay::<AttemptProgressView>(&mut uow, &scope, &metadata).await?
+            {
+                return Ok(response);
+            }
+
+            let package_id = locate_attempt_package(&uow, command.input.attempt_id).await?;
+            let package =
+                load_package_for_update(&uow, command.input.project_id, package_id).await?;
+            let attempt =
+                load_attempt_for_update(&uow, package_id, command.input.attempt_id).await?;
+            metadata.require_version(attempt.attempt.version)?;
+            let lease =
+                load_lease(&uow, command.input.project_id, command.input.lease_id, true).await?;
+            validate_active_work_binding(&package.package, &attempt.attempt, &lease.lease)?;
+            let now = uow.server_now().await?;
+            if attempt.attempt.lease_id != Some(command.input.lease_id)
+                || attempt.attempt.node_id != command.input.node_id
+                || attempt.attempt.fencing_token != command.input.fencing_token
+            {
+                return Err(agentforge_domain::DomainError::StaleLease.into());
+            }
+            validate_author_lease(
+                &package,
+                &attempt,
+                &lease,
+                command.input.node_id,
+                command.input.fencing_token,
+                now,
+            )?;
+
+            let phase_command = match command.input.stage {
+                AttemptProgressStage::Preparing => AttemptCommand::StartPreparation {
+                    expected_version: attempt.attempt.version,
+                    token_is_current: true,
+                    inputs_available: true,
+                },
+                AttemptProgressStage::Planning => AttemptCommand::BaselineReady {
+                    expected_version: attempt.attempt.version,
+                    snapshot_matches: true,
+                },
+                AttemptProgressStage::Implementing => AttemptCommand::ApproveExecutionPlan {
+                    expected_version: attempt.attempt.version,
+                    plan_covers_contract: true,
+                },
+                AttemptProgressStage::LocalVerify => AttemptCommand::StartLocalVerification {
+                    expected_version: attempt.attempt.version,
+                    has_candidate_changes: true,
+                },
+            };
+            let phase = attempt.attempt.transition(&phase_command)?;
+            let progress = phase
+                .aggregate
+                .transition(&AttemptCommand::ReportProgress {
+                    expected_version: phase.aggregate.version,
+                    progress: SemanticProgress {
+                        milestone_changed_with_evidence: true,
+                        ..SemanticProgress::default()
+                    },
+                })?;
+
+            let first_event_seq = next_event_seq(attempt.event_seq)?;
+            let second_event_seq = next_event_seq(first_event_seq)?;
+            update_attempt_after_progress(
+                &uow,
+                &attempt,
+                &progress.aggregate,
+                second_event_seq,
+                now,
+            )
+            .await?;
+            insert_attempt_progress(
+                &uow,
+                command,
+                package_id,
+                attempt.attempt.revision_id,
+                attempt.attempt.state,
+                &progress.aggregate,
+                now,
+            )
+            .await?;
+
+            let phase_event = build_event(
+                command.input.project_id,
+                AggregateId::Attempt(command.input.attempt_id),
+                phase.aggregate.version,
+                first_event_seq,
+                &metadata,
+                now,
+                phase.events[0].clone(),
+            )?;
+            let progress_event = build_event(
+                command.input.project_id,
+                AggregateId::Attempt(command.input.attempt_id),
+                progress.aggregate.version,
+                second_event_seq,
+                &metadata,
+                now,
+                progress.events[0].clone(),
+            )?;
+            let records = [phase_event.record.clone(), progress_event.record.clone()];
+            uow.append_events(&records).await?;
+            uow.enqueue_outbox(&[
+                phase_event.outbox(now, command.input.attempt_id.to_string()),
+                progress_event.outbox(now, command.input.attempt_id.to_string()),
+            ])
+            .await?;
+
+            let response = attempt_progress_view(
+                command.input.project_id,
+                package_id,
+                command.input.lease_id,
+                &progress.aggregate,
+                now,
+            );
+            store_receipt(
+                &mut uow,
+                scope,
+                &metadata,
+                response,
+                response.version,
+                effect_digest(&json!({
+                    "attempt_id": response.attempt_id,
+                    "state": response.state,
+                    "semantic_progress_seq": response.semantic_progress_seq,
+                    "event_ids": records.map(|record| record.event_id),
+                }))?,
             )
             .await?;
             Ok(response)
@@ -1245,6 +1390,13 @@ impl MvpControlPlane for PostgresMvpControlPlane {
         Box::pin(self.claim_package_inner(command))
     }
 
+    fn report_attempt_progress<'a>(
+        &'a self,
+        command: &'a MvpCommand<ReportAttemptProgressInput>,
+    ) -> MvpFuture<'a, AttemptProgressView> {
+        Box::pin(self.report_attempt_progress_inner(command))
+    }
+
     fn init_candidate_artifact<'a>(
         &'a self,
         command: &'a MvpCommand<InitCandidateArtifactInput>,
@@ -1546,6 +1698,22 @@ fn validate_complete_candidate_artifact(input: &CompleteCandidateArtifactInput) 
         return Err(agentforge_domain::DomainError::InvalidArgument {
             field: "candidate_artifact_complete".into(),
             reason: "resource identifiers or bundle URI are invalid".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_attempt_progress_input(input: &ReportAttemptProgressInput) -> MvpResult<()> {
+    if input.project_id.as_uuid().is_nil()
+        || input.attempt_id.as_uuid().is_nil()
+        || input.lease_id.as_uuid().is_nil()
+        || input.node_id.as_uuid().is_nil()
+        || digest_is_zero(input.evidence_digest)
+    {
+        return Err(agentforge_domain::DomainError::InvalidArgument {
+            field: "attempt_progress".into(),
+            reason: "resource identifiers and evidence digest must be valid".into(),
         }
         .into());
     }
@@ -2484,6 +2652,115 @@ fn validate_active_work_binding(
         return Err(agentforge_domain::DomainError::StaleLease.into());
     }
     Ok(())
+}
+
+async fn update_attempt_after_progress(
+    uow: &PostgresUnitOfWork,
+    loaded: &LoadedAttempt,
+    attempt: &Attempt,
+    event_seq: u64,
+    updated_at: ServerInstant,
+) -> MvpResult<()> {
+    let state = attempt.state.as_str().to_ascii_uppercase();
+    let previous_state = loaded.attempt.state.as_str().to_ascii_uppercase();
+    let changed = uow
+        .client()?
+        .execute(
+            "UPDATE attempts \
+             SET state=$3, semantic_progress_seq=$4, last_semantic_progress_at=$5, \
+                 version=$6, event_seq=$7, updated_at=$5 \
+             WHERE id=$1 AND package_id=$2 AND state=$8 AND version=$9 AND event_seq=$10",
+            &[
+                attempt.id.as_uuid(),
+                attempt.package_id.as_uuid(),
+                &state,
+                &u64_to_i64(attempt.semantic_progress_seq)?,
+                &updated_at.0,
+                &version_to_i64(attempt.version)?,
+                &u64_to_i64(event_seq)?,
+                &previous_state,
+                &version_to_i64(loaded.attempt.version)?,
+                &u64_to_i64(loaded.event_seq)?,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+async fn insert_attempt_progress(
+    uow: &PostgresUnitOfWork,
+    command: &MvpCommand<ReportAttemptProgressInput>,
+    package_id: agentforge_domain::PackageId,
+    revision_id: PackageRevisionId,
+    state_before: AttemptState,
+    attempt: &Attempt,
+    recorded_at: ServerInstant,
+) -> MvpResult<()> {
+    let changed = uow
+        .client()?
+        .execute(
+            "INSERT INTO attempt_progress \
+             (progress_id,project_id,attempt_id,package_id,revision_id,lease_id,node_id, \
+              fencing_token,stage,evidence_digest,state_before,state_after, \
+              semantic_progress_seq,attempt_version,recorded_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+            &[
+                command.context.command_id.as_uuid(),
+                command.input.project_id.as_uuid(),
+                command.input.attempt_id.as_uuid(),
+                package_id.as_uuid(),
+                revision_id.as_uuid(),
+                command.input.lease_id.as_uuid(),
+                command.input.node_id.as_uuid(),
+                &u64_to_i64(command.input.fencing_token.get())?,
+                &attempt_progress_stage_label(command.input.stage),
+                &&command.input.evidence_digest.as_bytes()[..],
+                &state_before.as_str().to_ascii_uppercase(),
+                &attempt.state.as_str().to_ascii_uppercase(),
+                &u64_to_i64(attempt.semantic_progress_seq)?,
+                &version_to_i64(attempt.version)?,
+                &recorded_at.0,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+const fn attempt_progress_stage_label(stage: AttemptProgressStage) -> &'static str {
+    match stage {
+        AttemptProgressStage::Preparing => "PREPARING",
+        AttemptProgressStage::Planning => "PLANNING",
+        AttemptProgressStage::Implementing => "IMPLEMENTING",
+        AttemptProgressStage::LocalVerify => "LOCAL_VERIFY",
+    }
+}
+
+fn attempt_progress_view(
+    project_id: ProjectId,
+    package_id: agentforge_domain::PackageId,
+    lease_id: LeaseId,
+    attempt: &Attempt,
+    updated_at: ServerInstant,
+) -> AttemptProgressView {
+    AttemptProgressView {
+        project_id,
+        package_id,
+        attempt_id: attempt.id,
+        lease_id,
+        fencing_token: attempt.fencing_token,
+        state: attempt.state,
+        semantic_progress_seq: attempt.semantic_progress_seq,
+        updated_at,
+        version: attempt.version,
+    }
 }
 
 async fn update_attempt_after_loss(

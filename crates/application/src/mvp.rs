@@ -10,7 +10,7 @@ use agentforge_domain::{
     ActorId, AggregateVersion, ArtifactRef, AttemptId, CandidateArtifactId, CandidateArtifactState,
     CandidateId, CommandId, CommandMetadata, CorrelationId, EventId, ExecutorId, FencingToken,
     GitObjectId, IdempotencyKey, LeaseId, NodeId, PackageId, PackageRevision, PackageRevisionId,
-    ProjectId, ProtocolKey, ServerInstant, Sha256Digest, lease::LeaseState,
+    ProjectId, ProtocolKey, ServerInstant, Sha256Digest, attempt::AttemptState, lease::LeaseState,
     work_package::WorkPackageState,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -327,6 +327,44 @@ pub struct ClaimedWork {
     pub execution: PackageExecutionSnapshot,
 }
 
+/// The immediate next central Attempt phase reported by an author Worker.
+/// Reports are intentionally one-step: a Worker cannot jump from LEASED to
+/// LOCAL_VERIFY with one optimistic assertion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptProgressStage {
+    Preparing,
+    Planning,
+    Implementing,
+    LocalVerify,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportAttemptProgressInput {
+    pub project_id: ProjectId,
+    pub attempt_id: AttemptId,
+    pub lease_id: LeaseId,
+    pub node_id: NodeId,
+    pub fencing_token: FencingToken,
+    pub stage: AttemptProgressStage,
+    pub evidence_digest: Sha256Digest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptProgressView {
+    pub project_id: ProjectId,
+    pub package_id: PackageId,
+    pub attempt_id: AttemptId,
+    pub lease_id: LeaseId,
+    pub fencing_token: FencingToken,
+    pub state: AttemptState,
+    pub semantic_progress_seq: u64,
+    pub updated_at: ServerInstant,
+    pub version: AggregateVersion,
+}
+
 /// Author-side reservation for one immutable Candidate bundle.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -524,6 +562,11 @@ pub trait MvpControlPlane: Send + Sync {
         &'a self,
         command: &'a MvpCommand<ClaimPackageInput>,
     ) -> MvpFuture<'a, ClaimedWork>;
+
+    fn report_attempt_progress<'a>(
+        &'a self,
+        command: &'a MvpCommand<ReportAttemptProgressInput>,
+    ) -> MvpFuture<'a, AttemptProgressView>;
 
     fn init_candidate_artifact<'a>(
         &'a self,

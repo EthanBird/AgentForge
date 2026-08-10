@@ -49,6 +49,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "mvp_candidates",
         sql: include_str!("../../../migrations/0005_mvp_candidates.sql"),
     },
+    Migration {
+        version: 6,
+        name: "mvp_attempt_progress",
+        sql: include_str!("../../../migrations/0006_mvp_attempt_progress.sql"),
+    },
 ];
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -246,7 +251,7 @@ mod tests {
     #[test]
     fn migration_manifest_is_contiguous_transactional_and_additive() {
         validate_manifest().expect("repository migration manifest must be valid");
-        assert_eq!(MIGRATIONS.len(), 5);
+        assert_eq!(MIGRATIONS.len(), 6);
         assert!(MIGRATIONS.iter().all(|migration| {
             let digest = migration.digest();
             digest.len() == 71 && digest.starts_with("sha256:")
