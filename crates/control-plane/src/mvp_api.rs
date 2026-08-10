@@ -1,11 +1,11 @@
 //! Versioned HTTP command surface for the runnable local MVP.
 
 use agentforge_application::{
-    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
+    AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
     CompleteCandidateArtifactInput, CreateProjectInput, InitCandidateArtifactInput, LeaseView,
     ListOffersQuery, MvpCommand, MvpCommandContext, MvpError, OfferView, ProjectView,
     PublishPackageInput, PublishedPackage, ReleaseLeaseInput, RenewLeaseInput,
-    UploadCandidateArtifactChunkInput,
+    ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, AggregateVersion, AttemptId, CandidateArtifactId, CommandId, CorrelationId, EventId,
@@ -51,6 +51,10 @@ pub(crate) fn routes() -> Router<ControlPlaneState> {
         .route(
             "/api/v1/projects/{project_id}/leases/{lease_id}/release",
             post(release_lease),
+        )
+        .route(
+            "/api/v1/projects/{project_id}/attempts/{attempt_id}/progress",
+            post(report_attempt_progress),
         )
         .route(
             "/api/v1/projects/{project_id}/attempts/{attempt_id}/candidate-artifacts",
@@ -185,6 +189,26 @@ async fn release_lease(
         input,
     };
     Ok(Json(service(&state)?.release_lease(&command).await?))
+}
+
+async fn report_attempt_progress(
+    State(state): State<ControlPlaneState>,
+    Path((project_id, attempt_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(input): Json<ReportAttemptProgressInput>,
+) -> Result<Json<AttemptProgressView>, ApiError> {
+    let project_id = parse_project(&project_id)?;
+    let attempt_id = parse_attempt(&attempt_id)?;
+    require_same(project_id, input.project_id, "project_id")?;
+    require_same(attempt_id, input.attempt_id, "attempt_id")?;
+    let actor = authorize(&state, &headers, project_id).await?;
+    let command = MvpCommand {
+        context: command_context(&headers, actor, true)?,
+        input,
+    };
+    Ok(Json(
+        service(&state)?.report_attempt_progress(&command).await?,
+    ))
 }
 
 async fn init_candidate_artifact(
@@ -470,14 +494,15 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use agentforge_application::{
-        AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimedWork,
-        CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseReconciliationReport,
-        MvpControlPlane, MvpFuture, ProjectView, ReconcileExpiredLeasesQuery,
-        ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
+        AttemptProgressStage, AttemptProgressView, CandidateArtifactChunkReceipt,
+        CandidateArtifactView, ClaimedWork, CompleteCandidateArtifactInput,
+        InitCandidateArtifactInput, LeaseReconciliationReport, MvpControlPlane, MvpFuture,
+        ProjectView, ReconcileExpiredLeasesQuery, ReportAttemptProgressInput,
+        UploadCandidateArtifactChunkInput,
     };
     use agentforge_domain::{
         CandidateArtifactState, CandidateId, ExecutorId, FencingToken, GitObjectId, NodeId,
-        ProtocolKey, ServerInstant, Sha256Digest,
+        ProtocolKey, ServerInstant, Sha256Digest, attempt::AttemptState,
     };
     use time::macros::datetime;
 
@@ -527,9 +552,28 @@ mod tests {
 
         fn report_attempt_progress<'a>(
             &'a self,
-            _command: &'a MvpCommand<ReportAttemptProgressInput>,
+            command: &'a MvpCommand<ReportAttemptProgressInput>,
         ) -> MvpFuture<'a, AttemptProgressView> {
-            unavailable()
+            Box::pin(async move {
+                let (state, semantic_progress_seq) = match command.input.stage {
+                    AttemptProgressStage::Preparing => (AttemptState::Preparing, 1),
+                    AttemptProgressStage::Planning => (AttemptState::Planning, 2),
+                    AttemptProgressStage::Implementing => (AttemptState::Implementing, 3),
+                    AttemptProgressStage::LocalVerify => (AttemptState::LocalVerify, 4),
+                };
+                let expected = command.context.expected_version.expect("Attempt version");
+                Ok(AttemptProgressView {
+                    project_id: command.input.project_id,
+                    package_id: PackageId::from_uuid(Uuid::from_bytes([2; 16])),
+                    attempt_id: command.input.attempt_id,
+                    lease_id: command.input.lease_id,
+                    fencing_token: command.input.fencing_token,
+                    state,
+                    semantic_progress_seq,
+                    updated_at: ServerInstant(datetime!(2026-08-10 00:00 UTC)),
+                    version: AggregateVersion::new(expected.get() + 2),
+                })
+            })
         }
 
         fn init_candidate_artifact<'a>(
@@ -762,6 +806,50 @@ mod tests {
         )
         .await
         .expect_err("mismatched package id");
+        assert!(matches!(error, ApiError::PathBodyMismatch));
+    }
+
+    #[tokio::test]
+    async fn attempt_progress_handler_enforces_path_cas_and_returns_typed_state() {
+        let project_id = ProjectId::from_uuid(Uuid::from_bytes([1; 16]));
+        let attempt_id = AttemptId::from_uuid(Uuid::from_bytes([4; 16]));
+        let input = ReportAttemptProgressInput {
+            project_id,
+            attempt_id,
+            lease_id: LeaseId::from_uuid(Uuid::from_bytes([5; 16])),
+            node_id: NodeId::from_uuid(Uuid::from_bytes([8; 16])),
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            stage: AttemptProgressStage::Preparing,
+            evidence_digest: Sha256Digest::of_bytes(b"preparation-evidence"),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            IDEMPOTENCY_KEY,
+            "attempt-progress-1".parse().expect("header"),
+        );
+        headers.insert(header::IF_MATCH, "\"1\"".parse().expect("header"));
+        let Json(view) = report_attempt_progress(
+            State(test_state(project_id)),
+            Path((project_id.to_string(), attempt_id.to_string())),
+            headers,
+            Json(input.clone()),
+        )
+        .await
+        .expect("progress response");
+        assert_eq!(view.state, AttemptState::Preparing);
+        assert_eq!(view.version, AggregateVersion::new(3));
+
+        let error = report_attempt_progress(
+            State(test_state(project_id)),
+            Path((
+                project_id.to_string(),
+                AttemptId::from_uuid(Uuid::from_bytes([9; 16])).to_string(),
+            )),
+            HeaderMap::new(),
+            Json(input),
+        )
+        .await
+        .expect_err("path/body Attempt mismatch");
         assert!(matches!(error, ApiError::PathBodyMismatch));
     }
 

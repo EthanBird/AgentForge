@@ -28,7 +28,8 @@ cargo run --locked -p agentforge-control-plane --bin agentforge-control-plane
 所有写命令必须带：
 
 - `Idempotency-Key`：同一 actor 内的稳定业务键；
-- `If-Match: "<version>"`：Claim、Renew、Release 以及 Candidate Artifact 的 Init、Chunk、Complete
+- `If-Match: "<version>"`：Claim、Attempt Progress、Renew、Release 以及 Candidate Artifact 的
+  Init、Chunk、Complete
   必须提供，创建 Project/Package 禁止提供；
 - `Content-Type: application/json`；
 - 可选 `X-AgentForge-Command-Id`、`X-AgentForge-Correlation-Id`、
@@ -45,6 +46,7 @@ HTTP actor 从已经验证的 request actor/Project grant 派生，客户端不�
 | `GET` | `/api/v1/projects/{project_id}/leases/{lease_id}` | 读取 Lease |
 | `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/renew` | fencing Renew |
 | `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/release` | fencing Release |
+| `POST` | `/api/v1/projects/{project_id}/attempts/{attempt_id}/progress` | 一步推进中心 Attempt 并登记证据 |
 | `POST` | `/api/v1/projects/{project_id}/attempts/{attempt_id}/candidate-artifacts` | 预留 Candidate 与 Artifact，返回 `201` |
 | `PUT` | `/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/chunks/{chunk_index}` | 上传一个已声明 chunk，返回 `204` |
 | `POST` | `/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/complete` | 重组并复算 Bundle，返回 COMPLETE Artifact |
@@ -65,7 +67,19 @@ Journal 前再次验证。这个内联快照只用于受控 MVP（请求/响应�
 }
 ```
 
-### 2.1 Candidate Artifact wire
+### 2.1 Attempt Progress wire
+
+Progress body 使用严格的 `ReportAttemptProgressInput`，路径中的 Project/Attempt 必须与 body 相同；
+`If-Match` 是当前中心 Attempt version。`stage` 只能依次为 `preparing`、`planning`、`implementing`、
+`local_verify`，服务端不会接受跳阶段。每一步返回新的 `AttemptProgressView`，其 version 因 phase event 与
+semantic-progress event 原子提交而前进 2，`semantic_progress_seq` 前进 1。`evidence_digest` 是阶段事实的
+内容摘要，只写入不可变 typed ledger，不会被冒充为 workspace checkpoint。
+
+四步命令都受当前 author Lease holder/fencing/expiry 保护，并采用 receipt-first：ACK 丢失后的原
+actor/key/body 返回首次 view；receipt miss 的新请求必须重新通过当前 authority 与 CAS。Worker 必须保存
+每一步完整请求与 response，取得最终 `LOCAL_VERIFY` version 后才可初始化 Candidate Artifact。
+
+### 2.2 Candidate Artifact wire
 
 Init body 使用 `InitCandidateArtifactInput` 的严格 JSON 结构，并同时绑定 Attempt、Lease、node、fencing、
 Package hash、base/candidate/tree、作者证据摘要、Bundle 总摘要/大小与有序 chunk 摘要。路径中的 Project 和
@@ -84,7 +98,7 @@ Complete 的 `If-Match` 是当前 Artifact version。服务端按声明顺序读
 
 CAS 过期固定返回 `AF_VERSION_STALE/412`，不得使用旧拼写 `AF_STALE_VERSION`。
 
-### 2.2 Worker Artifact upload Journal
+### 2.3 Worker Artifact upload Journal
 
 Worker SQLite Journal schema v5 增加 `candidate_artifact_command_intents`；schema v6 进一步把首次成功的
 完整 `ClaimedWork`（含 Package/Attempt/Lease CAS version 与 execution snapshot）保存进原 Claim intent。

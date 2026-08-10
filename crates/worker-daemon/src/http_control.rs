@@ -3,10 +3,11 @@
 use std::{net::SocketAddr, time::Duration};
 
 use agentforge_application::{
-    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
-    CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, ListOffersQuery,
-    MvpCommand, MvpError, MvpFuture, MvpRemoteError, MvpResult, OfferView, PortError,
-    ReleaseLeaseInput, RenewLeaseInput, UploadCandidateArtifactChunkInput,
+    AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
+    ClaimedWork, CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView,
+    ListOffersQuery, MvpCommand, MvpError, MvpFuture, MvpRemoteError, MvpResult, OfferView,
+    PortError, ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{LeaseId, ProjectId};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -191,6 +192,25 @@ impl WorkerControlPlane for LoopbackHttpControlPlane {
                     command.input.project_id, command.input.package_id
                 ),
                 201,
+                Some(Self::command_body(command)?),
+                Some(&command.context),
+            )
+            .await
+        })
+    }
+
+    fn report_attempt_progress<'a>(
+        &'a self,
+        command: &'a MvpCommand<ReportAttemptProgressInput>,
+    ) -> MvpFuture<'a, AttemptProgressView> {
+        Box::pin(async move {
+            self.send(
+                "POST",
+                format!(
+                    "/api/v1/projects/{}/attempts/{}/progress",
+                    command.input.project_id, command.input.attempt_id
+                ),
+                200,
                 Some(Self::command_body(command)?),
                 Some(&command.context),
             )
@@ -612,6 +632,32 @@ mod tests {
         (StatusCode::CREATED, Json(claimed()))
     }
 
+    async fn attempt_progress_handler(
+        Path((project, attempt)): Path<(String, String)>,
+        headers: HeaderMap,
+        Json(input): Json<ReportAttemptProgressInput>,
+    ) -> Json<AttemptProgressView> {
+        assert_eq!(project, id::<ProjectId>(1).to_string());
+        assert_eq!(attempt, id::<AttemptId>(4).to_string());
+        assert_eq!(
+            input.stage,
+            agentforge_application::AttemptProgressStage::Preparing
+        );
+        assert_eq!(headers["idempotency-key"], "worker-attempt-progress");
+        assert_eq!(headers["if-match"], "\"2\"");
+        Json(AttemptProgressView {
+            project_id: id(1),
+            package_id: id(2),
+            attempt_id: id(4),
+            lease_id: id(5),
+            fencing_token: FencingToken::new(1).expect("generation"),
+            state: agentforge_domain::attempt::AttemptState::Preparing,
+            semantic_progress_seq: 1,
+            updated_at: at(1),
+            version: AggregateVersion::new(4),
+        })
+    }
+
     fn artifact_view(state: CandidateArtifactState) -> CandidateArtifactView {
         let content = b"candidate-bundle";
         CandidateArtifactView {
@@ -733,6 +779,10 @@ mod tests {
                 post(claim_handler),
             )
             .route(
+                "/api/v1/projects/{project}/attempts/{attempt}/progress",
+                post(attempt_progress_handler),
+            )
+            .route(
                 "/api/v1/projects/{project}/attempts/{attempt}/candidate-artifacts",
                 post(artifact_init_handler),
             )
@@ -798,6 +848,35 @@ mod tests {
             headers["x-agentforge-command-id"],
             command.context.command_id.to_string()
         );
+
+        let progress = MvpCommand {
+            context: MvpCommandContext {
+                command_id: id(30),
+                actor_id: id(6),
+                idempotency_key: IdempotencyKey::new("worker-attempt-progress").expect("key"),
+                correlation_id: id(31),
+                causation_id: None,
+                expected_version: Some(AggregateVersion::new(2)),
+            },
+            input: ReportAttemptProgressInput {
+                project_id: id(1),
+                attempt_id: id(4),
+                lease_id: id(5),
+                node_id: id(8),
+                fencing_token: FencingToken::new(1).expect("generation"),
+                stage: agentforge_application::AttemptProgressStage::Preparing,
+                evidence_digest: Sha256Digest::of_bytes(b"preparation-evidence"),
+            },
+        };
+        let progress_view = adapter
+            .report_attempt_progress(&progress)
+            .await
+            .expect("Attempt progress");
+        assert_eq!(
+            progress_view.state,
+            agentforge_domain::attempt::AttemptState::Preparing
+        );
+        assert_eq!(progress_view.version, AggregateVersion::new(4));
 
         let bundle = b"candidate-bundle".to_vec();
         let init = MvpCommand {

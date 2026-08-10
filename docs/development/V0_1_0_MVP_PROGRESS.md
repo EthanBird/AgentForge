@@ -593,3 +593,32 @@ cargo fmt --all -- --check / workspace layout / node --check / diff-check  PASS
 `RecordCandidate + VerificationRun::Queued` 也尚未实现。下一检查点必须先把四步进度接入 Worker 的
 pending-first durable intent，再以最终 `LOCAL_VERIFY` Attempt version 提交 Candidate，不能在 adapter 内
 伪造或跳过状态。
+
+## MVP-03 / Checkpoint P.2：Attempt Progress HTTP 与 Worker adapter
+
+状态：实现完成，Control Plane/Worker 定点 tests 与 strict Clippy 通过；等待本检查点推送后的 CI。
+
+当前完成：
+
+- 新增 `POST /api/v1/projects/{project_id}/attempts/{attempt_id}/progress`；Project/Attempt path-body 必须
+  相等，请求必须携带 `Idempotency-Key` 与当前 Attempt `If-Match`，actor 继续由服务器授权上下文派生；
+- handler 只负责授权、路径绑定和 transport envelope，业务状态机与 receipt-first 事务仍由同一个
+  `MvpControlPlane` application port 执行；
+- `WorkerControlPlane` 增加相同 typed 方法，`LoopbackHttpControlPlane` 使用有界 HTTP exchange、严格 JSON、
+  loopback peer 检查和统一错误 allowlist 调用该路由；
+- Control Plane 合同覆盖正确 path/CAS 的 typed response 及 Attempt path-body mismatch；Worker adapter
+  合同覆盖真实 HTTP path、headers、body 和 `AttemptProgressView` 解码。
+
+定点证据：
+
+```text
+cargo test -p agentforge-control-plane -p agentforge-worker-daemon \
+  --locked --offline                                                   PASS
+cargo clippy -p agentforge-control-plane -p agentforge-worker-daemon \
+  --all-targets --all-features --locked --offline -- -D warnings       PASS
+cargo fmt --all -- --check / git diff --check                          PASS
+```
+
+明确边界：P.2 只交付 wire/adapter，尚未把 Progress intent 写入 SQLite，也没有让 daemon 自动执行四阶段。
+P.3 必须新增 additive Journal schema 与 pending-first replay；Artifact Init 仍不能直接使用旧 Claim response
+里的 Attempt version。

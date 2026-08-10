@@ -1,11 +1,11 @@
 //! Worker-side Claim handoff and startup Lease reconciliation.
 
 use agentforge_application::{
-    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
-    CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, ListOffersQuery,
-    MvpCommand, MvpCommandContext, MvpControlPlane, MvpError, MvpFuture, OfferView,
-    PackageExecutionSnapshot, ReleaseLeaseInput, RenewLeaseInput,
-    UploadCandidateArtifactChunkInput,
+    AttemptProgressView, CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput,
+    ClaimedWork, CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView,
+    ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane, MvpError, MvpFuture,
+    OfferView, PackageExecutionSnapshot, ReleaseLeaseInput, RenewLeaseInput,
+    ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, NodeId, ProjectId,
@@ -37,6 +37,11 @@ pub trait WorkerControlPlane: Send + Sync {
         &'a self,
         command: &'a MvpCommand<ClaimPackageInput>,
     ) -> MvpFuture<'a, ClaimedWork>;
+
+    fn report_attempt_progress<'a>(
+        &'a self,
+        command: &'a MvpCommand<ReportAttemptProgressInput>,
+    ) -> MvpFuture<'a, AttemptProgressView>;
 
     fn init_candidate_artifact<'a>(
         &'a self,
@@ -83,6 +88,13 @@ where
         command: &'a MvpCommand<ClaimPackageInput>,
     ) -> MvpFuture<'a, ClaimedWork> {
         MvpControlPlane::claim_package(self, command)
+    }
+
+    fn report_attempt_progress<'a>(
+        &'a self,
+        command: &'a MvpCommand<ReportAttemptProgressInput>,
+    ) -> MvpFuture<'a, AttemptProgressView> {
+        MvpControlPlane::report_attempt_progress(self, command)
     }
 
     fn init_candidate_artifact<'a>(
@@ -981,6 +993,13 @@ mod tests {
                 return Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) });
             }
             Box::pin(async move { Ok(claimed) })
+        }
+
+        fn report_attempt_progress<'a>(
+            &'a self,
+            _command: &'a MvpCommand<ReportAttemptProgressInput>,
+        ) -> MvpFuture<'a, AttemptProgressView> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
         }
 
         fn init_candidate_artifact<'a>(

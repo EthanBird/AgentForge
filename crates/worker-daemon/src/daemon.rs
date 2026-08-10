@@ -954,6 +954,13 @@ mod tests {
             Box::pin(async move { Ok(response) })
         }
 
+        fn report_attempt_progress<'a>(
+            &'a self,
+            _command: &'a MvpCommand<agentforge_application::ReportAttemptProgressInput>,
+        ) -> MvpFuture<'a, agentforge_application::AttemptProgressView> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+        }
+
         fn init_candidate_artifact<'a>(
             &'a self,
             command: &'a MvpCommand<InitCandidateArtifactInput>,
