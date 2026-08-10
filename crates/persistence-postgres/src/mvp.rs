@@ -624,7 +624,14 @@ impl PostgresMvpControlPlane {
                 progress.events[0].clone(),
             )?;
             let records = [phase_event.record.clone(), progress_event.record.clone()];
-            uow.append_events(&records).await?;
+            // The application command advances the Attempt through two domain
+            // transitions. Each transition has its own aggregate version, so
+            // they are two ordered event batches inside the same transaction,
+            // not one multi-event batch at a shared aggregate version.
+            uow.append_events(std::slice::from_ref(&phase_event.record))
+                .await?;
+            uow.append_events(std::slice::from_ref(&progress_event.record))
+                .await?;
             uow.enqueue_outbox(&[
                 phase_event.outbox(now, command.input.attempt_id.to_string()),
                 progress_event.outbox(now, command.input.attempt_id.to_string()),

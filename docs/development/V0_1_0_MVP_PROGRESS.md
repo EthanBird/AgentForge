@@ -665,7 +665,9 @@ cargo fmt --all -- --check / git diff --check                               PASS
 
 ## MVP-03 / Checkpoint P.4：Progress-first Fixture 与 Artifact CAS
 
-状态：实现完成，Worker 46 项测试与全工作区门禁通过；等待本检查点推送后的 CI。
+状态：实现完成，Worker 46 项测试与全工作区门禁通过。CI #96 的迁移、transactional UoW 步骤
+通过；MVP PostgreSQL 合同发现 Progress adapter 把两个不同 aggregate version 的事件误当成一个
+multi-event batch，修复随当前 checkpoint 重新验证。
 
 当前完成：
 
@@ -691,6 +693,10 @@ cargo fmt --all -- --check / git diff --check                               PASS
 - 修复后的 0001..0006 已在 PGlite 实际执行，并成功插入一条满足 Project/Package/Attempt/Lease/fencing/
   holder/expiry/version/semantic-sequence 全绑定的 `attempt_progress` 行。它验证迁移与 trigger 正向执行，但
   真实 PostgreSQL 17 的最终证据仍须由本检查点 CI 提供。
+- CI #96 / run `31360691668` 进一步证明迁移与通用 UoW 已通过；失败来自 Progress service command 连续执行
+  phase transition 与 `ReportProgress` 时，把两个各自拥有 aggregate version 的事件一次传给“同版本事件
+  batch”接口。adapter 现按顺序执行两次 `append_events`，仍处于同一 Serializable transaction，receipt、
+  outbox 与两条事件继续全有或全无。
 
 定点证据：
 
