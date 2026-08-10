@@ -348,7 +348,9 @@ init/chunk/complete 与原子 `RecordCandidate + VerificationRun::Queued` 接入
 
 ## MVP-03 / Checkpoint L：Candidate Artifact 应用与 PostgreSQL 命令纵切
 
-状态：实现与本地全工作区门禁通过；推送后等待 PostgreSQL 17 合同。
+状态：实现与本地全工作区门禁通过；CI #76 的 Rust job 全绿，但 PostgreSQL migration fixture 使用两次
+volatile `clock_timestamp()` 构造本应相等的 `created_at/updated_at`，在真实 PostgreSQL 微秒级分离后被
+正确拒绝。Checkpoint M 已改为单一 transaction timestamp，随下一次推送重新验证完整 PostgreSQL 合同。
 
 当前完成：
 
@@ -385,3 +387,41 @@ git diff --check                                                       PASS
 明确边界：本检查点只完成 application + PostgreSQL 的作者侧 Artifact 命令面；HTTP wire、Worker durable
 upload intent、`RecordCandidate + VerificationRun::Queued` 仍未接通，不能据此宣称 Candidate handoff 或
 独立验收闭环已经完成。
+
+## MVP-03 / Checkpoint M：Candidate Artifact HTTP 与 Worker adapter
+
+状态：实现完成，application/control-plane/worker 定点门禁通过；等待本检查点推送后的全工作区与
+PostgreSQL 17 CI。
+
+当前完成：
+
+- application 的 chunk DTO 统一使用带标准 padding 的 canonical Base64；严格拒绝 byte array、非规范
+  Base64、空值与解码后超过 1 MiB 的内容，HTTP 与 receipt request digest 不再存在二进制表示漂移；
+- 控制面新增 Artifact Init、Chunk、Complete 三条 Project-scoped 路由；在授权和 command dispatch 前
+  对 Project/Attempt/Artifact/chunk index 做 path/body 等值检查，并强制相应 Attempt/Artifact `If-Match`；
+- Chunk 保持设计文档规定的 `PUT + 204`；Worker 在空响应后只从已持久化请求与不变的 Artifact version
+  构造 receipt，不信任额外响应事实；Init 为 `201`，Complete 返回完整 typed Artifact view；
+- `LoopbackHttpControlPlane` 支持 PUT、空 body 成功响应和三条 Artifact 命令，并继续限制 loopback peer、
+  总交换超时、header/body 上限、JSON content type 与远端错误 code/status/retryable 三元组；
+- HTTP wire 将 CAS 错误统一为规范的 `AF_VERSION_STALE/412`，新增 Artifact 路径会产生的
+  `AF_ARGUMENT_INVALID`、`AF_PACKAGE_HASH_MISMATCH`、`AF_EVIDENCE_INVALID`、
+  `AF_CANDIDATE_ARTIFACT_NOT_COMPLETE` allowlist；后者与 Package not claimable 的 retryable 位与服务端
+  领域错误保持一致；
+- CI #76 暴露的 Candidate migration 正向 fixture 时间不稳定已修：同一初始 Artifact 的
+  `created_at/updated_at` 改用相同 transaction timestamp，避免测试数据偶然违反真实数据库不变量。
+
+本地证据：
+
+```text
+cargo fmt --all -- --check                                             PASS
+bash tests/contract/workspace_layout.sh                                PASS
+cargo build --workspace --locked --all-targets --offline              PASS
+cargo test --workspace --locked --offline                             PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                             PASS
+node --check crates/control-plane/assets/app.js                        PASS
+git diff --check                                                       PASS
+```
+
+当前边界：Worker 现在能按严格 wire 调用三条 Artifact API，但尚未把每个 init/chunk/complete intent 写入
+SQLite Journal，也未由 fixture driver 触发上传；因此本检查点不宣称跨重启 ACK-loss 恢复已经闭环。

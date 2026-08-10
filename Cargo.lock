@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "agentforge-domain",
  "agentforge-protocol",
+ "base64",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",

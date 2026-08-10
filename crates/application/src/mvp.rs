@@ -13,6 +13,7 @@ use agentforge_domain::{
     ProjectId, ProtocolKey, ServerInstant, Sha256Digest, lease::LeaseState,
     work_package::WorkPackageState,
 };
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -54,8 +55,12 @@ impl MvpError {
 
     #[must_use]
     pub const fn retryable(&self) -> bool {
-        matches!(self, Self::Port(error) if error.retryable())
-            || matches!(self, Self::Remote(error) if error.retryable())
+        match self {
+            Self::Domain(error) => error.retryable(),
+            Self::Port(error) => error.retryable(),
+            Self::Remote(error) => error.retryable(),
+            Self::IdempotencyResultExpired | Self::IdempotencyResultLegacy => false,
+        }
     }
 }
 
@@ -84,6 +89,8 @@ pub enum MvpRemoteError {
     Conflict,
     #[error("remote aggregate version is stale")]
     StaleVersion,
+    #[error("remote command argument is invalid")]
+    ArgumentInvalid,
     #[error("remote Lease generation is stale")]
     LeaseStale,
     #[error("remote idempotency key was reused")]
@@ -92,6 +99,12 @@ pub enum MvpRemoteError {
     TransitionInvalid,
     #[error("remote Package is not claimable")]
     PackageNotClaimable,
+    #[error("remote Package hash does not match")]
+    PackageHashMismatch,
+    #[error("remote evidence is invalid")]
+    EvidenceInvalid,
+    #[error("remote Candidate Artifact is not complete")]
+    CandidateArtifactNotComplete,
     #[error("remote dependency is unavailable")]
     Unavailable,
     #[error("remote storage integrity check failed")]
@@ -117,11 +130,15 @@ impl MvpRemoteError {
             Self::LeaseExpired => "AF_LEASE_EXPIRED",
             Self::PolicyDenied => "AF_POLICY_DENIED",
             Self::Conflict => "AF_CONFLICT",
-            Self::StaleVersion => "AF_STALE_VERSION",
+            Self::StaleVersion => "AF_VERSION_STALE",
+            Self::ArgumentInvalid => "AF_ARGUMENT_INVALID",
             Self::LeaseStale => "AF_LEASE_STALE",
             Self::IdempotencyKeyReused => "AF_IDEMPOTENCY_KEY_REUSED",
             Self::TransitionInvalid => "AF_TRANSITION_INVALID",
             Self::PackageNotClaimable => "AF_PACKAGE_NOT_CLAIMABLE",
+            Self::PackageHashMismatch => "AF_PACKAGE_HASH_MISMATCH",
+            Self::EvidenceInvalid => "AF_EVIDENCE_INVALID",
+            Self::CandidateArtifactNotComplete => "AF_CANDIDATE_ARTIFACT_NOT_COMPLETE",
             Self::Unavailable => "AF_UNAVAILABLE",
             Self::StorageIntegrity => "AF_STORAGE_INTEGRITY",
             Self::Serialization => "AF_SERIALIZATION",
@@ -141,11 +158,15 @@ impl MvpRemoteError {
             "AF_LEASE_EXPIRED" => Self::LeaseExpired,
             "AF_POLICY_DENIED" => Self::PolicyDenied,
             "AF_CONFLICT" => Self::Conflict,
-            "AF_STALE_VERSION" => Self::StaleVersion,
+            "AF_VERSION_STALE" => Self::StaleVersion,
+            "AF_ARGUMENT_INVALID" => Self::ArgumentInvalid,
             "AF_LEASE_STALE" => Self::LeaseStale,
             "AF_IDEMPOTENCY_KEY_REUSED" => Self::IdempotencyKeyReused,
             "AF_TRANSITION_INVALID" => Self::TransitionInvalid,
             "AF_PACKAGE_NOT_CLAIMABLE" => Self::PackageNotClaimable,
+            "AF_PACKAGE_HASH_MISMATCH" => Self::PackageHashMismatch,
+            "AF_EVIDENCE_INVALID" => Self::EvidenceInvalid,
+            "AF_CANDIDATE_ARTIFACT_NOT_COMPLETE" => Self::CandidateArtifactNotComplete,
             "AF_UNAVAILABLE" => Self::Unavailable,
             "AF_STORAGE_INTEGRITY" => Self::StorageIntegrity,
             "AF_SERIALIZATION" => Self::Serialization,
@@ -157,7 +178,13 @@ impl MvpRemoteError {
 
     #[must_use]
     pub const fn retryable(self) -> bool {
-        matches!(self, Self::CommandServiceUnavailable | Self::Unavailable)
+        matches!(
+            self,
+            Self::CommandServiceUnavailable
+                | Self::PackageNotClaimable
+                | Self::CandidateArtifactNotComplete
+                | Self::Unavailable
+        )
     }
 }
 
@@ -354,7 +381,50 @@ pub struct UploadCandidateArtifactChunkInput {
     pub fencing_token: FencingToken,
     pub chunk_index: u32,
     pub digest: Sha256Digest,
+    #[serde(with = "canonical_base64_bytes")]
     pub content: Vec<u8>,
+}
+
+mod canonical_base64_bytes {
+    use super::{BASE64_STANDARD, Deserialize, Serialize};
+    use base64::Engine as _;
+    use serde::{Deserializer, Serializer, de::Error as _, ser::Error as _};
+
+    const MAX_CHUNK_BYTES: usize = 1_048_576;
+    const MAX_ENCODED_BYTES: usize = MAX_CHUNK_BYTES.div_ceil(3) * 4;
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes.is_empty() || bytes.len() > MAX_CHUNK_BYTES {
+            return Err(S::Error::custom(
+                "Candidate Artifact chunk bytes are out of bounds",
+            ));
+        }
+        BASE64_STANDARD.encode(bytes).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.is_empty() || encoded.len() > MAX_ENCODED_BYTES {
+            return Err(D::Error::custom(
+                "Candidate Artifact chunk Base64 is out of bounds",
+            ));
+        }
+        let bytes = BASE64_STANDARD
+            .decode(&encoded)
+            .map_err(|_| D::Error::custom("Candidate Artifact chunk Base64 is invalid"))?;
+        if bytes.len() > MAX_CHUNK_BYTES || BASE64_STANDARD.encode(&bytes) != encoded {
+            return Err(D::Error::custom(
+                "Candidate Artifact chunk Base64 is not canonical",
+            ));
+        }
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -527,5 +597,39 @@ mod tests {
             "AF_IDEMPOTENCY_RESULT_EXPIRED"
         );
         assert!(!MvpError::Port(PortError::Integrity).retryable());
+    }
+
+    #[test]
+    fn candidate_chunk_wire_uses_bounded_canonical_base64() {
+        let input = UploadCandidateArtifactChunkInput {
+            project_id: id(1),
+            artifact_id: id(2),
+            lease_id: id(3),
+            node_id: id(4),
+            fencing_token: FencingToken::new(1).expect("fencing token"),
+            chunk_index: 0,
+            digest: Sha256Digest::of_bytes([0_u8, 1, 2, 3]),
+            content: vec![0, 1, 2, 3],
+        };
+        let value = serde_json::to_value(&input).expect("serialize chunk");
+        assert_eq!(value["content"], "AAECAw==");
+        assert_eq!(
+            serde_json::from_value::<UploadCandidateArtifactChunkInput>(value)
+                .expect("decode canonical chunk"),
+            input
+        );
+
+        let mut non_canonical = serde_json::to_value(&input).expect("serialize chunk");
+        non_canonical["content"] = serde_json::json!("AAECAw");
+        assert!(
+            serde_json::from_value::<UploadCandidateArtifactChunkInput>(non_canonical).is_err()
+        );
+        let mut byte_array = serde_json::to_value(&input).expect("serialize chunk");
+        byte_array["content"] = serde_json::json!([0, 1, 2, 3]);
+        assert!(serde_json::from_value::<UploadCandidateArtifactChunkInput>(byte_array).is_err());
+
+        let mut empty = input;
+        empty.content.clear();
+        assert!(serde_json::to_value(empty).is_err());
     }
 }

@@ -3,8 +3,10 @@
 use std::{net::SocketAddr, time::Duration};
 
 use agentforge_application::{
-    ClaimPackageInput, ClaimedWork, LeaseView, ListOffersQuery, MvpCommand, MvpError, MvpFuture,
-    MvpRemoteError, MvpResult, OfferView, PortError, ReleaseLeaseInput, RenewLeaseInput,
+    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
+    CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, ListOffersQuery,
+    MvpCommand, MvpError, MvpFuture, MvpRemoteError, MvpResult, OfferView, PortError,
+    ReleaseLeaseInput, RenewLeaseInput, UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{LeaseId, ProjectId};
 use serde::{Deserialize, de::DeserializeOwned};
@@ -44,6 +46,48 @@ impl LoopbackHttpControlPlane {
         body: Option<Vec<u8>>,
         command: Option<&agentforge_application::MvpCommandContext>,
     ) -> MvpResult<T> {
+        let (status, content_type, response_body) =
+            self.exchange(method, path, body, command).await?;
+        if !content_type.as_deref().is_some_and(is_json_content_type) {
+            return Err(MvpError::Port(PortError::Serialization));
+        }
+        if status == expected_status {
+            decode_json(&response_body)
+        } else {
+            decode_remote_error(status, &response_body)
+        }
+    }
+
+    async fn send_empty(
+        &self,
+        method: &'static str,
+        path: String,
+        expected_status: u16,
+        body: Option<Vec<u8>>,
+        command: Option<&agentforge_application::MvpCommandContext>,
+    ) -> MvpResult<()> {
+        let (status, content_type, response_body) =
+            self.exchange(method, path, body, command).await?;
+        if status == expected_status {
+            if response_body.is_empty() && content_type.as_deref().is_none_or(is_json_content_type)
+            {
+                return Ok(());
+            }
+            return Err(MvpError::Port(PortError::Serialization));
+        }
+        if !content_type.as_deref().is_some_and(is_json_content_type) {
+            return Err(MvpError::Port(PortError::Serialization));
+        }
+        decode_remote_error(status, &response_body)
+    }
+
+    async fn exchange(
+        &self,
+        method: &'static str,
+        path: String,
+        body: Option<Vec<u8>>,
+        command: Option<&agentforge_application::MvpCommandContext>,
+    ) -> MvpResult<(u16, Option<String>, Vec<u8>)> {
         let request = self.build_request(method, &path, body.as_deref(), command)?;
         let operation = async {
             let mut stream = TcpStream::connect(self.address)
@@ -63,16 +107,7 @@ impl LoopbackHttpControlPlane {
                 .flush()
                 .await
                 .map_err(|_| MvpError::Port(PortError::Unavailable))?;
-            let (status, content_type, response_body) =
-                read_response(&mut stream, self.max_response_bytes).await?;
-            if !is_json_content_type(&content_type) {
-                return Err(MvpError::Port(PortError::Serialization));
-            }
-            if status == expected_status {
-                decode_json(&response_body)
-            } else {
-                decode_remote_error(status, &response_body)
-            }
+            read_response(&mut stream, self.max_response_bytes).await
         };
         tokio::time::timeout(self.timeout, operation)
             .await
@@ -86,7 +121,7 @@ impl LoopbackHttpControlPlane {
         body: Option<&[u8]>,
         command: Option<&agentforge_application::MvpCommandContext>,
     ) -> MvpResult<Vec<u8>> {
-        if !matches!(method, "GET" | "POST")
+        if !matches!(method, "GET" | "POST" | "PUT")
             || !path.starts_with('/')
             || path.contains('\r')
             || path.contains('\n')
@@ -156,6 +191,74 @@ impl WorkerControlPlane for LoopbackHttpControlPlane {
                     command.input.project_id, command.input.package_id
                 ),
                 201,
+                Some(Self::command_body(command)?),
+                Some(&command.context),
+            )
+            .await
+        })
+    }
+
+    fn init_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<InitCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView> {
+        Box::pin(async move {
+            self.send(
+                "POST",
+                format!(
+                    "/api/v1/projects/{}/attempts/{}/candidate-artifacts",
+                    command.input.project_id, command.input.attempt_id
+                ),
+                201,
+                Some(Self::command_body(command)?),
+                Some(&command.context),
+            )
+            .await
+        })
+    }
+
+    fn upload_candidate_artifact_chunk<'a>(
+        &'a self,
+        command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+    ) -> MvpFuture<'a, CandidateArtifactChunkReceipt> {
+        Box::pin(async move {
+            self.send_empty(
+                "PUT",
+                format!(
+                    "/api/v1/projects/{}/candidate-artifacts/{}/chunks/{}",
+                    command.input.project_id, command.input.artifact_id, command.input.chunk_index
+                ),
+                204,
+                Some(Self::command_body(command)?),
+                Some(&command.context),
+            )
+            .await?;
+            Ok(CandidateArtifactChunkReceipt {
+                artifact_id: command.input.artifact_id,
+                chunk_index: command.input.chunk_index,
+                digest: command.input.digest,
+                size_bytes: u32::try_from(command.input.content.len())
+                    .map_err(|_| MvpError::Port(PortError::Serialization))?,
+                artifact_version: command
+                    .context
+                    .expected_version
+                    .ok_or(MvpError::Port(PortError::Serialization))?,
+            })
+        })
+    }
+
+    fn complete_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView> {
+        Box::pin(async move {
+            self.send(
+                "POST",
+                format!(
+                    "/api/v1/projects/{}/candidate-artifacts/{}/complete",
+                    command.input.project_id, command.input.artifact_id
+                ),
+                200,
                 Some(Self::command_body(command)?),
                 Some(&command.context),
             )
@@ -252,15 +355,20 @@ const fn remote_status(error: MvpRemoteError) -> u16 {
         MvpRemoteError::ProjectAccessDenied | MvpRemoteError::PolicyDenied => 403,
         MvpRemoteError::NotFound => 404,
         MvpRemoteError::LeaseExpired => 410,
+        MvpRemoteError::StaleVersion => 412,
         MvpRemoteError::Conflict
-        | MvpRemoteError::StaleVersion
         | MvpRemoteError::LeaseStale
         | MvpRemoteError::IdempotencyKeyReused
         | MvpRemoteError::TransitionInvalid
-        | MvpRemoteError::PackageNotClaimable => 409,
+        | MvpRemoteError::PackageNotClaimable
+        | MvpRemoteError::CandidateArtifactNotComplete
+        | MvpRemoteError::IdempotencyResultExpired
+        | MvpRemoteError::IdempotencyResultLegacy => 409,
+        MvpRemoteError::ArgumentInvalid
+        | MvpRemoteError::PackageHashMismatch
+        | MvpRemoteError::EvidenceInvalid => 422,
         MvpRemoteError::CommandServiceUnavailable | MvpRemoteError::Unavailable => 503,
         MvpRemoteError::StorageIntegrity | MvpRemoteError::Serialization => 500,
-        MvpRemoteError::IdempotencyResultExpired | MvpRemoteError::IdempotencyResultLegacy => 422,
     }
 }
 
@@ -281,7 +389,7 @@ fn is_json_content_type(value: &str) -> bool {
 async fn read_response(
     stream: &mut TcpStream,
     max_body_bytes: usize,
-) -> MvpResult<(u16, String, Vec<u8>)> {
+) -> MvpResult<(u16, Option<String>, Vec<u8>)> {
     let mut received = Vec::with_capacity(8 * 1024);
     let mut chunk = [0_u8; 8 * 1024];
     let header_end = loop {
@@ -346,8 +454,11 @@ async fn read_response(
             );
         }
     }
-    let content_length = content_length.ok_or(MvpError::Port(PortError::Serialization))?;
-    let content_type = content_type.ok_or(MvpError::Port(PortError::Serialization))?;
+    let content_length = match (content_length, status) {
+        (Some(content_length), _) => content_length,
+        (None, 204) => 0,
+        (None, _) => return Err(MvpError::Port(PortError::Serialization)),
+    };
     let buffered_body = received.len() - header_end;
     if buffered_body > content_length {
         return Err(MvpError::Port(PortError::Serialization));
@@ -373,15 +484,16 @@ mod tests {
 
     use agentforge_application::MvpCommandContext;
     use agentforge_domain::{
-        ActorId, AggregateVersion, CommandId, CorrelationId, ExecutorId, FencingToken, GitObjectId,
-        IdempotencyKey, NodeId, PackageRevision, PackageRevisionId, ProtocolKey, ServerInstant,
-        Sha256Digest, work_package::WorkPackageState,
+        ActorId, AggregateVersion, AttemptId, CandidateArtifactId, CandidateArtifactState,
+        CommandId, CorrelationId, ExecutorId, FencingToken, GitObjectId, IdempotencyKey, NodeId,
+        PackageRevision, PackageRevisionId, ProtocolKey, ServerInstant, Sha256Digest,
+        work_package::WorkPackageState,
     };
     use axum::{
         Json, Router,
         extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},
-        routing::{get, post},
+        routing::{get, post, put},
     };
     use serde::Deserialize;
     use time::macros::datetime;
@@ -500,6 +612,84 @@ mod tests {
         (StatusCode::CREATED, Json(claimed()))
     }
 
+    fn artifact_view(state: CandidateArtifactState) -> CandidateArtifactView {
+        let content = b"candidate-bundle";
+        CandidateArtifactView {
+            project_id: id(1),
+            artifact_id: id(20),
+            candidate_id: id(21),
+            attempt_id: id(4),
+            package_id: id(2),
+            revision_id: id(3),
+            lease_id: id(5),
+            fencing_token: FencingToken::new(1).expect("generation"),
+            candidate_commit: GitObjectId::new("2".repeat(40)).expect("candidate"),
+            tree_hash: GitObjectId::new("3".repeat(40)).expect("tree"),
+            state,
+            expected_bundle_digest: Sha256Digest::of_bytes(content),
+            expected_bundle_size_bytes: u64::try_from(content.len()).expect("bundle size"),
+            chunk_digests: vec![Sha256Digest::of_bytes(content)],
+            bundle: None,
+            created_at: at(0),
+            expires_at: at(60),
+            updated_at: at(if state == CandidateArtifactState::Complete {
+                2
+            } else {
+                0
+            }),
+            version: AggregateVersion::new(if state == CandidateArtifactState::Complete {
+                3
+            } else {
+                1
+            }),
+        }
+    }
+
+    async fn artifact_init_handler(
+        Path((project, attempt)): Path<(String, String)>,
+        headers: HeaderMap,
+        Json(input): Json<InitCandidateArtifactInput>,
+    ) -> (StatusCode, Json<CandidateArtifactView>) {
+        assert_eq!(project, id::<ProjectId>(1).to_string());
+        assert_eq!(attempt, id::<AttemptId>(4).to_string());
+        assert_eq!(input.project_id, id(1));
+        assert_eq!(input.attempt_id, id(4));
+        assert_eq!(headers["idempotency-key"], "worker-artifact-init");
+        assert_eq!(headers["if-match"], "\"2\"");
+        (
+            StatusCode::CREATED,
+            Json(artifact_view(CandidateArtifactState::Uploading)),
+        )
+    }
+
+    async fn artifact_chunk_handler(
+        Path((project, artifact, chunk_index)): Path<(String, String, String)>,
+        headers: HeaderMap,
+        Json(input): Json<UploadCandidateArtifactChunkInput>,
+    ) -> StatusCode {
+        assert_eq!(project, id::<ProjectId>(1).to_string());
+        assert_eq!(artifact, id::<CandidateArtifactId>(20).to_string());
+        assert_eq!(chunk_index, "0");
+        assert_eq!(input.content, b"candidate-bundle");
+        assert_eq!(input.digest, Sha256Digest::of_bytes(&input.content));
+        assert_eq!(headers["idempotency-key"], "worker-artifact-chunk-0");
+        assert_eq!(headers["if-match"], "\"1\"");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn artifact_complete_handler(
+        Path((project, artifact)): Path<(String, String)>,
+        headers: HeaderMap,
+        Json(input): Json<CompleteCandidateArtifactInput>,
+    ) -> Json<CandidateArtifactView> {
+        assert_eq!(project, id::<ProjectId>(1).to_string());
+        assert_eq!(artifact, id::<CandidateArtifactId>(20).to_string());
+        assert_eq!(input.artifact_id, id(20));
+        assert_eq!(headers["idempotency-key"], "worker-artifact-complete");
+        assert_eq!(headers["if-match"], "\"1\"");
+        Json(artifact_view(CandidateArtifactState::Complete))
+    }
+
     async fn lease_error_handler() -> (StatusCode, Json<serde_json::Value>) {
         (
             StatusCode::CONFLICT,
@@ -541,6 +731,18 @@ mod tests {
             .route(
                 "/api/v1/projects/{project}/packages/{package}/claim",
                 post(claim_handler),
+            )
+            .route(
+                "/api/v1/projects/{project}/attempts/{attempt}/candidate-artifacts",
+                post(artifact_init_handler),
+            )
+            .route(
+                "/api/v1/projects/{project}/candidate-artifacts/{artifact}/chunks/{chunk_index}",
+                put(artifact_chunk_handler),
+            )
+            .route(
+                "/api/v1/projects/{project}/candidate-artifacts/{artifact}/complete",
+                post(artifact_complete_handler),
             )
             .with_state(state.clone());
         let (address, server) = spawn_server(router).await;
@@ -595,6 +797,103 @@ mod tests {
         assert_eq!(
             headers["x-agentforge-command-id"],
             command.context.command_id.to_string()
+        );
+
+        let bundle = b"candidate-bundle".to_vec();
+        let init = MvpCommand {
+            context: MvpCommandContext {
+                command_id: id(12),
+                actor_id: id(6),
+                idempotency_key: IdempotencyKey::new("worker-artifact-init").expect("key"),
+                correlation_id: id(13),
+                causation_id: None,
+                expected_version: Some(AggregateVersion::new(2)),
+            },
+            input: InitCandidateArtifactInput {
+                project_id: id(1),
+                attempt_id: id(4),
+                lease_id: id(5),
+                node_id: id(8),
+                fencing_token: FencingToken::new(1).expect("generation"),
+                package_hash: execution().package_hash,
+                base_commit: execution().base_commit,
+                candidate_commit: GitObjectId::new("2".repeat(40)).expect("candidate"),
+                tree_hash: GitObjectId::new("3".repeat(40)).expect("tree"),
+                author_evidence_digest: Sha256Digest::of_bytes("evidence"),
+                expected_bundle_digest: Sha256Digest::of_bytes(&bundle),
+                expected_bundle_size_bytes: u64::try_from(bundle.len()).expect("bundle size"),
+                chunk_digests: vec![Sha256Digest::of_bytes(&bundle)],
+                upload_ttl_seconds: 60,
+            },
+        };
+        let artifact = adapter
+            .init_candidate_artifact(&init)
+            .await
+            .expect("artifact init");
+        assert_eq!(artifact, artifact_view(CandidateArtifactState::Uploading));
+
+        let chunk = MvpCommand {
+            context: MvpCommandContext {
+                command_id: id(14),
+                actor_id: id(6),
+                idempotency_key: IdempotencyKey::new("worker-artifact-chunk-0").expect("key"),
+                correlation_id: id(13),
+                causation_id: None,
+                expected_version: Some(AggregateVersion::new(1)),
+            },
+            input: UploadCandidateArtifactChunkInput {
+                project_id: id(1),
+                artifact_id: artifact.artifact_id,
+                lease_id: id(5),
+                node_id: id(8),
+                fencing_token: FencingToken::new(1).expect("generation"),
+                chunk_index: 0,
+                digest: Sha256Digest::of_bytes(&bundle),
+                content: bundle,
+            },
+        };
+        assert_eq!(
+            adapter
+                .upload_candidate_artifact_chunk(&chunk)
+                .await
+                .expect("artifact chunk"),
+            CandidateArtifactChunkReceipt {
+                artifact_id: id(20),
+                chunk_index: 0,
+                digest: chunk.input.digest,
+                size_bytes: u32::try_from(chunk.input.content.len()).expect("chunk size"),
+                artifact_version: AggregateVersion::new(1),
+            }
+        );
+
+        let complete = MvpCommand {
+            context: MvpCommandContext {
+                command_id: id(15),
+                actor_id: id(6),
+                idempotency_key: IdempotencyKey::new("worker-artifact-complete").expect("key"),
+                correlation_id: id(13),
+                causation_id: None,
+                expected_version: Some(AggregateVersion::new(1)),
+            },
+            input: CompleteCandidateArtifactInput {
+                project_id: id(1),
+                artifact_id: id(20),
+                lease_id: id(5),
+                node_id: id(8),
+                fencing_token: FencingToken::new(1).expect("generation"),
+                bundle_protocol_key: ProtocolKey::new("candidate-bundle").expect("key"),
+                bundle_uri: format!(
+                    "artifact://candidate-artifacts/{}",
+                    id::<CandidateArtifactId>(20)
+                ),
+            },
+        };
+        assert_eq!(
+            adapter
+                .complete_candidate_artifact(&complete)
+                .await
+                .expect("artifact complete"),
+            artifact_view(CandidateArtifactState::Complete)
         );
         server.abort();
     }
@@ -692,10 +991,14 @@ mod tests {
             MvpRemoteError::PolicyDenied,
             MvpRemoteError::Conflict,
             MvpRemoteError::StaleVersion,
+            MvpRemoteError::ArgumentInvalid,
             MvpRemoteError::LeaseStale,
             MvpRemoteError::IdempotencyKeyReused,
             MvpRemoteError::TransitionInvalid,
             MvpRemoteError::PackageNotClaimable,
+            MvpRemoteError::PackageHashMismatch,
+            MvpRemoteError::EvidenceInvalid,
+            MvpRemoteError::CandidateArtifactNotComplete,
             MvpRemoteError::Unavailable,
             MvpRemoteError::StorageIntegrity,
             MvpRemoteError::Serialization,
@@ -707,6 +1010,8 @@ mod tests {
             assert!((400..=599).contains(&remote_status(error)));
         }
         assert!(MvpRemoteError::CommandServiceUnavailable.retryable());
+        assert!(MvpRemoteError::PackageNotClaimable.retryable());
+        assert!(MvpRemoteError::CandidateArtifactNotComplete.retryable());
         assert!(!MvpRemoteError::LeaseStale.retryable());
         assert!(MvpRemoteError::parse("AF_FUTURE_SERVER_CODE").is_none());
     }

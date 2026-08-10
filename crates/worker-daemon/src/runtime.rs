@@ -562,7 +562,7 @@ impl WorkerError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidArgument(_) => "AF_WORKER_ARGUMENT_INVALID",
-            Self::StaleVersion => "AF_STALE_VERSION",
+            Self::StaleVersion => "AF_VERSION_STALE",
             Self::InvalidTransition => "AF_TRANSITION_INVALID",
             Self::HistoryEmpty | Self::HistoryMalformed => "AF_WORKER_HISTORY_INVALID",
             Self::WakeMismatch => "AF_WAKE_CONDITION_UNMET",

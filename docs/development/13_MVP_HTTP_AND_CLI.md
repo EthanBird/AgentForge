@@ -28,7 +28,8 @@ cargo run --locked -p agentforge-control-plane --bin agentforge-control-plane
 所有写命令必须带：
 
 - `Idempotency-Key`：同一 actor 内的稳定业务键；
-- `If-Match: "<version>"`：Claim、Renew、Release 必须提供，创建 Project/Package 禁止提供；
+- `If-Match: "<version>"`：Claim、Renew、Release 以及 Candidate Artifact 的 Init、Chunk、Complete
+  必须提供，创建 Project/Package 禁止提供；
 - `Content-Type: application/json`；
 - 可选 `X-AgentForge-Command-Id`、`X-AgentForge-Correlation-Id`、
   `X-AgentForge-Causation-Id`；缺省 ID 由服务器生成 UUIDv7。
@@ -44,6 +45,9 @@ HTTP actor 从已经验证的 request actor/Project grant 派生，客户端不�
 | `GET` | `/api/v1/projects/{project_id}/leases/{lease_id}` | 读取 Lease |
 | `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/renew` | fencing Renew |
 | `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/release` | fencing Release |
+| `POST` | `/api/v1/projects/{project_id}/attempts/{attempt_id}/candidate-artifacts` | 预留 Candidate 与 Artifact，返回 `201` |
+| `PUT` | `/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/chunks/{chunk_index}` | 上传一个已声明 chunk，返回 `204` |
+| `POST` | `/api/v1/projects/{project_id}/candidate-artifacts/{artifact_id}/complete` | 重组并复算 Bundle，返回 COMPLETE Artifact |
 
 Claim 成功响应除 Attempt/Lease/CAS 版本外，还包含 `granted_at`、`expires_at`、`max_expires_at` 与
 `execution`。`execution` 固定 revision、JCS package hash、base commit、Git object format、canonical
@@ -60,6 +64,25 @@ Journal 前再次验证。这个内联快照只用于受控 MVP（请求/响应�
   "retryable": false
 }
 ```
+
+### 2.1 Candidate Artifact wire
+
+Init body 使用 `InitCandidateArtifactInput` 的严格 JSON 结构，并同时绑定 Attempt、Lease、node、fencing、
+Package hash、base/candidate/tree、作者证据摘要、Bundle 总摘要/大小与有序 chunk 摘要。路径中的 Project 和
+Attempt 必须与 body 相同；`If-Match` 是当前 Attempt version。
+
+Chunk body 使用 `UploadCandidateArtifactChunkInput`，其中 `content` 是带标准 padding 的 canonical RFC 4648
+Base64 字符串，不接受 JSON byte array、无 padding 变体、空内容或解码后超过 1 MiB 的内容。路径中的
+Project、Artifact 和 chunk index 必须与 body 相同；服务端复算内容 SHA-256，成功返回空 body 的 `204`。
+Worker 可从已持久化请求与 `If-Match` 构造本地 chunk receipt，因为写 chunk 不推进 Artifact version。
+
+Complete 的 `If-Match` 是当前 Artifact version。服务端按声明顺序读取全部 chunk，逐块及整体复算摘要和
+大小，再原子执行 `UPLOADING -> ASSEMBLING -> COMPLETE`；缺块返回
+`AF_CANDIDATE_ARTIFACT_NOT_COMPLETE/409`，错误修复后可在 Lease 仍有效时用新命令补齐。所有三类命令
+均先查询 actor-scoped idempotency receipt；相同 key/hash 可在 ACK 丢失后回放，不因 Lease 随后关闭而
+重新执行。
+
+CAS 过期固定返回 `AF_VERSION_STALE/412`，不得使用旧拼写 `AF_STALE_VERSION`。
 
 ## 3. 管理 CLI
 

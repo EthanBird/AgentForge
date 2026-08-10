@@ -552,6 +552,27 @@ mod tests {
             Box::pin(async move { Ok(response) })
         }
 
+        fn init_candidate_artifact<'a>(
+            &'a self,
+            _command: &'a MvpCommand<agentforge_application::InitCandidateArtifactInput>,
+        ) -> MvpFuture<'a, agentforge_application::CandidateArtifactView> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+        }
+
+        fn upload_candidate_artifact_chunk<'a>(
+            &'a self,
+            _command: &'a MvpCommand<agentforge_application::UploadCandidateArtifactChunkInput>,
+        ) -> MvpFuture<'a, agentforge_application::CandidateArtifactChunkReceipt> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+        }
+
+        fn complete_candidate_artifact<'a>(
+            &'a self,
+            _command: &'a MvpCommand<agentforge_application::CompleteCandidateArtifactInput>,
+        ) -> MvpFuture<'a, agentforge_application::CandidateArtifactView> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+        }
+
         fn get_lease(&self, project_id: ProjectId, lease_id: LeaseId) -> MvpFuture<'_, LeaseView> {
             let response = self
                 .leases

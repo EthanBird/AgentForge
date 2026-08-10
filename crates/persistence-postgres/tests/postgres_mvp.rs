@@ -180,7 +180,7 @@ async fn exercise_mvp(
                     matches!(
                         error.code(),
                         "AF_CONFLICT"
-                            | "AF_STALE_VERSION"
+                            | "AF_VERSION_STALE"
                             | "AF_TRANSITION_INVALID"
                             | "AF_PACKAGE_NOT_CLAIMABLE"
                     ),

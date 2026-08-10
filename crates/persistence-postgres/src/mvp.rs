@@ -1197,7 +1197,7 @@ impl PostgresMvpControlPlane {
                         error.code(),
                         "AF_CONFLICT"
                             | "AF_NOT_FOUND"
-                            | "AF_STALE_VERSION"
+                            | "AF_VERSION_STALE"
                             | "AF_TRANSITION_INVALID"
                     ) =>
                 {

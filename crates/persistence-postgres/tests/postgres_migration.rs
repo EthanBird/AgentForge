@@ -402,9 +402,9 @@ async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
                decode(repeat('11',32),'hex'), '{lease}', 1, repeat('a',40), repeat('b',40),
                repeat('c',40), decode(repeat('22',32),'hex'), sha256({bundle_bytes}),
                octet_length({bundle_bytes}), ARRAY[sha256({bundle_bytes})], 'UPLOADING', 1, 1,
-               clock_timestamp() - interval '50 seconds',
+               transaction_timestamp() - interval '50 seconds',
                clock_timestamp() + interval '10 minutes',
-               clock_timestamp() - interval '50 seconds');
+               transaction_timestamp() - interval '50 seconds');
             INSERT INTO candidate_artifact_chunks
               (artifact_id, chunk_index, digest, size_bytes, content, received_at)
             VALUES

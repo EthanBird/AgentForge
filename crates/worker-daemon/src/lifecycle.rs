@@ -1,9 +1,11 @@
 //! Worker-side Claim handoff and startup Lease reconciliation.
 
 use agentforge_application::{
-    ClaimPackageInput, ClaimedWork, LeaseView, ListOffersQuery, MvpCommand, MvpCommandContext,
-    MvpControlPlane, MvpError, MvpFuture, OfferView, PackageExecutionSnapshot, ReleaseLeaseInput,
-    RenewLeaseInput,
+    CandidateArtifactChunkReceipt, CandidateArtifactView, ClaimPackageInput, ClaimedWork,
+    CompleteCandidateArtifactInput, InitCandidateArtifactInput, LeaseView, ListOffersQuery,
+    MvpCommand, MvpCommandContext, MvpControlPlane, MvpError, MvpFuture, OfferView,
+    PackageExecutionSnapshot, ReleaseLeaseInput, RenewLeaseInput,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, NodeId, ProjectId,
@@ -35,6 +37,21 @@ pub trait WorkerControlPlane: Send + Sync {
         command: &'a MvpCommand<ClaimPackageInput>,
     ) -> MvpFuture<'a, ClaimedWork>;
 
+    fn init_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<InitCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView>;
+
+    fn upload_candidate_artifact_chunk<'a>(
+        &'a self,
+        command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+    ) -> MvpFuture<'a, CandidateArtifactChunkReceipt>;
+
+    fn complete_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView>;
+
     fn get_lease(
         &self,
         project_id: ProjectId,
@@ -65,6 +82,27 @@ where
         command: &'a MvpCommand<ClaimPackageInput>,
     ) -> MvpFuture<'a, ClaimedWork> {
         MvpControlPlane::claim_package(self, command)
+    }
+
+    fn init_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<InitCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView> {
+        MvpControlPlane::init_candidate_artifact(self, command)
+    }
+
+    fn upload_candidate_artifact_chunk<'a>(
+        &'a self,
+        command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+    ) -> MvpFuture<'a, CandidateArtifactChunkReceipt> {
+        MvpControlPlane::upload_candidate_artifact_chunk(self, command)
+    }
+
+    fn complete_candidate_artifact<'a>(
+        &'a self,
+        command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+    ) -> MvpFuture<'a, CandidateArtifactView> {
+        MvpControlPlane::complete_candidate_artifact(self, command)
     }
 
     fn get_lease(
@@ -899,6 +937,27 @@ mod tests {
                 return Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) });
             }
             Box::pin(async move { Ok(claimed) })
+        }
+
+        fn init_candidate_artifact<'a>(
+            &'a self,
+            _command: &'a MvpCommand<InitCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+        }
+
+        fn upload_candidate_artifact_chunk<'a>(
+            &'a self,
+            _command: &'a MvpCommand<UploadCandidateArtifactChunkInput>,
+        ) -> MvpFuture<'a, CandidateArtifactChunkReceipt> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+        }
+
+        fn complete_candidate_artifact<'a>(
+            &'a self,
+            _command: &'a MvpCommand<CompleteCandidateArtifactInput>,
+        ) -> MvpFuture<'a, CandidateArtifactView> {
+            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
         }
 
         fn get_lease(
