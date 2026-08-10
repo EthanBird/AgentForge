@@ -19,12 +19,13 @@
 - `config.rs`：严格、限长、拒绝未知字段的 daemon 配置，以及包含 runtime/policy 的稳定节点指纹；
 - `daemon.rs`：单写者组合根，固定执行 pending Claim → pending Renew/Release → Lease maintenance →
   capacity-bounded Claim；
+- `http_control.rs`：有总超时、header/body 上限和严格错误契约的 loopback HTTP/1 adapter；
 - `FakeTurnExecutor` / `FakeVerifier`：MVP 的确定性执行和故障注入边界，后续 jcode adapter 实现相同
   trait。
 
-本检查点已经提供 transport-independent 的 Offer/Claim/Lease 端口、可恢复调度循环和关闭边界，但没有
-宣称完成 HTTP/mTLS adapter、Worker enrollment、workspace sandbox 或 jcode 进程桥接；这些属于
-MVP-02 后续纵切。
+本检查点已经提供 transport-independent 的 Offer/Claim/Lease 端口、可恢复调度循环、loopback HTTP
+adapter 和可启动二进制，但没有宣称完成 LAN mTLS、Worker enrollment、workspace sandbox 或 jcode
+进程桥接；这些属于 MVP-02 后续纵切。
 
 ## 2. 状态机边界
 
@@ -131,6 +132,31 @@ Candidate 只保留为 salvage 输入，正式 `candidate_id` 授权被清除。
 调用取消则由同一意图和 idempotency key 在下一次启动恢复。定时器采用 delay 语义，慢请求不会触发
 追赶式 mutation burst。
 
+### 4.1 Loopback HTTP 与启动
+
+`LoopbackHttpControlPlane` 只接受 literal `http://127.0.0.1:PORT` 或 `http://[::1]:PORT`。DNS 名称、
+userinfo、path/query、端口 0 与非 loopback 地址一律在配置阶段拒绝；无 TLS adapter 不能被配置成 LAN
+连接。每个 exchange 还强制：
+
+- 整体 timeout，32 KiB response header 上限和 1 KiB–4 MiB 可配 body 上限；
+- HTTP/1.1、唯一 `Content-Length`、`application/json`，拒绝 `Transfer-Encoding` 与重复长度/类型；
+- strict JSON（重复 key、尾随输入、unsafe integer 均失败）和 typed response unknown-field 拒绝；
+- HTTP status、稳定 AF error code 与 `retryable` 三者必须匹配，未知未来 code fail closed；
+- Claim/Renew/Release 传递原 command/correlation/idempotency/If-Match，body 只包含服务器 API 规定的
+  typed input，不能由客户端注入 actor。
+
+示例配置位于 `examples/worker-loopback.json`。复制后至少替换 Project/actor/executor/node ID、runtime
+fingerprint 与 Journal 路径，然后启动：
+
+```bash
+install -d -m 0700 /var/lib/agentforge
+export AGENTFORGE_WORKER_CONFIG=/etc/agentforge/worker.json
+cargo run --locked -p agentforge-worker-daemon --bin agentforge-worker-daemon
+```
+
+二进制在打开 Journal 与建立任何远端请求前严格解析配置；SIGINT/SIGTERM 只在当前 tick 收敛后退出。
+日志只打印 node ID、派生指纹、项目数和容量，不回显完整配置或凭据。
+
 ## 5. 外部副作用与重启恢复
 
 模型 Turn 属于 `NON_REPEATABLE`：
@@ -169,16 +195,17 @@ cargo fmt --all -- --check
 - Claim 响应执行快照的双端摘要校验、远端调用前 durable intent、ACK-loss/restart exact replay、漏收
   Renew 导入、阈值续租、终态 Release 和 Revoke 停止；
 - daemon 严格配置、节点指纹、pending-first 启动顺序、容量门禁、Claim ACK-loss 后重启恢复与自动续租；
+- loopback HTTP 的真实 Axum contract、command header、远端错误码、重复 JSON、body 上限和总 timeout；
 - Turn budget 与 Lease expiry 在启动 Executor 前阻止新副作用。
 
 ## 7. 下一纵切
 
 MVP-02 的下一检查点按顺序接入：
 
-1. Worker enrollment、本地节点身份与 loopback HTTP / LAN mTLS 控制面 adapter；
+1. Worker enrollment、本地节点身份与 LAN mTLS 控制面 adapter；
 2. workspace/日志/凭据目录隔离与受控命令执行；
 3. jcode bridge 版本握手、能力探测、operation query 与 sanitized transcript；
 4. Candidate Artifact 上传及 `RecordCandidate` handoff。
 
-在 transport 与 enrollment 完成前，`worker-daemon` 二进制仍未连接真实控制面；本检查点交付的是可复用、
-可定时运行且经过故障测试的 library composition root，不是最终可部署 daemon。
+当前二进制已经能连接同机控制面执行 Offer/Claim/Lease 循环；在 enrollment、执行桥和 sandbox 完成前，
+它仍不是可以接收不可信工单的最终部署形态。

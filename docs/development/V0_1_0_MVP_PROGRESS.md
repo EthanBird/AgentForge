@@ -182,7 +182,10 @@ enrollment、sandbox 与 jcode bridge。
 
 ## MVP-02 / Checkpoint G：Pending-first Worker Daemon 组合根
 
-状态：本地实现与完整 workspace 门禁通过；等待提交和远端 CI。
+状态：完成；远端 workspace 与 PostgreSQL 17 CI 均通过。
+
+- 远端提交：`69d6ce97737d86856c63bb72368d74209cf8e1bb`
+- GitHub Actions：CI #63 / run `31350376544`
 
 当前完成：
 
@@ -197,4 +200,26 @@ enrollment、sandbox 与 jcode bridge。
 - Worker 定点测试增至 29 项，覆盖 capacity、自动 Renew、Claim ACK-loss、重启 pending-first exact replay
   和非法 runtime ID 在远端 mutation 前拒绝。
 
-仍待：HTTP/mTLS Worker adapter、enrollment、sandbox、jcode bridge 与 Candidate Artifact handoff。
+Checkpoint G 当时仍待 HTTP adapter（现由 H 的 loopback slice 关闭）；其余仍待 LAN mTLS、enrollment、
+sandbox、jcode bridge 与 Candidate Artifact handoff。
+
+## MVP-02 / Checkpoint H：真实 Loopback HTTP Worker
+
+状态：本地实现与完整 workspace 门禁通过；等待提交和远端 CI。
+
+当前完成：
+
+- `LoopbackHttpControlPlane` 实现 Offer、Claim、Lease GET/Renew/Release 的真实 `/api/v1` HTTP contract；
+- 配置只允许 literal IPv4/IPv6 loopback，无 TLS adapter 不能被误配到 LAN；请求整体 timeout、response
+  header/body 上限、唯一 Content-Length、JSON Content-Type 与禁用 Transfer-Encoding 均 fail closed；
+- response 先 strict JSON，再 typed decode；HTTP status、AF error code 与 retryable 必须是受支持的一致
+  组合，未知 code、重复 JSON key、状态码替换和超限 body 均拒绝；
+- command ID、correlation ID、idempotency key 与 If-Match 从 durable intent 原样传输，HTTP actor 仍由
+  控制面已授权 request context 派生；
+- `agentforge-worker-daemon` 二进制读取 `AGENTFORGE_WORKER_CONFIG`、建立 Journal/HTTP adapter、运行
+  pending-first tick loop，并在 SIGINT/SIGTERM 后有序停止；
+- `examples/worker-loopback.json` 受编译期测试约束；Worker 定点测试增至 34 项（含真实 Axum server
+  contract、错误映射、body limit 和 timeout）。
+
+仍待：Worker enrollment、LAN mTLS、sandbox、jcode bridge、把 Turn Pump 接入 daemon，以及 Candidate
+Artifact handoff。

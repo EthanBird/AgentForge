@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod daemon;
+pub mod http_control;
 pub mod journal;
 pub mod lifecycle;
 pub mod runtime;

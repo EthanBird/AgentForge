@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeSet,
     fs,
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
 };
 
@@ -24,6 +25,9 @@ pub struct WorkerDaemonConfig {
     pub node_id: NodeId,
     pub runtime_fingerprint: Sha256Digest,
     pub project_ids: Vec<ProjectId>,
+    pub control_plane_url: String,
+    pub request_timeout_seconds: u16,
+    pub max_response_bytes: u32,
     pub journal_path: PathBuf,
     pub capacity: u16,
     pub offer_limit: u16,
@@ -48,6 +52,7 @@ impl WorkerDaemonConfig {
     }
 
     pub fn validate(&self) -> ConfigResult<()> {
+        self.control_plane_address()?;
         let projects = self
             .project_ids
             .iter()
@@ -71,6 +76,8 @@ impl WorkerDaemonConfig {
             || self.project_ids.len() > 64
             || projects.len() != self.project_ids.len()
             || projects.iter().any(|project_id| project_id.is_nil())
+            || !(1..=120).contains(&self.request_timeout_seconds)
+            || !(1_024..=4_194_304).contains(&self.max_response_bytes)
             || !journal_is_safe_absolute
             || self.capacity == 0
             || self.capacity > 64
@@ -89,6 +96,23 @@ impl WorkerDaemonConfig {
             return Err(ConfigError::Invalid);
         }
         Ok(())
+    }
+
+    /// Resolves only literal loopback HTTP authorities. DNS names, userinfo,
+    /// paths, query strings and non-loopback IPs are rejected so an MVP config
+    /// cannot silently turn the no-TLS adapter into a LAN transport.
+    pub fn control_plane_address(&self) -> ConfigResult<SocketAddr> {
+        let authority = self
+            .control_plane_url
+            .strip_prefix("http://")
+            .ok_or(ConfigError::Invalid)?;
+        let address = authority
+            .parse::<SocketAddr>()
+            .map_err(|_| ConfigError::Invalid)?;
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err(ConfigError::Invalid);
+        }
+        Ok(address)
     }
 
     pub fn identity(&self) -> WorkerIdentity {
@@ -156,6 +180,9 @@ mod tests {
             node_id: id(3),
             runtime_fingerprint: Sha256Digest::of_bytes("jcode-v1+prompt-v1+tools-v1"),
             project_ids: vec![id(4)],
+            control_plane_url: "http://127.0.0.1:8080".to_owned(),
+            request_timeout_seconds: 10,
+            max_response_bytes: 2_097_152,
             journal_path: path,
             capacity: 1,
             offer_limit: 10,
@@ -206,6 +233,13 @@ mod tests {
         relative.journal_path = PathBuf::from("../worker.sqlite3");
         assert!(relative.validate().is_err());
 
+        let mut remote = config(directory.path().join("remote.sqlite3"));
+        remote.control_plane_url = "http://192.0.2.10:8080".to_owned();
+        assert_eq!(
+            remote.validate().expect_err("remote cleartext").code(),
+            "AF_WORKER_CONFIG_INVALID"
+        );
+
         let with_unknown = serde_json::json!({
             "schema_version": 1,
             "actor_id": id::<ActorId>(1),
@@ -213,6 +247,9 @@ mod tests {
             "node_id": id::<NodeId>(3),
             "runtime_fingerprint": Sha256Digest::of_bytes("runtime"),
             "project_ids": [id::<ProjectId>(4)],
+            "control_plane_url": "http://127.0.0.1:8080",
+            "request_timeout_seconds": 10,
+            "max_response_bytes": 2_097_152,
             "journal_path": directory.path().join("worker.sqlite3"),
             "capacity": 1,
             "offer_limit": 10,
@@ -230,6 +267,18 @@ mod tests {
                 .expect_err("unknown field")
                 .code(),
             "AF_WORKER_CONFIG_DECODE"
+        );
+    }
+
+    #[test]
+    fn repository_loopback_example_is_strict_and_release_valid() {
+        let example: WorkerDaemonConfig =
+            serde_json::from_slice(include_bytes!("../../../examples/worker-loopback.json"))
+                .expect("strictly typed example");
+        example.validate().expect("release-valid example");
+        assert_eq!(
+            example.control_plane_address().expect("loopback address"),
+            "127.0.0.1:8080".parse().expect("fixture address")
         );
     }
 }

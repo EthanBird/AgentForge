@@ -31,6 +31,8 @@ pub enum MvpError {
     IdempotencyResultExpired,
     #[error("the idempotent result predates the current response protocol")]
     IdempotencyResultLegacy,
+    #[error(transparent)]
+    Remote(#[from] MvpRemoteError),
 }
 
 impl MvpError {
@@ -45,12 +47,116 @@ impl MvpError {
             Self::Port(PortError::Serialization) => "AF_SERIALIZATION",
             Self::IdempotencyResultExpired => "AF_IDEMPOTENCY_RESULT_EXPIRED",
             Self::IdempotencyResultLegacy => "AF_IDEMPOTENCY_RESULT_LEGACY",
+            Self::Remote(error) => error.code(),
         }
     }
 
     #[must_use]
     pub const fn retryable(&self) -> bool {
         matches!(self, Self::Port(error) if error.retryable())
+            || matches!(self, Self::Remote(error) if error.retryable())
+    }
+}
+
+/// Stable error codes accepted from the versioned HTTP adapter. Unknown codes
+/// are not converted into this enum: clients fail closed as a serialization
+/// error rather than trusting an unversioned server diagnostic.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum MvpRemoteError {
+    #[error("remote resource identifier is invalid")]
+    ResourceIdInvalid,
+    #[error("remote command header is invalid")]
+    CommandHeaderInvalid,
+    #[error("remote path and request body do not match")]
+    PathBodyMismatch,
+    #[error("remote Project access was denied")]
+    ProjectAccessDenied,
+    #[error("remote command service is unavailable")]
+    CommandServiceUnavailable,
+    #[error("remote resource was not found")]
+    NotFound,
+    #[error("remote Lease expired")]
+    LeaseExpired,
+    #[error("remote policy denied the command")]
+    PolicyDenied,
+    #[error("remote durable state conflicts with the command")]
+    Conflict,
+    #[error("remote aggregate version is stale")]
+    StaleVersion,
+    #[error("remote Lease generation is stale")]
+    LeaseStale,
+    #[error("remote idempotency key was reused")]
+    IdempotencyKeyReused,
+    #[error("remote transition is invalid")]
+    TransitionInvalid,
+    #[error("remote Package is not claimable")]
+    PackageNotClaimable,
+    #[error("remote dependency is unavailable")]
+    Unavailable,
+    #[error("remote storage integrity check failed")]
+    StorageIntegrity,
+    #[error("remote serialization failed")]
+    Serialization,
+    #[error("remote idempotent result expired")]
+    IdempotencyResultExpired,
+    #[error("remote idempotent result uses a legacy protocol")]
+    IdempotencyResultLegacy,
+}
+
+impl MvpRemoteError {
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ResourceIdInvalid => "AF_RESOURCE_ID_INVALID",
+            Self::CommandHeaderInvalid => "AF_COMMAND_HEADER_INVALID",
+            Self::PathBodyMismatch => "AF_PATH_BODY_MISMATCH",
+            Self::ProjectAccessDenied => "AF_PROJECT_ACCESS_DENIED",
+            Self::CommandServiceUnavailable => "AF_COMMAND_SERVICE_UNAVAILABLE",
+            Self::NotFound => "AF_NOT_FOUND",
+            Self::LeaseExpired => "AF_LEASE_EXPIRED",
+            Self::PolicyDenied => "AF_POLICY_DENIED",
+            Self::Conflict => "AF_CONFLICT",
+            Self::StaleVersion => "AF_STALE_VERSION",
+            Self::LeaseStale => "AF_LEASE_STALE",
+            Self::IdempotencyKeyReused => "AF_IDEMPOTENCY_KEY_REUSED",
+            Self::TransitionInvalid => "AF_TRANSITION_INVALID",
+            Self::PackageNotClaimable => "AF_PACKAGE_NOT_CLAIMABLE",
+            Self::Unavailable => "AF_UNAVAILABLE",
+            Self::StorageIntegrity => "AF_STORAGE_INTEGRITY",
+            Self::Serialization => "AF_SERIALIZATION",
+            Self::IdempotencyResultExpired => "AF_IDEMPOTENCY_RESULT_EXPIRED",
+            Self::IdempotencyResultLegacy => "AF_IDEMPOTENCY_RESULT_LEGACY",
+        }
+    }
+
+    pub fn parse(code: &str) -> Option<Self> {
+        Some(match code {
+            "AF_RESOURCE_ID_INVALID" => Self::ResourceIdInvalid,
+            "AF_COMMAND_HEADER_INVALID" => Self::CommandHeaderInvalid,
+            "AF_PATH_BODY_MISMATCH" => Self::PathBodyMismatch,
+            "AF_PROJECT_ACCESS_DENIED" => Self::ProjectAccessDenied,
+            "AF_COMMAND_SERVICE_UNAVAILABLE" => Self::CommandServiceUnavailable,
+            "AF_NOT_FOUND" => Self::NotFound,
+            "AF_LEASE_EXPIRED" => Self::LeaseExpired,
+            "AF_POLICY_DENIED" => Self::PolicyDenied,
+            "AF_CONFLICT" => Self::Conflict,
+            "AF_STALE_VERSION" => Self::StaleVersion,
+            "AF_LEASE_STALE" => Self::LeaseStale,
+            "AF_IDEMPOTENCY_KEY_REUSED" => Self::IdempotencyKeyReused,
+            "AF_TRANSITION_INVALID" => Self::TransitionInvalid,
+            "AF_PACKAGE_NOT_CLAIMABLE" => Self::PackageNotClaimable,
+            "AF_UNAVAILABLE" => Self::Unavailable,
+            "AF_STORAGE_INTEGRITY" => Self::StorageIntegrity,
+            "AF_SERIALIZATION" => Self::Serialization,
+            "AF_IDEMPOTENCY_RESULT_EXPIRED" => Self::IdempotencyResultExpired,
+            "AF_IDEMPOTENCY_RESULT_LEGACY" => Self::IdempotencyResultLegacy,
+            _ => return None,
+        })
+    }
+
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::CommandServiceUnavailable | Self::Unavailable)
     }
 }
 
@@ -132,12 +238,14 @@ pub struct PublishedPackage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListOffersQuery {
     pub project_id: ProjectId,
     pub limit: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OfferView {
     pub project_id: ProjectId,
     pub package_id: PackageId,
@@ -152,6 +260,7 @@ pub struct OfferView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimPackageInput {
     pub project_id: ProjectId,
     pub package_id: PackageId,
@@ -191,6 +300,7 @@ pub struct ClaimedWork {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenewLeaseInput {
     pub project_id: ProjectId,
     pub lease_id: LeaseId,
@@ -200,6 +310,7 @@ pub struct RenewLeaseInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseLeaseInput {
     pub project_id: ProjectId,
     pub lease_id: LeaseId,
@@ -208,6 +319,7 @@ pub struct ReleaseLeaseInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LeaseView {
     pub project_id: ProjectId,
     pub package_id: PackageId,
