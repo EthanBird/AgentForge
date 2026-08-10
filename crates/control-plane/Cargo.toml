@@ -11,6 +11,7 @@ default-run = "agentforge-control-plane"
 agentforge-application = { path = "../application" }
 agentforge-domain = { path = "../domain" }
 agentforge-protocol = { path = "../protocol" }
+agentforge-storage-postgres = { path = "../persistence-postgres" }
 anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true

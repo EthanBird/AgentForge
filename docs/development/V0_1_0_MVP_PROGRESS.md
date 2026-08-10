@@ -7,7 +7,12 @@
 
 ## MVP-01 / Checkpoint A：Typed Market 与 Lease 命令面
 
-状态：本地门禁通过，真实 PostgreSQL 17 合同等待 GitHub Actions。
+状态：完成；真实 PostgreSQL 17 与 workspace CI 均通过。
+
+- 远端提交：`1ba8cdcb8d98014896c3f10e2aefd5b72123a61e`
+- GitHub Actions：CI #49 / run `31344363783`
+- PostgreSQL 17 job：migration、transactional UoW、MVP market/Lease contract 全部通过
+- Rust job：format、metadata、workspace boundary、build、Clippy、workspace test 全部通过
 
 本检查点完成：
 
@@ -38,9 +43,23 @@ git diff --check                                             PASS
 
 限制与下一步：
 
-- 当前机器没有 PostgreSQL/docker，因此 `postgres_mvp` 在本地仅完成编译，真实事务与并发断言必须以
-  本次 push 后的 PostgreSQL 17 CI 结果为准；
+- 当前机器没有 PostgreSQL/docker；真实事务与并发断言的权威证据为上述 PostgreSQL 17 CI；
 - HTTP `/api/v1`、管理 CLI、Lease expiry/reconciliation 以及 Worker Attempt 进度命令尚未完成；
 - Release 当前只终结 Lease；在 Checkpoint B 中必须加入 typed reconciliation，使仍为 ACTIVE 的
   WorkPackage/Attempt 收敛到 `REWORK_READY`/`LOST`，不得把该中间状态当作 MVP 完成态；
 - Checkpoint B 完成后再宣布 MVP-01 退出条件通过。
+
+## MVP-01 / Checkpoint B：HTTP、管理 CLI 与 Lease 收敛
+
+状态：实施中。
+
+当前已落盘但尚未形成远端检查点：
+
+- `/api/v1` Project、Package、Offer、Claim、Lease Read/Renew/Release 路由；
+- 请求级项目授权、服务器派生 Actor ID、强制 `Idempotency-Key` 与更新命令 `If-Match`；
+- 稳定且不泄露内部细节的 HTTP 错误 envelope；
+- `af-cli mvp` 等价管理命令，直接使用同一 application port 与 PostgreSQL adapter；
+- control-plane 启动时显式装配 typed PostgreSQL command service。
+
+本检查点剩余：HTTP handler 合同测试、Lease expiry/release reconciliation、API/CLI 使用说明和完整
+workspace 门禁。

@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod control_room;
+pub mod mvp_api;
 pub mod ui;
 
 /// Package name used by smoke tests.

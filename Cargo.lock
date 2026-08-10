@@ -23,6 +23,7 @@ dependencies = [
  "agentforge-application",
  "agentforge-domain",
  "agentforge-protocol",
+ "agentforge-storage-postgres",
  "anyhow",
  "async-stream",
  "axum",

@@ -2,8 +2,8 @@
 
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
-use agentforge_application::{ProjectReadModels, ProjectionEnvelope};
-use agentforge_domain::{ProjectId, Sha256Digest};
+use agentforge_application::{MvpControlPlane, ProjectReadModels, ProjectionEnvelope};
+use agentforge_domain::{ActorId, ProjectId, Sha256Digest};
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
@@ -169,6 +169,7 @@ pub struct ControlPlaneState {
     cursor: CursorCodec,
     actor_extractor: Option<Arc<dyn RequestActorExtractor>>,
     authorizer: Option<Arc<dyn ProjectAuthorizer>>,
+    commands: Option<Arc<dyn MvpControlPlane>>,
 }
 
 impl ControlPlaneState {
@@ -201,7 +202,40 @@ impl ControlPlaneState {
             cursor,
             actor_extractor,
             authorizer,
+            commands: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_commands(mut self, commands: Arc<dyn MvpControlPlane>) -> Self {
+        self.commands = Some(commands);
+        self
+    }
+
+    pub(crate) fn command_service(&self) -> Option<Arc<dyn MvpControlPlane>> {
+        self.commands.clone()
+    }
+
+    pub(crate) async fn authorize_command_actor(
+        &self,
+        headers: &HeaderMap,
+        project_id: ProjectId,
+    ) -> Result<ActorId, ()> {
+        let authorization = self
+            .authorize_project(headers, project_id)
+            .await
+            .map_err(|_| ())?;
+        let material = format!(
+            "agentforge-http-actor:v1\n{}\n{}",
+            authorization.actor.tenant().as_str(),
+            authorization.actor.actor().as_str(),
+        );
+        let digest = Sha256Digest::of_bytes(material);
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x80;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Ok(ActorId::from_uuid(uuid::Uuid::from_bytes(bytes)))
     }
 
     async fn authorize_project(
@@ -243,6 +277,7 @@ pub fn router(state: ControlPlaneState) -> Router {
             get(mission_control),
         )
         .route("/v1/projects/{project_id}/control-room-stream", get(events))
+        .merge(crate::mvp_api::routes())
         .fallback(not_found)
         .layer(middleware::from_fn(local_origin_guard))
         .layer(SetResponseHeaderLayer::if_not_present(

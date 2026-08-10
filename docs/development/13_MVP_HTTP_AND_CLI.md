@@ -1,0 +1,76 @@
+# MVP HTTP API 与管理 CLI
+
+本文描述 `v0.1.0-mvp` 的本地/私网试点命令面。它不是公有网络认证方案：当前二进制只允许
+loopback bind，并要求 Host/Origin 同源检查和 Project allowlist。
+
+## 1. 启动前置
+
+先显式执行迁移，再启动控制面；生产启动不会自动迁移：
+
+```bash
+export AGENTFORGE_DATABASE_URL='host=127.0.0.1 user=agentforge dbname=agentforge'
+cargo run --locked -p agentforge-storage-postgres --bin af-migrate
+
+export AGENTFORGE_BIND='127.0.0.1:8080'
+export AGENTFORGE_DATABASE_SCHEMA='public'
+export AGENTFORGE_CURSOR_HMAC_KEY='<64 lowercase hex characters>'
+export AGENTFORGE_LOCAL_PROJECT_IDS='<comma-separated Project UUIDs>'
+cargo run --locked -p agentforge-control-plane --bin agentforge-control-plane
+```
+
+要创建的新 Project UUID 必须预先出现在 `AGENTFORGE_LOCAL_PROJECT_IDS`。这是本地试点的显式授权
+边界，不是动态多租户目录。
+
+## 2. HTTP 契约
+
+所有写命令必须带：
+
+- `Idempotency-Key`：同一 actor 内的稳定业务键；
+- `If-Match: "<version>"`：Claim、Renew、Release 必须提供，创建 Project/Package 禁止提供；
+- `Content-Type: application/json`；
+- 可选 `X-AgentForge-Command-Id`、`X-AgentForge-Correlation-Id`、
+  `X-AgentForge-Causation-Id`；缺省 ID 由服务器生成 UUIDv7。
+
+HTTP actor 从已经验证的 request actor/Project grant 派生，客户端不能在 JSON 中指定 actor。
+
+| 方法 | 路径 | 结果 |
+|---|---|---|
+| `POST` | `/api/v1/projects` | 创建预授权 Project |
+| `POST` | `/api/v1/projects/{project_id}/packages` | 校验 JCS hash 并发布 Package |
+| `GET` | `/api/v1/projects/{project_id}/offers?limit=50` | 列出 Offer |
+| `POST` | `/api/v1/projects/{project_id}/packages/{package_id}/claim` | 原子创建 Attempt + Lease |
+| `GET` | `/api/v1/projects/{project_id}/leases/{lease_id}` | 读取 Lease |
+| `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/renew` | fencing Renew |
+| `POST` | `/api/v1/projects/{project_id}/leases/{lease_id}/release` | fencing Release |
+
+路径与 JSON 中重复的 Project/Package/Lease ID 必须完全相同。错误响应固定为：
+
+```json
+{
+  "code": "AF_LEASE_STALE",
+  "message": "the command conflicts with current durable state",
+  "retryable": false
+}
+```
+
+## 3. 管理 CLI
+
+CLI 与 HTTP 使用相同的 application port；它不会绕过领域状态机、typed rows、receipt、Event 或
+Outbox。写命令的 JSON 文件是 `MvpCommand<T>` envelope，包含 `context` 和 `input`。
+
+```bash
+cargo run --locked -p agentforge-control-plane --bin af-cli -- \
+  mvp --database-schema public project-create project-create.json
+
+cargo run --locked -p agentforge-control-plane --bin af-cli -- \
+  mvp offers <project-uuid> --limit 50
+
+cargo run --locked -p agentforge-control-plane --bin af-cli -- \
+  mvp package-claim claim.json
+
+cargo run --locked -p agentforge-control-plane --bin af-cli -- \
+  mvp lease-get <project-uuid> <lease-uuid>
+```
+
+如果未传 `--database-url`，CLI 使用 `AGENTFORGE_DATABASE_URL`。连接器只接受 loopback PostgreSQL；
+远程生产数据库需要 TLS/身份 adapter，本 MVP 不做不安全降级。

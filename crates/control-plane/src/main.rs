@@ -1,7 +1,8 @@
-use std::{collections::BTreeSet, net::SocketAddr, str::FromStr};
+use std::{collections::BTreeSet, net::SocketAddr, str::FromStr, sync::Arc};
 
 use agentforge_control_plane::ui::{ControlPlaneState, CursorCodec, router};
 use agentforge_domain::ProjectId;
+use agentforge_storage_postgres::PostgresMvpControlPlane;
 use anyhow::{Context, Result};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,13 @@ async fn main() -> Result<()> {
     )?;
     let (state, _local_store) =
         ControlPlaneState::local_reference(CursorCodec::from_hex(&cursor_key)?, allowed_projects)?;
+    let database_url = std::env::var("AGENTFORGE_DATABASE_URL")
+        .context("AGENTFORGE_DATABASE_URL must point to the local/private PostgreSQL instance")?;
+    let database_schema =
+        std::env::var("AGENTFORGE_DATABASE_SCHEMA").unwrap_or_else(|_| "public".to_owned());
+    let commands = PostgresMvpControlPlane::new_local_no_tls(database_url, database_schema)
+        .context("configure the PostgreSQL MVP command service")?;
+    let state = state.with_commands(Arc::new(commands));
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .context("bind AgentForge control plane")?;
