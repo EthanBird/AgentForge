@@ -3,7 +3,8 @@
 use std::{future::Future, sync::Arc, time::Duration};
 
 use agentforge_application::{
-    CompleteCandidateArtifactInput, InitCandidateArtifactInput, MvpCommand, MvpCommandContext,
+    AttemptProgressStage, AttemptProgressView, CompleteCandidateArtifactInput,
+    InitCandidateArtifactInput, MvpCommand, MvpCommandContext, ReportAttemptProgressInput,
     UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
@@ -21,13 +22,15 @@ use crate::{
         FixtureDriveContext, FixtureDriveIds, FixtureDriverError, drive_fixture_attempt,
     },
     journal::{
-        CandidateArtifactCommandIntentRecord, CandidateArtifactCommandResponse,
-        CandidateArtifactControlCommand, Journal, JournalCommand, JournalError, JournalRequest,
+        AttemptProgressCommandIntentRecord, CandidateArtifactCommandIntentRecord,
+        CandidateArtifactCommandResponse, CandidateArtifactControlCommand, Journal, JournalCommand,
+        JournalError, JournalRequest,
     },
     lifecycle::{
         ClaimIntent, LeaseMaintenanceIntent, LeaseMaintenanceOutcome, LifecycleError,
-        WorkerControlPlane, claim_offer, execute_candidate_artifact_command_intent,
-        maintain_attempt, poll_offer, resume_claim_intent, resume_lease_command_intent,
+        WorkerControlPlane, claim_offer, execute_attempt_progress_command_intent,
+        execute_candidate_artifact_command_intent, maintain_attempt, poll_offer,
+        resume_claim_intent, resume_lease_command_intent,
     },
     runtime::{CandidateSnapshot, WorkerCommandEnvelope, WorkerCommandKind, WorkerPhase},
 };
@@ -55,10 +58,12 @@ impl DaemonRuntime for SystemDaemonRuntime {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DaemonTickReport {
     pub resumed_claims: u16,
+    pub resumed_progress_commands: u16,
     pub resumed_artifact_commands: u16,
     pub resumed_lease_commands: u16,
     pub artifact_commands_completed: u16,
     pub candidate_artifacts_completed: u16,
+    pub progress_commands_completed: u16,
     pub maintenance_noops: u16,
     pub renewed: u16,
     pub released: u16,
@@ -85,6 +90,8 @@ pub enum DaemonError {
     MissingProjectBinding(AttemptId),
     #[error("attempt {0} has an invalid fixture Candidate Artifact command history")]
     InvalidArtifactWorkflow(AttemptId),
+    #[error("attempt {0} has an invalid central Attempt progress history")]
+    InvalidProgressWorkflow(AttemptId),
     #[error("daemon counter exceeded its bounded representation")]
     CounterOverflow,
 }
@@ -100,6 +107,7 @@ impl DaemonError {
             Self::InvalidRuntimeId => "AF_WORKER_RUNTIME_ID_INVALID",
             Self::MissingProjectBinding(_) => "AF_WORKER_PROJECT_BINDING_MISSING",
             Self::InvalidArtifactWorkflow(_) => "AF_WORKER_ARTIFACT_WORKFLOW_INVALID",
+            Self::InvalidProgressWorkflow(_) => "AF_WORKER_PROGRESS_WORKFLOW_INVALID",
             Self::CounterOverflow => "AF_WORKER_COUNTER_OVERFLOW",
         }
     }
@@ -156,11 +164,12 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
     /// Executes one deterministic scheduling turn:
     ///
     /// 1. replay pending Claim mutations;
-    /// 2. replay pending Candidate Artifact mutations;
-    /// 3. replay pending Renew/Release mutations;
-    /// 4. reconcile and maintain every locally owned Lease;
-    /// 5. drive fixture work and its deterministic Artifact upload;
-    /// 6. poll and Claim only the remaining execution capacity.
+    /// 2. replay pending central Attempt Progress mutations;
+    /// 3. replay pending Candidate Artifact mutations;
+    /// 4. replay pending Renew/Release mutations;
+    /// 5. reconcile and maintain every locally owned Lease;
+    /// 6. drive fixture work, central Progress, then deterministic Artifact upload;
+    /// 7. poll and Claim only the remaining execution capacity.
     pub async fn tick(&mut self) -> DaemonResult<DaemonTickReport> {
         let observed_at = self.runtime.now();
         let mut report = DaemonTickReport::default();
@@ -168,6 +177,16 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
         for record in self.journal.pending_claim_intents()? {
             resume_claim_intent(self.control.as_ref(), &mut self.journal, &record).await?;
             increment(&mut report.resumed_claims)?;
+        }
+        for record in self.journal.pending_attempt_progress_command_intents()? {
+            execute_attempt_progress_command_intent(
+                self.control.as_ref(),
+                &mut self.journal,
+                &record,
+            )
+            .await?;
+            increment(&mut report.resumed_progress_commands)?;
+            increment(&mut report.progress_commands_completed)?;
         }
         for record in self.journal.pending_candidate_artifact_command_intents()? {
             let response = execute_candidate_artifact_command_intent(
@@ -257,8 +276,16 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
                 .filter(|state| state.phase() == WorkerPhase::HandingOffCandidate)
                 .collect::<Vec<_>>();
             for state in handing_off {
-                self.drive_fixture_candidate_artifact(&state, observed_at, &mut report)
+                let progress = self
+                    .drive_fixture_attempt_progress(&state, observed_at, &mut report)
                     .await?;
+                self.drive_fixture_candidate_artifact(
+                    &state,
+                    progress.version,
+                    observed_at,
+                    &mut report,
+                )
+                .await?;
             }
         }
 
@@ -408,9 +435,116 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
         Ok(())
     }
 
+    async fn drive_fixture_attempt_progress(
+        &mut self,
+        state: &crate::runtime::WorkerAttemptState,
+        observed_at: ServerInstant,
+        report: &mut DaemonTickReport,
+    ) -> DaemonResult<AttemptProgressView> {
+        let claimed = self
+            .journal
+            .claimed_work_for_attempt(state.attempt_id())?
+            .ok_or(DaemonError::InvalidProgressWorkflow(state.attempt_id()))?;
+        let stages = [
+            AttemptProgressStage::Preparing,
+            AttemptProgressStage::Planning,
+            AttemptProgressStage::Implementing,
+            AttemptProgressStage::LocalVerify,
+        ];
+        let history = self
+            .journal
+            .attempt_progress_command_history(state.attempt_id())?;
+        if history.len() > stages.len() {
+            return Err(DaemonError::InvalidProgressWorkflow(state.attempt_id()));
+        }
+
+        let mut expected_version = claimed.attempt_version;
+        let mut last_response = None;
+        for (index, entry) in history.iter().enumerate() {
+            let response = entry
+                .response
+                .ok_or(DaemonError::InvalidProgressWorkflow(state.attempt_id()))?;
+            if entry.record.command.input.stage != stages[index]
+                || entry.record.command.context.expected_version != Some(expected_version)
+            {
+                return Err(DaemonError::InvalidProgressWorkflow(state.attempt_id()));
+            }
+            expected_version = response.version;
+            last_response = Some(response);
+        }
+
+        for stage in stages.into_iter().skip(history.len()) {
+            let record = self.fixture_attempt_progress_intent(
+                state,
+                &claimed,
+                stage,
+                expected_version,
+                observed_at,
+            )?;
+            let response = execute_attempt_progress_command_intent(
+                self.control.as_ref(),
+                &mut self.journal,
+                &record,
+            )
+            .await?;
+            increment(&mut report.progress_commands_completed)?;
+            expected_version = response.version;
+            last_response = Some(response);
+        }
+
+        let response =
+            last_response.ok_or(DaemonError::InvalidProgressWorkflow(state.attempt_id()))?;
+        if response.state != agentforge_domain::attempt::AttemptState::LocalVerify
+            || response.semantic_progress_seq != 4
+        {
+            return Err(DaemonError::InvalidProgressWorkflow(state.attempt_id()));
+        }
+        Ok(response)
+    }
+
+    fn fixture_attempt_progress_intent(
+        &mut self,
+        state: &crate::runtime::WorkerAttemptState,
+        claimed: &agentforge_application::ClaimedWork,
+        stage: AttemptProgressStage,
+        expected_version: AggregateVersion,
+        created_at: ServerInstant,
+    ) -> DaemonResult<AttemptProgressCommandIntentRecord> {
+        let intent_id = self.next_uuid()?;
+        Ok(AttemptProgressCommandIntentRecord {
+            intent_id,
+            attempt_id: state.attempt_id(),
+            command: MvpCommand {
+                context: MvpCommandContext {
+                    command_id: CommandId::from(self.next_uuid()?),
+                    actor_id: self.config.actor_id,
+                    idempotency_key: idempotency_key("worker-attempt-progress", intent_id)?,
+                    correlation_id: CorrelationId::from(self.next_uuid()?),
+                    causation_id: None,
+                    expected_version: Some(expected_version),
+                },
+                input: ReportAttemptProgressInput {
+                    project_id: claimed.project_id,
+                    attempt_id: state.attempt_id(),
+                    lease_id: state.lease_id(),
+                    node_id: self.config.node_id,
+                    fencing_token: state.lease_generation(),
+                    stage,
+                    evidence_digest: fixture_progress_evidence(
+                        state,
+                        stage,
+                        self.config.runtime_fingerprint,
+                    )?,
+                },
+            },
+            created_at,
+        })
+    }
+
     async fn drive_fixture_candidate_artifact(
         &mut self,
         state: &crate::runtime::WorkerAttemptState,
+        attempt_version: AggregateVersion,
         observed_at: ServerInstant,
         report: &mut DaemonTickReport,
     ) -> DaemonResult<()> {
@@ -474,8 +608,14 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
             if chunk.is_some() {
                 return Err(DaemonError::InvalidArtifactWorkflow(state.attempt_id()));
             }
-            let record =
-                self.fixture_artifact_init(state, &claimed, &bundle, bundle_digest, observed_at)?;
+            let record = self.fixture_artifact_init(
+                state,
+                &claimed,
+                &bundle,
+                bundle_digest,
+                attempt_version,
+                observed_at,
+            )?;
             let response = execute_candidate_artifact_command_intent(
                 self.control.as_ref(),
                 &mut self.journal,
@@ -543,13 +683,14 @@ impl<R: DaemonRuntime> WorkerDaemon<R> {
         claimed: &agentforge_application::ClaimedWork,
         bundle: &[u8],
         bundle_digest: Sha256Digest,
+        attempt_version: AggregateVersion,
         created_at: ServerInstant,
     ) -> DaemonResult<CandidateArtifactCommandIntentRecord> {
         let candidate = state
             .candidate()
             .ok_or(DaemonError::InvalidArtifactWorkflow(state.attempt_id()))?;
         let (intent_id, context) =
-            self.artifact_command_context("worker-artifact-init", claimed.attempt_version)?;
+            self.artifact_command_context("worker-artifact-init", attempt_version)?;
         Ok(CandidateArtifactCommandIntentRecord {
             intent_id,
             attempt_id: state.attempt_id(),
@@ -746,6 +887,44 @@ fn fixture_candidate_bundle(
     .map_err(|_| DaemonError::InvalidArtifactWorkflow(state.attempt_id()))
 }
 
+fn fixture_progress_evidence(
+    state: &crate::runtime::WorkerAttemptState,
+    stage: AttemptProgressStage,
+    runtime_fingerprint: Sha256Digest,
+) -> DaemonResult<Sha256Digest> {
+    match stage {
+        AttemptProgressStage::Planning => state
+            .plan_digest()
+            .ok_or(DaemonError::InvalidProgressWorkflow(state.attempt_id())),
+        AttemptProgressStage::LocalVerify => state
+            .last_verification_digest()
+            .ok_or(DaemonError::InvalidProgressWorkflow(state.attempt_id())),
+        AttemptProgressStage::Preparing | AttemptProgressStage::Implementing => {
+            let tree = if stage == AttemptProgressStage::Implementing {
+                Some(
+                    state
+                        .current_tree()
+                        .ok_or(DaemonError::InvalidProgressWorkflow(state.attempt_id()))?,
+                )
+            } else {
+                None
+            };
+            let evidence = serde_json_canonicalizer::to_vec(&serde_json::json!({
+                "attempt_id": state.attempt_id(),
+                "base_commit": state.base_commit(),
+                "package_hash": state.package_hash(),
+                "runtime_fingerprint": runtime_fingerprint,
+                "schema": "agentforge.fixture.attempt-progress-evidence.v1",
+                "stage": stage,
+                "tree": tree,
+                "turns_completed": state.turns_completed(),
+            }))
+            .map_err(|_| DaemonError::InvalidProgressWorkflow(state.attempt_id()))?;
+            Ok(Sha256Digest::of_bytes(evidence))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -762,7 +941,7 @@ mod tests {
     use agentforge_domain::{
         ActorId, AggregateVersion, ArtifactRef, CandidateArtifactId, CandidateArtifactState,
         CandidateId, ExecutorId, FencingToken, GitObjectId, LeaseId, NodeId, PackageId,
-        PackageRevision, ProtocolKey, Sha256Digest, lease::LeaseState,
+        PackageRevision, ProtocolKey, Sha256Digest, attempt::AttemptState, lease::LeaseState,
         work_package::WorkPackageState,
     };
     use time::macros::datetime;
@@ -850,6 +1029,9 @@ mod tests {
         claim_receipts: Mutex<BTreeMap<String, ClaimedWork>>,
         renew_receipts: Mutex<BTreeMap<String, LeaseView>>,
         release_receipts: Mutex<BTreeMap<String, LeaseView>>,
+        attempt_versions: Mutex<BTreeMap<AttemptId, AggregateVersion>>,
+        attempt_progress_sequences: Mutex<BTreeMap<AttemptId, u64>>,
+        progress_receipts: Mutex<BTreeMap<String, AttemptProgressView>>,
         artifacts: Mutex<BTreeMap<CandidateArtifactId, CandidateArtifactView>>,
         artifact_chunks: Mutex<BTreeMap<(CandidateArtifactId, u32), Vec<u8>>>,
         artifact_init_receipts: Mutex<BTreeMap<String, CandidateArtifactView>>,
@@ -858,13 +1040,21 @@ mod tests {
         now: Mutex<ServerInstant>,
         claims: Mutex<u16>,
         renewals: Mutex<u16>,
+        progress_effects: Mutex<u16>,
         artifact_effects: Mutex<u16>,
         fail_after_claim: Mutex<bool>,
+        fail_after_progress: Mutex<bool>,
         fail_after_artifact_init: Mutex<bool>,
     }
 
     impl FakeControl {
         fn new(offers: Vec<OfferView>, work: Vec<ClaimedWork>, node_id: NodeId) -> Self {
+            let attempt_versions = work
+                .iter()
+                .map(|claimed| (claimed.attempt_id, claimed.attempt_version))
+                .collect();
+            let attempt_progress_sequences =
+                work.iter().map(|claimed| (claimed.attempt_id, 0)).collect();
             Self {
                 offers: Mutex::new(offers),
                 work: work
@@ -876,6 +1066,9 @@ mod tests {
                 claim_receipts: Mutex::new(BTreeMap::new()),
                 renew_receipts: Mutex::new(BTreeMap::new()),
                 release_receipts: Mutex::new(BTreeMap::new()),
+                attempt_versions: Mutex::new(attempt_versions),
+                attempt_progress_sequences: Mutex::new(attempt_progress_sequences),
+                progress_receipts: Mutex::new(BTreeMap::new()),
                 artifacts: Mutex::new(BTreeMap::new()),
                 artifact_chunks: Mutex::new(BTreeMap::new()),
                 artifact_init_receipts: Mutex::new(BTreeMap::new()),
@@ -884,8 +1077,10 @@ mod tests {
                 now: Mutex::new(at(0)),
                 claims: Mutex::new(0),
                 renewals: Mutex::new(0),
+                progress_effects: Mutex::new(0),
                 artifact_effects: Mutex::new(0),
                 fail_after_claim: Mutex::new(false),
+                fail_after_progress: Mutex::new(false),
                 fail_after_artifact_init: Mutex::new(false),
             }
         }
@@ -956,9 +1151,99 @@ mod tests {
 
         fn report_attempt_progress<'a>(
             &'a self,
-            _command: &'a MvpCommand<agentforge_application::ReportAttemptProgressInput>,
-        ) -> MvpFuture<'a, agentforge_application::AttemptProgressView> {
-            Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) })
+            command: &'a MvpCommand<ReportAttemptProgressInput>,
+        ) -> MvpFuture<'a, AttemptProgressView> {
+            let key = command.context.idempotency_key.as_str().to_owned();
+            if let Some(response) = self
+                .progress_receipts
+                .lock()
+                .expect("progress receipts")
+                .get(&key)
+                .copied()
+            {
+                return Box::pin(async move { Ok(response) });
+            }
+            let Some(work) = self
+                .work
+                .values()
+                .find(|work| work.attempt_id == command.input.attempt_id)
+            else {
+                return Box::pin(async { Err(MvpError::Port(PortError::NotFound)) });
+            };
+            let now = *self.now.lock().expect("now lock");
+            let authority_matches = self
+                .leases
+                .lock()
+                .expect("leases lock")
+                .get(&command.input.lease_id)
+                .is_some_and(|lease| {
+                    lease.state == LeaseState::Active
+                        && lease.holder_node_id == command.input.node_id
+                        && lease.fencing_token == command.input.fencing_token
+                        && now < lease.expires_at
+                });
+            if !authority_matches
+                || command.input.project_id != work.project_id
+                || command.input.node_id != self.node_id
+            {
+                return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
+            }
+
+            let mut versions = self.attempt_versions.lock().expect("attempt versions");
+            let Some(version) = versions.get_mut(&work.attempt_id) else {
+                return Box::pin(async { Err(MvpError::Port(PortError::NotFound)) });
+            };
+            let mut sequences = self
+                .attempt_progress_sequences
+                .lock()
+                .expect("attempt progress sequences");
+            let Some(sequence) = sequences.get_mut(&work.attempt_id) else {
+                return Box::pin(async { Err(MvpError::Port(PortError::NotFound)) });
+            };
+            let expected = match *sequence {
+                0 => (AttemptProgressStage::Preparing, AttemptState::Preparing),
+                1 => (AttemptProgressStage::Planning, AttemptState::Planning),
+                2 => (
+                    AttemptProgressStage::Implementing,
+                    AttemptState::Implementing,
+                ),
+                3 => (AttemptProgressStage::LocalVerify, AttemptState::LocalVerify),
+                _ => return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) }),
+            };
+            if command.context.expected_version != Some(*version)
+                || command.input.stage != expected.0
+            {
+                return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
+            }
+            *version = AggregateVersion::new(version.get() + 2);
+            *sequence += 1;
+            let response = AttemptProgressView {
+                project_id: work.project_id,
+                package_id: work.package_id,
+                attempt_id: work.attempt_id,
+                lease_id: work.lease_id,
+                fencing_token: work.fencing_token,
+                state: expected.1,
+                semantic_progress_seq: *sequence,
+                updated_at: now,
+                version: *version,
+            };
+            drop(sequences);
+            drop(versions);
+            self.progress_receipts
+                .lock()
+                .expect("progress receipts")
+                .insert(key, response);
+            *self.progress_effects.lock().expect("progress effects") += 1;
+            if std::mem::take(
+                &mut *self
+                    .fail_after_progress
+                    .lock()
+                    .expect("progress failure lock"),
+            ) {
+                return Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) });
+            }
+            Box::pin(async move { Ok(response) })
         }
 
         fn init_candidate_artifact<'a>(
@@ -993,7 +1278,13 @@ mod tests {
                 || command.input.project_id != work.project_id
                 || command.input.package_hash != work.execution.package_hash
                 || command.input.base_commit != work.execution.base_commit
-                || command.context.expected_version != Some(work.attempt_version)
+                || command.context.expected_version
+                    != self
+                        .attempt_versions
+                        .lock()
+                        .expect("attempt versions")
+                        .get(&work.attempt_id)
+                        .copied()
             {
                 return Box::pin(async { Err(MvpError::Port(PortError::Conflict)) });
             }
@@ -1381,6 +1672,7 @@ mod tests {
         let report = daemon.tick().await.expect("fixture drive tick");
         assert_eq!(report.driven_attempts, 1);
         assert_eq!(report.local_candidates_ready, 1);
+        assert_eq!(report.progress_commands_completed, 4);
         assert_eq!(report.artifact_commands_completed, 3);
         assert_eq!(report.candidate_artifacts_completed, 1);
         assert_eq!(
@@ -1403,6 +1695,35 @@ mod tests {
             .expect("artifact history");
         assert_eq!(history.len(), 3);
         assert!(history.iter().all(|entry| entry.response.is_some()));
+        let progress = daemon
+            .journal()
+            .attempt_progress_command_history(id(10))
+            .expect("progress history");
+        assert_eq!(progress.len(), 4);
+        assert_eq!(
+            progress.last().and_then(|entry| entry.response.as_ref()),
+            Some(&AttemptProgressView {
+                project_id: id(1),
+                package_id: id(2),
+                attempt_id: id(10),
+                lease_id: id(11),
+                fencing_token: FencingToken::new(1).expect("generation"),
+                state: AttemptState::LocalVerify,
+                semantic_progress_seq: 4,
+                updated_at: at(1),
+                version: AggregateVersion::new(10),
+            })
+        );
+        let CandidateArtifactControlCommand::Init { command } =
+            &history.first().expect("artifact init").record.command
+        else {
+            panic!("artifact init")
+        };
+        assert_eq!(
+            command.context.expected_version,
+            Some(AggregateVersion::new(10))
+        );
+        assert_eq!(*control.progress_effects.lock().expect("effects"), 4);
         assert_eq!(*control.artifact_effects.lock().expect("effects"), 3);
         assert!(
             daemon
@@ -1429,6 +1750,14 @@ mod tests {
             .expect("artifact failure") = true;
         let error = first.tick().await.expect_err("artifact Init ACK loss");
         assert_eq!(error.code(), "AF_UNAVAILABLE");
+        assert_eq!(
+            first
+                .journal()
+                .attempt_progress_command_history(id(10))
+                .expect("progress before Artifact")
+                .len(),
+            4
+        );
         let pending = first
             .journal()
             .pending_candidate_artifact_command_intents()
@@ -1439,6 +1768,7 @@ mod tests {
             CandidateArtifactControlCommand::Init { .. }
         ));
         assert_eq!(*control.artifact_effects.lock().expect("effects"), 1);
+        assert_eq!(*control.progress_effects.lock().expect("effects"), 4);
         drop(first);
 
         control.set_now(at(2));
@@ -1453,9 +1783,12 @@ mod tests {
         .expect("restart");
         let report = restarted.tick().await.expect("artifact recovery");
         assert_eq!(report.resumed_artifact_commands, 1);
+        assert_eq!(report.resumed_progress_commands, 0);
+        assert_eq!(report.progress_commands_completed, 0);
         assert_eq!(report.artifact_commands_completed, 3);
         assert_eq!(report.candidate_artifacts_completed, 1);
         assert_eq!(*control.artifact_effects.lock().expect("effects"), 3);
+        assert_eq!(*control.progress_effects.lock().expect("effects"), 4);
         assert!(
             restarted
                 .journal()
@@ -1469,6 +1802,73 @@ mod tests {
             .expect("artifact history");
         assert_eq!(history.len(), 3);
         assert!(history.iter().all(|entry| entry.response.is_some()));
+    }
+
+    #[tokio::test]
+    async fn restart_replays_progress_before_creating_any_candidate_artifact() {
+        let (_directory, mut config, control, runtime) = fixture();
+        config.driver_mode = crate::config::WorkerDriverMode::Fixture;
+        let mut first =
+            WorkerDaemon::open(control.clone(), config.clone(), runtime).expect("daemon");
+        assert_eq!(first.tick().await.expect("claim tick").claimed, 1);
+
+        first.runtime.now = at(1);
+        control.set_now(at(1));
+        *control
+            .fail_after_progress
+            .lock()
+            .expect("progress failure") = true;
+        let error = first.tick().await.expect_err("Progress ACK loss");
+        assert_eq!(error.code(), "AF_UNAVAILABLE");
+        assert_eq!(
+            first
+                .journal()
+                .pending_attempt_progress_command_intents()
+                .expect("pending progress")
+                .len(),
+            1
+        );
+        assert!(
+            first
+                .journal()
+                .pending_candidate_artifact_command_intents()
+                .expect("no Artifact side effect planned")
+                .is_empty()
+        );
+        assert_eq!(*control.progress_effects.lock().expect("effects"), 1);
+        assert_eq!(*control.artifact_effects.lock().expect("effects"), 0);
+        drop(first);
+
+        control.set_now(at(2));
+        let mut restarted = WorkerDaemon::open(
+            control.clone(),
+            config,
+            FakeRuntime {
+                now: at(2),
+                next: 40_000,
+            },
+        )
+        .expect("restart");
+        let report = restarted.tick().await.expect("progress recovery");
+        assert_eq!(report.resumed_progress_commands, 1);
+        assert_eq!(report.progress_commands_completed, 4);
+        assert_eq!(report.artifact_commands_completed, 3);
+        assert_eq!(report.candidate_artifacts_completed, 1);
+        assert_eq!(*control.progress_effects.lock().expect("effects"), 4);
+        assert_eq!(*control.artifact_effects.lock().expect("effects"), 3);
+        assert!(
+            restarted
+                .journal()
+                .pending_attempt_progress_command_intents()
+                .expect("progress completed")
+                .is_empty()
+        );
+        let progress = restarted
+            .journal()
+            .attempt_progress_command_history(id(10))
+            .expect("progress history");
+        assert_eq!(progress.len(), 4);
+        assert!(progress.iter().all(|entry| entry.response.is_some()));
     }
 
     #[test]

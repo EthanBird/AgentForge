@@ -2356,6 +2356,32 @@ fn validate_attempt_progress_response(
     Ok(())
 }
 
+fn completed_attempt_progress_head(
+    connection: &Connection,
+    state: &WorkerAttemptState,
+) -> JournalResult<AttemptProgressView> {
+    let history = load_attempt_progress_history(connection, state.attempt_id())?;
+    if history.len() != 4 {
+        return Err(JournalError::Runtime(WorkerError::InvalidTransition));
+    }
+    for (index, stored) in history.iter().enumerate() {
+        let (actual_index, _) = attempt_progress_stage_contract(stored.record.stage());
+        let response = stored.response.as_ref().ok_or(JournalError::Integrity)?;
+        if index != actual_index || stored.state != AttemptProgressCommandState::Completed {
+            return Err(JournalError::Integrity);
+        }
+        validate_attempt_progress_response(connection, &stored.record, state, response)?;
+    }
+    let head = history
+        .last()
+        .and_then(|stored| stored.response)
+        .ok_or(JournalError::Integrity)?;
+    if head.state != AttemptState::LocalVerify || head.semantic_progress_seq != 4 {
+        return Err(JournalError::Integrity);
+    }
+    Ok(head)
+}
+
 fn validate_candidate_artifact_binding(
     connection: &Connection,
     record: &CandidateArtifactCommandIntentRecord,
@@ -2393,7 +2419,11 @@ fn validate_candidate_artifact_command_against_attempt(
     }
     match &record.command {
         CandidateArtifactControlCommand::Init { command } => {
+            let progress = completed_attempt_progress_head(connection, state)?;
             let candidate = state.candidate().ok_or(JournalError::Integrity)?;
+            if command.context.expected_version != Some(progress.version) {
+                return Err(JournalError::Runtime(WorkerError::StaleVersion));
+            }
             if command.input.attempt_id != state.attempt_id()
                 || command.input.package_hash != state.package_hash()
                 || command.input.base_commit != *state.base_commit()
@@ -4542,6 +4572,38 @@ mod tests {
         }
     }
 
+    fn complete_attempt_progress_history(
+        journal: &mut Journal,
+        state: &WorkerAttemptState,
+    ) -> AggregateVersion {
+        let mut expected_version = claimed_work().attempt_version;
+        for (index, stage) in [
+            AttemptProgressStage::Preparing,
+            AttemptProgressStage::Planning,
+            AttemptProgressStage::Implementing,
+            AttemptProgressStage::LocalVerify,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ordinal = u8::try_from(index + 1).expect("four stages");
+            let intent = attempt_progress_intent(state, stage, ordinal, expected_version);
+            journal
+                .register_attempt_progress_command_intent(&intent)
+                .expect("register progress");
+            let response = attempt_progress_response(&intent, ordinal);
+            journal
+                .complete_attempt_progress_command_intent(
+                    intent.intent_id,
+                    &response,
+                    response.updated_at,
+                )
+                .expect("complete progress");
+            expected_version = response.version;
+        }
+        expected_version
+    }
+
     fn artifact_bundle() -> Vec<u8> {
         b"fixture-candidate-bundle".to_vec()
     }
@@ -4560,7 +4622,7 @@ mod tests {
                         idempotency_key: IdempotencyKey::new("artifact-init-fixture").expect("key"),
                         correlation_id: id(65),
                         causation_id: None,
-                        expected_version: Some(AggregateVersion::new(2)),
+                        expected_version: Some(AggregateVersion::new(10)),
                     },
                     input: InitCandidateArtifactInput {
                         project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
@@ -4581,7 +4643,7 @@ mod tests {
                     },
                 },
             },
-            created_at: at(8),
+            created_at: at(17),
         }
     }
 
@@ -4608,9 +4670,9 @@ mod tests {
                 expected_bundle_size_bytes: command.input.expected_bundle_size_bytes,
                 chunk_digests: command.input.chunk_digests.clone(),
                 bundle: None,
-                created_at: at(9),
-                expires_at: at(609),
-                updated_at: at(9),
+                created_at: at(18),
+                expires_at: at(618),
+                updated_at: at(18),
                 version: AggregateVersion::new(1),
             },
         }
@@ -4648,7 +4710,7 @@ mod tests {
                     },
                 },
             },
-            created_at: at(10),
+            created_at: at(19),
         }
     }
 
@@ -4702,7 +4764,7 @@ mod tests {
                     },
                 },
             },
-            created_at: at(12),
+            created_at: at(21),
         }
     }
 
@@ -4722,7 +4784,7 @@ mod tests {
             uri: command.input.bundle_uri.clone(),
             digest: artifact.expected_bundle_digest,
         });
-        artifact.updated_at = at(13);
+        artifact.updated_at = at(22);
         artifact.version = AggregateVersion::new(3);
         CandidateArtifactCommandResponse::Complete { artifact }
     }
@@ -4862,6 +4924,29 @@ mod tests {
         assert_eq!(
             journal
                 .register_candidate_artifact_command_intent(&init)
+                .expect_err("Artifact Init requires completed central Attempt progress")
+                .code(),
+            "AF_TRANSITION_INVALID"
+        );
+        assert_eq!(
+            complete_attempt_progress_history(&mut journal, &state),
+            AggregateVersion::new(10)
+        );
+        let mut stale_init = init.clone();
+        let CandidateArtifactControlCommand::Init { command } = &mut stale_init.command else {
+            panic!("init")
+        };
+        command.context.expected_version = Some(claimed_work().attempt_version);
+        assert_eq!(
+            journal
+                .register_candidate_artifact_command_intent(&stale_init)
+                .expect_err("Claim-time Attempt version cannot initialize an Artifact")
+                .code(),
+            "AF_VERSION_STALE"
+        );
+        assert_eq!(
+            journal
+                .register_candidate_artifact_command_intent(&init)
                 .expect("register init"),
             CandidateArtifactCommandRegistration::Registered
         );
@@ -4892,7 +4977,7 @@ mod tests {
         let init_response = artifact_init_response(&state);
         assert_eq!(
             journal
-                .complete_candidate_artifact_command_intent(init.intent_id, &init_response, at(9),)
+                .complete_candidate_artifact_command_intent(init.intent_id, &init_response, at(18),)
                 .expect("complete init"),
             CandidateArtifactCommandCompletion::Completed
         );
@@ -4924,7 +5009,7 @@ mod tests {
         );
         let chunk_response = artifact_chunk_response(&state);
         journal
-            .complete_candidate_artifact_command_intent(chunk.intent_id, &chunk_response, at(11))
+            .complete_candidate_artifact_command_intent(chunk.intent_id, &chunk_response, at(20))
             .expect("complete chunk");
 
         let complete = artifact_complete_intent(&state);
@@ -4949,7 +5034,7 @@ mod tests {
                 &live_state,
                 "lease-lost-after-remote-complete",
                 74,
-                14,
+                23,
                 WorkerCommandKind::LoseLease {
                     reason: crate::runtime::LeaseLossReason::Expired,
                     observed_generation: live_state.lease_generation(),
@@ -4965,7 +5050,7 @@ mod tests {
                 .complete_candidate_artifact_command_intent(
                     complete.intent_id,
                     &complete_response,
-                    at(15),
+                    at(23),
                 )
                 .expect("complete artifact"),
             CandidateArtifactCommandCompletion::Completed
@@ -4992,7 +5077,7 @@ mod tests {
                 .complete_candidate_artifact_command_intent(
                     complete.intent_id,
                     &forged_response,
-                    at(15),
+                    at(23),
                 )
                 .expect_err("changed completion cannot replace receipt")
                 .code(),

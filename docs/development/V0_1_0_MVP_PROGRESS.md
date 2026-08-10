@@ -625,7 +625,9 @@ P.3 必须新增 additive Journal schema 与 pending-first replay；Artifact Ini
 
 ## MVP-03 / Checkpoint P.3：Attempt Progress Journal v7
 
-状态：实现完成，Worker Journal/lifecycle 定点测试与全工作区门禁通过；等待本检查点推送后的 CI。
+状态：实现完成，Worker Journal/lifecycle 定点测试与全工作区门禁通过。CI #94 的 Rust job 全绿；真实
+PostgreSQL 17 job 在执行 Progress 正向路径时发现 `0006` trigger 引用了不存在的 WorkPackage 列，修复随
+P.4 checkpoint 交付。
 
 当前完成：
 
@@ -660,3 +662,53 @@ cargo fmt --all -- --check / git diff --check                               PASS
 明确边界：P.3 交付 durable command ledger 与通用 executor，但 daemon 尚未自动规划/执行四阶段，Artifact Init
 也尚未改为使用最终 `LOCAL_VERIFY` response version。P.4 必须把 pending Progress 恢复置于 Artifact 之前，
 逐步驱动中心 Attempt，并只用第四条受验证回执的 version 初始化 Artifact。
+
+## MVP-03 / Checkpoint P.4：Progress-first Fixture 与 Artifact CAS
+
+状态：实现完成，Worker 46 项测试与全工作区门禁通过；等待本检查点推送后的 CI。
+
+当前完成：
+
+- daemon 的 pending-first 顺序升级为 Claim → Attempt Progress → Candidate Artifact → Lease command；任何
+  pending Progress 都在 Artifact 恢复和新副作用前执行，tick 失败时原 intent 仍是重启后的第一条命令；
+- fixture driver 在本地 Candidate seal 后读取完整 Claim 回执与 Progress history，只为缺失的下一阶段创建
+  typed intent，严格完成 Preparing、Planning、Implementing、LocalVerify；每一步 expected version 来自前一
+  受验证 response；
+- fixture evidence 明确分型：Preparing/Implementing 使用绑定 Attempt、runtime fingerprint、Package/base/tree
+  的 deterministic fixture attestation，Planning 使用 plan digest，LocalVerify 使用 hard-verification digest；
+  这些测试摘要不宣称是真实 jcode Evidence Bundle；
+- Candidate Artifact Init 的 Journal 门禁现在要求四条 Progress 全部完成，并把 `If-Match` 固定为最终
+  `LOCAL_VERIFY/version=10`；旧 Claim 的初始 `attempt_version=2` 会被拒绝，不能越过中心 Attempt 状态机；
+- daemon report 分开记录 resumed/completed Progress command；Fake Control Plane 维护真实的中心 Attempt
+  version/semantic sequence，并同样拒绝旧 version 的 Artifact Init；
+- 新故障注入覆盖首次 Progress 已在中心成功但 ACK 丢失：重启先恢复同一 key/body，中心 Progress effect
+  最终恰好 4 次，恢复完成前 Artifact effect 始终为 0，随后 Artifact Init/Chunk/Complete 恰好各一次；
+- 既有 Artifact Init ACK-loss 测试同步证明 Progress 四阶段不会在重启时重复执行。
+- CI #94 精确暴露 `enforce_attempt_progress_insert()` 对不存在的 `work_packages.active_lease_id` 与
+  `active_fencing_token` 的引用；trigger 已改为使用 schema 中真实存在且足够的 authority 链：active
+  Package → `active_attempt_id` → Attempt `lease_id/fencing_token` → ACTIVE Lease holder/expiry；静态合同新增
+  禁止这两个幽灵列；
+- 修复后的 0001..0006 已在 PGlite 实际执行，并成功插入一条满足 Project/Package/Attempt/Lease/fencing/
+  holder/expiry/version/semantic-sequence 全绑定的 `attempt_progress` 行。它验证迁移与 trigger 正向执行，但
+  真实 PostgreSQL 17 的最终证据仍须由本检查点 CI 提供。
+
+定点证据：
+
+```text
+cargo test -p agentforge-worker-daemon --locked --offline                   PASS (46 tests)
+cargo test -p agentforge-storage-postgres --all-features \
+  --locked --offline                                                        PASS
+PGlite 0001..0006 + Attempt Progress trigger positive insert                PASS
+bash tests/contract/workspace_layout.sh                                     PASS
+cargo build --workspace --locked --all-targets --offline                    PASS
+cargo test --workspace --locked --offline                                   PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                   PASS
+node --check crates/control-plane/assets/app.js                              PASS
+cargo fmt --all -- --check / git diff --check                               PASS
+```
+
+明确边界：P.4 仍使用 deterministic fixture driver/fixture Bundle，尚未实现中心原子的
+`RecordCandidate + VerificationRun::Queued`，也没有关闭 author Lease。下一纵切必须把已经 COMPLETE 的
+Artifact、最终 Attempt version、Candidate commit/tree 与作者证据绑定成不可变 Candidate，再交给独立验收；
+不能让 Worker 自行生成 Accepted Submission。

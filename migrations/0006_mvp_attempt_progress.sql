@@ -82,9 +82,7 @@ BEGIN
        AND attempt.lease_id = lease.id
        AND attempt.fencing_token = NEW.fencing_token
        AND package.state = 'ACTIVE'
-       AND package.active_attempt_id = attempt.id
-       AND package.active_lease_id = lease.id
-       AND package.active_fencing_token = lease.fencing_token;
+       AND package.active_attempt_id = attempt.id;
     IF NOT FOUND
        OR current_attempt_state <> NEW.state_after
        OR current_attempt_version <> NEW.attempt_version

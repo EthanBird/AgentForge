@@ -110,8 +110,9 @@ idempotency key、stage、请求摘要与创建时间先于 HTTP 调用写入 WA
 Progress 成功回执必须逐字段绑定 Project、Package、Attempt、Lease/fencing、目标状态、semantic sequence、
 服务端时间和 `expected_version + 2`。ACK 丢失时 executor 只重放原 actor/key/body；服务端返回首次成功 view
 后，Journal 用由请求创建时间和响应 `updated_at` 确定的完成时间落账，因此重试时钟不能改写历史。请求、
-回执与 pending→completed 转换受触发器保护且不可删除。schema v7 已提供 executor 与 pending 查询；daemon
-自动规划四阶段属于下一纵切，当前不会悄悄在 Artifact adapter 内补报进度。
+回执与 pending→completed 转换受触发器保护且不可删除。daemon 启动恢复顺序固定为 Claim → Progress →
+Artifact → Lease command；fixture driver 在本地 Candidate seal 后逐步执行四阶段，只有第四条受验证回执存在
+才会规划 Artifact Init。Progress 不会在 Artifact adapter 内隐式补报。
 
 Init、每个 Chunk、Complete 都以
 完整 typed command、actor、idempotency key、Attempt binding、请求摘要和创建时间先于 HTTP 调用提交；
@@ -128,12 +129,18 @@ v2、v3、v4、v5、v6 Journal 在独占 SQLite 迁移事务内逐级升级到 v
 的 Claim 没有可证明的中央 Attempt version，迁移会保留该历史行，但 Artifact workflow 返回“缺少可验证
 Claim 回执”，不得猜测常量 version。
 
-在显式 `driver_mode=fixture` 下，daemon 会在本地 hard verification 后持久化 Candidate seal，生成一个
-确定性的单 chunk canonical JSON 测试 Bundle，并按 Init → Chunk → Complete 顺序自动创建、执行上述 intent。
-启动时 pending Artifact command 的恢复优先于 Lease maintenance 和任何新规划；Init ACK 丢失后只回放原
-key/body，不建立第二个 Artifact。该载荷仅验证 wire、fencing、CAS、摘要和宕机恢复，不是 Git Bundle，
-也不能替代真实 jcode workspace 输出。Complete 后 Worker 仍停在 `HandingOffCandidate`；当前尚未调用
-`RecordCandidate`、关闭作者 Lease或启动独立 VerificationRun。
+在显式 `driver_mode=fixture` 下，daemon 会在本地 hard verification 后持久化 Candidate seal，先把
+Preparing/Planning/Implementing/LocalVerify 四条 Progress intent 逐条完成，再生成一个确定性的单 chunk
+canonical JSON 测试 Bundle，并按 Init → Chunk → Complete 顺序自动执行 Artifact intent。Preparing 与
+Implementing evidence 是绑定 Attempt/runtime/tree 的 fixture attestation；Planning 和 LocalVerify 分别使用
+本地 plan 与 verification digest。它们只用于测试纵切，不能冒充真实 jcode evidence bundle。
+
+启动时 pending Progress 的恢复严格早于 pending Artifact、Lease maintenance 和任何新规划；Progress 或
+Init ACK 丢失后只回放原 key/body，不建立第二个中心阶段或 Artifact。Journal 在 Init 注册时再次要求完整
+四阶段历史，并强制 `If-Match` 等于最终 `LOCAL_VERIFY` version；旧 Claim response 中的初始 Attempt version
+不能继续使用。Fixture Bundle 只验证 wire、fencing、CAS、摘要和宕机恢复，不是 Git Bundle。Complete 后
+Worker 仍停在 `HandingOffCandidate`；当前尚未调用 `RecordCandidate`、关闭作者 Lease 或启动独立
+VerificationRun。
 
 ## 3. 管理 CLI
 

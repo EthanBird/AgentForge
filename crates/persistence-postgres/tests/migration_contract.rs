@@ -43,6 +43,13 @@ fn attempt_progress_sql_is_typed_immutable_and_authority_bound() {
         );
     }
     assert!(!progress.contains("aggregate_snapshots"));
+    for nonexistent_column in ["package.active_lease_id", "package.active_fencing_token"] {
+        assert!(
+            !progress.contains(nonexistent_column),
+            "Attempt progress trigger referenced a nonexistent WorkPackage column: \
+             {nonexistent_column}"
+        );
+    }
 }
 
 #[test]
