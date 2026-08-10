@@ -606,7 +606,14 @@ impl PostgresMvpControlPlane {
                 attempt_event_seq,
             )
             .await?;
-            update_lease(&uow, &loaded, &lease_transition.aggregate, lease_event_seq).await?;
+            update_lease(
+                &uow,
+                &loaded,
+                &lease_transition.aggregate,
+                lease_event_seq,
+                now,
+            )
+            .await?;
             update_package_after_loss(
                 &uow,
                 &package,
@@ -704,7 +711,7 @@ impl PostgresMvpControlPlane {
                 .event_seq
                 .checked_add(1)
                 .ok_or(agentforge_application::PortError::Integrity)?;
-            update_lease(&uow, &loaded, &transition.aggregate, event_seq).await?;
+            update_lease(&uow, &loaded, &transition.aggregate, event_seq, now).await?;
             let event = build_event(
                 project_id,
                 AggregateId::Lease(lease_id),
@@ -1691,6 +1698,7 @@ async fn update_lease(
     loaded: &LoadedLease,
     lease: &Lease,
     event_seq: u64,
+    updated_at: ServerInstant,
 ) -> MvpResult<()> {
     let version = version_to_i64(lease.version)?;
     let previous_version = version_to_i64(loaded.lease.version)?;
@@ -1703,7 +1711,7 @@ async fn update_lease(
         .execute(
             "UPDATE leases \
              SET state = $2, expires_at = $3, version = $4, event_seq = $5, \
-                 updated_at = clock_timestamp() \
+                 updated_at = $10 \
              WHERE id = $1 AND version = $6 AND event_seq = $7 AND state = 'ACTIVE' \
                AND holder_node_id = $8 AND fencing_token = $9",
             &[
@@ -1716,6 +1724,7 @@ async fn update_lease(
                 &previous_event_seq,
                 lease.holder_node_id.as_uuid(),
                 &fencing_token,
+                &updated_at.0,
             ],
         )
         .await

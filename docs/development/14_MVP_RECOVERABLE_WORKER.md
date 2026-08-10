@@ -47,7 +47,7 @@ Granted -> Preparing -> Baseline -> Planning -> Implementing
 
 ## 3. SQLite Journal
 
-首次打开 Journal 会创建 schema version 2，并强制：
+首次打开 Journal 会创建 schema version 3，并强制：
 
 ```text
 PRAGMA journal_mode = WAL
@@ -66,6 +66,7 @@ PRAGMA quick_check = ok
 | `inbox` | 本地命令回执 | `(actor_id, idempotency_key)` 唯一、不可修改/删除 |
 | `outbox` | 待发控制面事件 | destination + semantic key 唯一、payload 不可变 |
 | `operations` | 外部副作用账本 | 先计划后执行、request immutable、Pending 只能单向完成 |
+| `claim_intents` | 远端 Claim 前的节点级意图 | actor/key 唯一、request immutable、Pending 只能完成 |
 
 每个正式命令采用以下顺序：
 
@@ -79,9 +80,9 @@ PRAGMA quick_check = ok
 Journal 在恢复时重算每条事实的 JCS SHA-256、整条 previous-digest 链和物化状态摘要；任一不一致均
 fail closed 为 `AF_WORKER_JOURNAL_INTEGRITY`。
 
-Schema version 1 是尚未携带执行快照的预发布开发格式，无法安全补造 AFWP/input；version 2 会明确
-拒绝打开旧格式，而不是在缺少冻结输入时继续执行。正式 `v0.1.0-mvp` 发布后，Journal 变更必须提供
-可验证迁移或显式导出/重新 Claim 流程。
+Schema version 1 是尚未携带执行快照的预发布开发格式，无法安全补造 AFWP/input，因此明确拒绝打开；
+version 2 到 version 3 使用单事务增加空的 `claim_intents` 账本，已有 Attempt、事实链和执行快照保持
+不变。正式 `v0.1.0-mvp` 发布后，Journal 变更必须提供可验证迁移或显式导出/重新 Claim 流程。
 
 ## 4. Claim handoff 与 Lease reconciliation
 
@@ -90,9 +91,11 @@ Git object format、canonical AFWP 和 input snapshot。PostgreSQL adapter 从 c
 重新验证 JCS hash；Worker 再次复核响应与已选择 Offer、Git object format 和 hash，之后才把 Grant
 与执行快照写入一个本地事务。
 
-`ClaimIntent` 固定 Package、command/correlation ID、idempotency key、Lease window 和本地 message
-ID。生产 daemon 必须在远端 Claim 前持久化该 intent；ACK 丢失时用同一个 intent 重放，不能重新从
-Offer 列表挑选另一个 Package。
+`ClaimIntentRecord` 固定 Offer、expected version、actor/executor/node、command/correlation ID、
+idempotency key、Lease window 和本地 message ID。Worker 在远端 Claim 前先把它写入
+`claim_intents`；远端失败或 ACK 丢失后，重启只会枚举 Pending record 并重放同一个 command，不能
+重新从 Offer 列表挑选另一个 Package。远端响应、本地 Grant 和执行快照成功后，该 record 才单向
+绑定 Attempt/Lease 并标记 Completed。
 
 启动 reconciliation 对每个非终态 Attempt 查询服务器 Lease，并核对 Project、Package、Attempt、
 Lease、holder node 和 generation：
@@ -138,7 +141,8 @@ cargo fmt --all -- --check
 - 外部 operation 先计划后执行、completion 原子性和 completion ACK-loss；
 - 模型提前声称完成但 hard criterion 失败时继续下一 Turn；
 - Worker 重启后查询原非幂等 Turn，并恢复 Pending Verification；
-- Claim 响应执行快照的双端摘要校验、本地 exact replay、漏收 Renew 导入和 Revoke 停止；
+- Claim 响应执行快照的双端摘要校验、远端调用前 durable intent、ACK-loss/restart exact replay、漏收
+  Renew 导入和 Revoke 停止；
 - Turn budget 与 Lease expiry 在启动 Executor 前阻止新副作用。
 
 ## 7. 下一纵切
@@ -146,7 +150,7 @@ cargo fmt --all -- --check
 MVP-02 的下一检查点按顺序接入：
 
 1. Worker enrollment、本地节点身份与 loopback HTTP / LAN mTLS 控制面 adapter；
-2. Claim intent 的节点级持久化、自动 Renew 调度和 Release；
+2. 自动 Renew 调度和 Release；
 3. workspace/日志/凭据目录隔离与受控命令执行；
 4. jcode bridge 版本握手、能力探测、operation query 与 sanitized transcript；
 5. Candidate Artifact 上传及 `RecordCandidate` handoff。

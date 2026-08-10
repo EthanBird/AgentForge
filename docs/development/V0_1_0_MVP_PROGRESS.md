@@ -107,7 +107,15 @@ HTTP handler 合同测试、API/CLI 使用说明、本地完整 workspace 门禁
 
 ## MVP-02 / Checkpoint D：Claim 执行快照与启动 Lease 对账
 
-状态：本地实现和定点门禁完成；等待本次远端检查点与 CI。
+状态：远端 Rust job 通过；PostgreSQL 17 job 暴露 Renew response/row 时间不一致，修复已进入
+Checkpoint E，等待追加 CI 复核。
+
+- 远端提交：`f4fa14a760118cb6d50763caf19544f3b31289ac`
+- GitHub Actions：CI #57 / run `31348181584`
+- Rust job：workspace build、format、boundary、Clippy、全部测试通过
+- PostgreSQL 17 job：migration 与 UoW 通过；MVP contract 在 Renew 后发现 response 的 `updated_at`
+  比 typed row 早约 0.8ms。根因是响应使用事务 `now`、SQL 更新使用稍后的 `clock_timestamp()`；
+  Checkpoint E 改为 canonical row 与响应共用同一个数据库权威时间。
 
 当前完成：
 
@@ -121,5 +129,22 @@ HTTP handler 合同测试、API/CLI 使用说明、本地完整 workspace 门禁
 - 本地 Lease renewal 事实强制 generation、旧/新 expiry、服务器更新时间和 replay shape；
 - Worker 定点测试增至 18 项；application、storage 和 Worker 严格 Clippy/测试通过。
 
-仍待：HTTP/mTLS transport、Claim intent 节点级预登记、自动 Renew/Release 调度、enrollment、sandbox
-与 jcode bridge。
+Checkpoint D 当时仍待 Claim intent 节点级预登记（现由 E 关闭）；其余仍待 HTTP/mTLS transport、自动
+Renew/Release 调度、enrollment、sandbox 与 jcode bridge。
+
+## MVP-02 / Checkpoint E：Durable Claim Intent 与 CI 时间一致性修复
+
+状态：本地实现与完整 workspace 门禁通过；等待提交与远端 PostgreSQL 17 复核。
+
+当前完成：
+
+- Journal schema v3 增加不可变 `claim_intents` 账本；Offer、expected version、actor/executor/node、
+  command/correlation ID、idempotency key 和 Lease window 在远端调用前持久化；
+- 远端失败或 ACK 丢失后，重启从 Pending record 精确重放；成功后单向绑定 Attempt/Lease，changed
+  payload key reuse、请求篡改和删除均 fail closed；
+- 提供 v2→v3 单事务迁移，并验证已有 Attempt、事实链和执行快照保持可恢复；
+- Lease Renew/Release 的 typed row `updated_at` 与响应改为共用同一个 PostgreSQL 权威 `now`，关闭
+  CI #57 的亚毫秒时间漂移；
+- Worker 定点测试增至 21 项，覆盖远端失败→进程重启→exact Claim replay。
+
+仍待：自动 Renew/Release 调度、HTTP/mTLS Worker adapter、enrollment、sandbox 与 jcode bridge。

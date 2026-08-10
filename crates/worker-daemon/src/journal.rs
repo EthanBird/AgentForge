@@ -6,9 +6,10 @@
 
 use std::{path::Path, str::FromStr};
 
-use agentforge_application::PackageExecutionSnapshot;
+use agentforge_application::{ClaimPackageInput, MvpCommand, OfferView, PackageExecutionSnapshot};
 use agentforge_domain::{
-    ActorId, AttemptId, IdempotencyKey, ProtocolKey, ServerInstant, Sha256Digest,
+    ActorId, AttemptId, CommandId, CorrelationId, ExecutorId, IdempotencyKey, LeaseId, NodeId,
+    ProtocolKey, ServerInstant, Sha256Digest, work_package::WorkPackageState,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -20,7 +21,7 @@ use crate::runtime::{
     AttemptGrant, WorkerAttemptState, WorkerCommandEnvelope, WorkerError, WorkerFact, grant_fact,
 };
 
-const JOURNAL_SCHEMA_VERSION: i64 = 2;
+const JOURNAL_SCHEMA_VERSION: i64 = 3;
 const OUTBOX_DESTINATION: &str = "control-plane.worker-events";
 const MAX_INLINE_EXECUTION_BYTES: usize = 1_048_576;
 
@@ -112,6 +113,23 @@ CREATE TABLE operations (
       OR (state = 'completed' AND result_digest IS NOT NULL AND finished_at IS NOT NULL))
 );
 
+CREATE TABLE claim_intents (
+  intent_id TEXT PRIMARY KEY,
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  attempt_id TEXT REFERENCES attempts(attempt_id),
+  lease_id TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  CHECK ((state = 'pending' AND attempt_id IS NULL AND lease_id IS NULL AND completed_at IS NULL)
+      OR (state = 'completed' AND attempt_id IS NOT NULL AND lease_id IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
 CREATE INDEX operations_pending_idx
   ON operations (attempt_id, planned_at, operation_id)
   WHERE state = 'pending';
@@ -119,6 +137,10 @@ CREATE INDEX operations_pending_idx
 CREATE INDEX outbox_pending_idx
   ON outbox (available_at, outbox_id)
   WHERE delivered_at IS NULL;
+
+CREATE INDEX claim_intents_pending_idx
+  ON claim_intents (created_at, intent_id)
+  WHERE state = 'pending';
 
 CREATE TRIGGER attempts_binding_is_immutable
 BEFORE UPDATE ON attempts
@@ -217,6 +239,87 @@ BEFORE DELETE ON operations
 BEGIN
   SELECT RAISE(ABORT, 'operations cannot be deleted');
 END;
+
+CREATE TRIGGER claim_intents_request_is_immutable
+BEFORE UPDATE ON claim_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'claim intent request is immutable');
+END;
+
+CREATE TRIGGER claim_intents_state_is_monotonic
+BEFORE UPDATE ON claim_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.attempt_id IS NULL
+  OR NEW.lease_id IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'claim intent state is monotonic');
+END;
+
+CREATE TRIGGER claim_intents_cannot_be_deleted
+BEFORE DELETE ON claim_intents
+BEGIN
+  SELECT RAISE(ABORT, 'claim intents cannot be deleted');
+END;
+"#;
+
+const MIGRATE_V2_TO_V3: &str = r#"
+CREATE TABLE claim_intents (
+  intent_id TEXT PRIMARY KEY,
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+  intent_json TEXT NOT NULL,
+  intent_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  attempt_id TEXT REFERENCES attempts(attempt_id),
+  lease_id TEXT,
+  completed_at TEXT,
+  UNIQUE (actor_id, idempotency_key),
+  CHECK ((state = 'pending' AND attempt_id IS NULL AND lease_id IS NULL AND completed_at IS NULL)
+      OR (state = 'completed' AND attempt_id IS NOT NULL AND lease_id IS NOT NULL
+          AND completed_at IS NOT NULL))
+);
+
+CREATE INDEX claim_intents_pending_idx
+  ON claim_intents (created_at, intent_id)
+  WHERE state = 'pending';
+
+CREATE TRIGGER claim_intents_request_is_immutable
+BEFORE UPDATE ON claim_intents
+WHEN NEW.intent_id <> OLD.intent_id
+  OR NEW.actor_id <> OLD.actor_id
+  OR NEW.idempotency_key <> OLD.idempotency_key
+  OR NEW.intent_json <> OLD.intent_json
+  OR NEW.intent_digest <> OLD.intent_digest
+  OR NEW.created_at <> OLD.created_at
+BEGIN
+  SELECT RAISE(ABORT, 'claim intent request is immutable');
+END;
+
+CREATE TRIGGER claim_intents_state_is_monotonic
+BEFORE UPDATE ON claim_intents
+WHEN OLD.state <> 'pending'
+  OR NEW.state <> 'completed'
+  OR NEW.attempt_id IS NULL
+  OR NEW.lease_id IS NULL
+  OR NEW.completed_at IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'claim intent state is monotonic');
+END;
+
+CREATE TRIGGER claim_intents_cannot_be_deleted
+BEFORE DELETE ON claim_intents
+BEGIN
+  SELECT RAISE(ABORT, 'claim intents cannot be deleted');
+END;
 "#;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -254,6 +357,88 @@ impl JournalDisposition {
             Self::Applied(state) | Self::Replay(state) => state,
         }
     }
+}
+
+/// Durable request identity written before the Worker sends a remote Claim.
+/// The exact record is replayed after an ACK loss or process crash; selecting a
+/// fresh Offer or generating a new idempotency key is never part of recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimIntentRecord {
+    pub intent_id: Uuid,
+    pub offer: OfferView,
+    pub command: MvpCommand<ClaimPackageInput>,
+    pub created_at: ServerInstant,
+}
+
+impl ClaimIntentRecord {
+    fn validate(&self) -> JournalResult<()> {
+        let context = &self.command.context;
+        let input = &self.command.input;
+        if self.intent_id.is_nil()
+            || context.command_id.as_uuid().is_nil()
+            || context.actor_id.as_uuid().is_nil()
+            || context.correlation_id.as_uuid().is_nil()
+            || input.project_id.as_uuid().is_nil()
+            || input.package_id.as_uuid().is_nil()
+            || input.executor_id.as_uuid().is_nil()
+            || input.node_id.as_uuid().is_nil()
+            || self.offer.project_id != input.project_id
+            || self.offer.package_id != input.package_id
+            || context.expected_version != Some(self.offer.version)
+            || !(5..=3_600).contains(&input.lease_seconds)
+            || input.max_lease_seconds < input.lease_seconds
+            || input.max_lease_seconds > 86_400
+            || self.offer.max_attempts == 0
+            || self.offer.attempts_started >= self.offer.max_attempts
+            || !matches!(
+                self.offer.state,
+                WorkPackageState::Offered | WorkPackageState::ReworkReady
+            )
+        {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "claim_intent",
+            )));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn actor_id(&self) -> ActorId {
+        self.command.context.actor_id
+    }
+
+    #[must_use]
+    pub const fn executor_id(&self) -> ExecutorId {
+        self.command.input.executor_id
+    }
+
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.command.input.node_id
+    }
+
+    #[must_use]
+    pub const fn command_id(&self) -> CommandId {
+        self.command.context.command_id
+    }
+
+    #[must_use]
+    pub const fn correlation_id(&self) -> CorrelationId {
+        self.command.context.correlation_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimIntentRegistration {
+    Registered,
+    Existing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimIntentCompletion {
+    Completed,
+    Existing,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -495,6 +680,136 @@ fn decode_operation(raw: RawOperation) -> JournalResult<OperationPlan> {
     Ok(plan)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaimIntentState {
+    Pending,
+    Completed,
+}
+
+impl ClaimIntentState {
+    fn parse(value: &str) -> JournalResult<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            _ => Err(JournalError::Integrity),
+        }
+    }
+}
+
+struct StoredClaimIntent {
+    record: ClaimIntentRecord,
+    state: ClaimIntentState,
+    attempt_id: Option<AttemptId>,
+    lease_id: Option<LeaseId>,
+    completed_at: Option<ServerInstant>,
+}
+
+struct RawClaimIntent {
+    intent_id: String,
+    actor_id: String,
+    idempotency_key: String,
+    state: String,
+    intent_json: String,
+    intent_digest: String,
+    created_at: String,
+    attempt_id: Option<String>,
+    lease_id: Option<String>,
+    completed_at: Option<String>,
+}
+
+fn raw_claim_intent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawClaimIntent> {
+    Ok(RawClaimIntent {
+        intent_id: row.get(0)?,
+        actor_id: row.get(1)?,
+        idempotency_key: row.get(2)?,
+        state: row.get(3)?,
+        intent_json: row.get(4)?,
+        intent_digest: row.get(5)?,
+        created_at: row.get(6)?,
+        attempt_id: row.get(7)?,
+        lease_id: row.get(8)?,
+        completed_at: row.get(9)?,
+    })
+}
+
+fn decode_claim_intent(raw: RawClaimIntent) -> JournalResult<StoredClaimIntent> {
+    let record: ClaimIntentRecord = decode_stored(&raw.intent_json)?;
+    record.validate()?;
+    let state = ClaimIntentState::parse(&raw.state)?;
+    let attempt_id = raw
+        .attempt_id
+        .map(|value| AttemptId::from_str(&value).map_err(|_| JournalError::Integrity))
+        .transpose()?;
+    let lease_id = raw
+        .lease_id
+        .map(|value| LeaseId::from_str(&value).map_err(|_| JournalError::Integrity))
+        .transpose()?;
+    let completed_at = raw
+        .completed_at
+        .map(|value| parse_instant(&value))
+        .transpose()?;
+    let completion_shape_is_valid = match state {
+        ClaimIntentState::Pending => {
+            attempt_id.is_none() && lease_id.is_none() && completed_at.is_none()
+        }
+        ClaimIntentState::Completed => {
+            attempt_id.is_some() && lease_id.is_some() && completed_at.is_some()
+        }
+    };
+    if record.intent_id.to_string() != raw.intent_id
+        || record.actor_id().to_string() != raw.actor_id
+        || record.command.context.idempotency_key.as_str() != raw.idempotency_key
+        || instant_text(record.created_at) != raw.created_at
+        || digest_json(&record)?.to_string() != raw.intent_digest
+        || !completion_shape_is_valid
+        || completed_at.is_some_and(|instant| instant < record.created_at)
+    {
+        return Err(JournalError::Integrity);
+    }
+    Ok(StoredClaimIntent {
+        record,
+        state,
+        attempt_id,
+        lease_id,
+        completed_at,
+    })
+}
+
+fn load_claim_intent_by_id(
+    connection: &Connection,
+    intent_id: Uuid,
+) -> JournalResult<Option<StoredClaimIntent>> {
+    connection
+        .query_row(
+            "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
+                    created_at, attempt_id, lease_id, completed_at \
+             FROM claim_intents WHERE intent_id = ?1",
+            [intent_id.to_string()],
+            raw_claim_intent_row,
+        )
+        .optional()?
+        .map(decode_claim_intent)
+        .transpose()
+}
+
+fn load_claim_intent_by_key(
+    connection: &Connection,
+    actor_id: ActorId,
+    idempotency_key: &IdempotencyKey,
+) -> JournalResult<Option<StoredClaimIntent>> {
+    connection
+        .query_row(
+            "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
+                    created_at, attempt_id, lease_id, completed_at \
+             FROM claim_intents WHERE actor_id = ?1 AND idempotency_key = ?2",
+            params![actor_id.to_string(), idempotency_key.as_str()],
+            raw_claim_intent_row,
+        )
+        .optional()?
+        .map(decode_claim_intent)
+        .transpose()
+}
+
 impl JournalError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
@@ -556,6 +871,19 @@ impl Journal {
                     return Err(error.into());
                 }
             }
+            2 => {
+                connection.execute_batch("BEGIN IMMEDIATE")?;
+                let migrated = connection
+                    .execute_batch(MIGRATE_V2_TO_V3)
+                    .and_then(|()| {
+                        connection.pragma_update(None, "user_version", JOURNAL_SCHEMA_VERSION)
+                    })
+                    .and_then(|()| connection.execute_batch("COMMIT"));
+                if let Err(error) = migrated {
+                    let _ = connection.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+            }
             JOURNAL_SCHEMA_VERSION => {}
             _ => return Err(JournalError::UnsupportedSchema),
         }
@@ -568,6 +896,129 @@ impl Journal {
 
     pub fn handle(&mut self, request: &JournalRequest) -> JournalResult<JournalDisposition> {
         self.handle_inner(request, None, CrashPoint::None)
+    }
+
+    pub fn register_claim_intent(
+        &mut self,
+        intent: &ClaimIntentRecord,
+    ) -> JournalResult<ClaimIntentRegistration> {
+        intent.validate()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = load_claim_intent_by_id(&transaction, intent.intent_id)? {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(ClaimIntentRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        if let Some(existing) = load_claim_intent_by_key(
+            &transaction,
+            intent.actor_id(),
+            &intent.command.context.idempotency_key,
+        )? {
+            if existing.record == *intent {
+                transaction.commit()?;
+                return Ok(ClaimIntentRegistration::Existing);
+            }
+            return Err(JournalError::IdempotencyKeyReused);
+        }
+        let intent_json = encode(intent)?;
+        let intent_digest = digest_json(intent)?;
+        transaction.execute(
+            "INSERT INTO claim_intents \
+             (intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, \
+              created_at) VALUES (?1, ?2, ?3, 'pending', ?4, ?5, ?6)",
+            params![
+                intent.intent_id.to_string(),
+                intent.actor_id().to_string(),
+                intent.command.context.idempotency_key.as_str(),
+                intent_json,
+                intent_digest.to_string(),
+                instant_text(intent.created_at),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ClaimIntentRegistration::Registered)
+    }
+
+    pub fn pending_claim_intents(&self) -> JournalResult<Vec<ClaimIntentRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT intent_id, actor_id, idempotency_key, state, intent_json, intent_digest, created_at, \
+                    attempt_id, lease_id, completed_at \
+             FROM claim_intents WHERE state = 'pending' ORDER BY created_at, intent_id",
+        )?;
+        let rows = statement.query_map([], raw_claim_intent_row)?;
+        rows.map(|row| decode_claim_intent(row?).map(|stored| stored.record))
+            .collect()
+    }
+
+    pub fn complete_claim_intent(
+        &mut self,
+        intent_id: Uuid,
+        attempt_id: AttemptId,
+        lease_id: LeaseId,
+        completed_at: ServerInstant,
+    ) -> JournalResult<ClaimIntentCompletion> {
+        if intent_id.is_nil() || attempt_id.as_uuid().is_nil() || lease_id.as_uuid().is_nil() {
+            return Err(JournalError::Runtime(WorkerError::InvalidArgument(
+                "claim_intent_completion",
+            )));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let stored =
+            load_claim_intent_by_id(&transaction, intent_id)?.ok_or(JournalError::Integrity)?;
+        if stored.state == ClaimIntentState::Completed {
+            if stored.attempt_id == Some(attempt_id)
+                && stored.lease_id == Some(lease_id)
+                && stored.completed_at == Some(completed_at)
+            {
+                transaction.commit()?;
+                return Ok(ClaimIntentCompletion::Existing);
+            }
+            return Err(JournalError::Integrity);
+        }
+        if completed_at < stored.record.created_at {
+            return Err(JournalError::Runtime(WorkerError::TimeRegressed));
+        }
+        let attempt_binding = transaction
+            .query_row(
+                "SELECT package_id, package_revision, lease_id FROM attempts WHERE attempt_id = ?1",
+                [attempt_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(JournalError::Integrity)?;
+        if attempt_binding.0 != stored.record.offer.package_id.to_string()
+            || attempt_binding.1 != i64::from(stored.record.offer.revision.get())
+            || attempt_binding.2 != lease_id.to_string()
+        {
+            return Err(JournalError::Integrity);
+        }
+        let changed = transaction.execute(
+            "UPDATE claim_intents SET state = 'completed', attempt_id = ?2, lease_id = ?3, \
+                    completed_at = ?4 WHERE intent_id = ?1 AND state = 'pending'",
+            params![
+                intent_id.to_string(),
+                attempt_id.to_string(),
+                lease_id.to_string(),
+                instant_text(completed_at),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(JournalError::Integrity);
+        }
+        transaction.commit()?;
+        Ok(ClaimIntentCompletion::Completed)
     }
 
     pub fn plan_operation(
@@ -1286,9 +1737,10 @@ impl CrashPoint {
 
 #[cfg(test)]
 mod tests {
+    use agentforge_application::MvpCommandContext;
     use agentforge_domain::{
         AggregateVersion, FencingToken, GitObjectId, LeaseId, PackageId, PackageRevision,
-        ServerInstant,
+        PackageRevisionId, ProjectId, ServerInstant,
     };
     use tempfile::TempDir;
     use time::macros::datetime;
@@ -1355,6 +1807,44 @@ mod tests {
                 execution: execution(),
             },
         )
+    }
+
+    fn claim_intent() -> ClaimIntentRecord {
+        ClaimIntentRecord {
+            intent_id: Uuid::from_bytes([40; 16]),
+            offer: OfferView {
+                project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+                package_id: grant().package_id,
+                package_key: ProtocolKey::new("fixture-package").expect("package key"),
+                revision_id: PackageRevisionId::from_uuid(Uuid::from_bytes([42; 16])),
+                revision: grant().package_revision,
+                state: WorkPackageState::Offered,
+                priority: 10,
+                attempts_started: 0,
+                max_attempts: 3,
+                version: AggregateVersion::new(1),
+            },
+            command: MvpCommand {
+                context: MvpCommandContext {
+                    command_id: id(43),
+                    actor_id: id(9),
+                    idempotency_key: IdempotencyKey::new("remote-claim-fixture")
+                        .expect("idempotency key"),
+                    correlation_id: id(44),
+                    causation_id: None,
+                    expected_version: Some(AggregateVersion::new(1)),
+                },
+                input: ClaimPackageInput {
+                    project_id: ProjectId::from_uuid(Uuid::from_bytes([41; 16])),
+                    package_id: grant().package_id,
+                    executor_id: id(45),
+                    node_id: id(46),
+                    lease_seconds: 60,
+                    max_lease_seconds: 600,
+                },
+            },
+            created_at: at(0),
+        }
     }
 
     fn apply_request(
@@ -1424,6 +1914,130 @@ mod tests {
     }
 
     #[test]
+    fn claim_intent_is_durable_exactly_replayable_and_completed_after_grant() {
+        let (_directory, mut journal) = fixture();
+        let intent = claim_intent();
+        assert_eq!(
+            journal
+                .register_claim_intent(&intent)
+                .expect("register intent"),
+            ClaimIntentRegistration::Registered
+        );
+        assert_eq!(
+            journal
+                .register_claim_intent(&intent)
+                .expect("exact intent replay"),
+            ClaimIntentRegistration::Existing
+        );
+        assert_eq!(
+            journal.pending_claim_intents().expect("pending intents"),
+            vec![intent.clone()]
+        );
+
+        let mut reused = intent.clone();
+        reused.command.input.lease_seconds = 61;
+        assert_eq!(
+            journal
+                .register_claim_intent(&reused)
+                .expect_err("changed intent reuses the key")
+                .code(),
+            "AF_IDEMPOTENCY_KEY_REUSED"
+        );
+
+        journal.handle(&grant_request()).expect("grant");
+        assert_eq!(
+            journal
+                .complete_claim_intent(
+                    intent.intent_id,
+                    grant().attempt_id,
+                    grant().lease_id,
+                    at(1)
+                )
+                .expect("complete intent"),
+            ClaimIntentCompletion::Completed
+        );
+        assert_eq!(
+            journal
+                .complete_claim_intent(
+                    intent.intent_id,
+                    grant().attempt_id,
+                    grant().lease_id,
+                    at(1)
+                )
+                .expect("completion replay"),
+            ClaimIntentCompletion::Existing
+        );
+        assert!(
+            journal
+                .pending_claim_intents()
+                .expect("no pending intent")
+                .is_empty()
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "UPDATE claim_intents SET intent_json = '{}' WHERE intent_id = ?1",
+                    [intent.intent_id.to_string()],
+                )
+                .is_err()
+        );
+        assert!(
+            journal
+                .connection
+                .execute(
+                    "DELETE FROM claim_intents WHERE intent_id = ?1",
+                    [intent.intent_id.to_string()],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_v2_is_upgraded_without_losing_existing_attempts() {
+        let (directory, mut journal) = fixture();
+        let state = journal
+            .handle(&grant_request())
+            .expect("grant before migration")
+            .state()
+            .clone();
+        journal
+            .connection
+            .execute_batch(
+                "DROP TRIGGER claim_intents_request_is_immutable;
+                 DROP TRIGGER claim_intents_state_is_monotonic;
+                 DROP TRIGGER claim_intents_cannot_be_deleted;
+                 DROP INDEX claim_intents_pending_idx;
+                 DROP TABLE claim_intents;
+                 PRAGMA user_version = 2;",
+            )
+            .expect("downgrade fixture to the exact v2 delta");
+        drop(journal);
+
+        let mut reopened =
+            Journal::open(directory.path().join("worker.sqlite3")).expect("migrate v2 to v3");
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("schema version"),
+            3
+        );
+        assert_eq!(
+            reopened
+                .verify_attempt(state.attempt_id())
+                .expect("existing attempt survives"),
+            state
+        );
+        assert_eq!(
+            reopened
+                .register_claim_intent(&claim_intent())
+                .expect("new table works"),
+            ClaimIntentRegistration::Registered
+        );
+    }
+
+    #[test]
     fn journal_is_wal_full_hash_chained_and_receipt_first() {
         let (_directory, mut journal) = fixture();
         let request = grant_request();
@@ -1432,7 +2046,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .expect("schema version"),
-            2
+            3
         );
         let applied = journal.handle(&request).expect("grant applied");
         assert!(matches!(applied, JournalDisposition::Applied(_)));

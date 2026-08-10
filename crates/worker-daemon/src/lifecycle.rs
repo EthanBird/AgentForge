@@ -12,7 +12,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    journal::{Journal, JournalCommand, JournalError, JournalRequest},
+    journal::{ClaimIntentRecord, Journal, JournalCommand, JournalError, JournalRequest},
     runtime::{
         AttemptGrant, LeaseLossReason, WorkerAttemptState, WorkerCommandEnvelope,
         WorkerCommandKind, WorkerPhase,
@@ -93,6 +93,7 @@ pub struct ClaimIntent {
     pub local_message_id: Uuid,
     pub lease_seconds: u32,
     pub max_lease_seconds: u32,
+    pub created_at: ServerInstant,
 }
 
 impl ClaimIntent {
@@ -219,8 +220,34 @@ pub async fn claim_offer(
             max_lease_seconds: intent.max_lease_seconds,
         },
     };
-    let claimed = control.claim_package(&command).await?;
-    validate_claim_response(&claimed, intent)?;
+    let record = ClaimIntentRecord {
+        intent_id: intent.local_message_id,
+        offer: intent.offer.clone(),
+        command,
+        created_at: intent.created_at,
+    };
+    execute_claim_intent(control, journal, &record).await
+}
+
+/// Replays a Claim that was durably registered before a previous remote call.
+/// This is the only recovery path for a pending intent: it preserves the exact
+/// Package, expected version, actor, holder, command ID and idempotency key.
+pub async fn resume_claim_intent(
+    control: &dyn WorkerControlPlane,
+    journal: &mut Journal,
+    record: &ClaimIntentRecord,
+) -> LifecycleResult<ClaimedAttempt> {
+    execute_claim_intent(control, journal, record).await
+}
+
+async fn execute_claim_intent(
+    control: &dyn WorkerControlPlane,
+    journal: &mut Journal,
+    record: &ClaimIntentRecord,
+) -> LifecycleResult<ClaimedAttempt> {
+    journal.register_claim_intent(record)?;
+    let claimed = control.claim_package(&record.command).await?;
+    validate_claim_response(&claimed, &record.offer)?;
     let grant = AttemptGrant {
         attempt_id: claimed.attempt_id,
         package_id: claimed.package_id,
@@ -240,8 +267,8 @@ pub async fn claim_offer(
     .map_err(|_| LifecycleError::InvalidResponse)?;
     let state = journal
         .handle(&JournalRequest {
-            message_id: intent.local_message_id,
-            actor_id: identity.actor_id,
+            message_id: record.intent_id,
+            actor_id: record.actor_id(),
             idempotency_key: local_key,
             command: JournalCommand::Grant {
                 grant,
@@ -250,6 +277,12 @@ pub async fn claim_offer(
         })?
         .state()
         .clone();
+    journal.complete_claim_intent(
+        record.intent_id,
+        claimed.attempt_id,
+        claimed.lease_id,
+        max_instant(record.created_at, claimed.granted_at),
+    )?;
     Ok(ClaimedAttempt {
         state,
         execution: claimed.execution,
@@ -373,7 +406,7 @@ pub async fn reconcile_attempt(
     })
 }
 
-fn validate_claim_response(claimed: &ClaimedWork, intent: &ClaimIntent) -> LifecycleResult<()> {
+fn validate_claim_response(claimed: &ClaimedWork, offer: &OfferView) -> LifecycleResult<()> {
     let execution_bytes = serde_json_canonicalizer::to_vec(&claimed.execution.canonical_document)
         .map_err(|_| LifecycleError::InvalidResponse)?;
     let input_bytes = serde_json_canonicalizer::to_vec(&claimed.execution.input_snapshot)
@@ -383,11 +416,11 @@ fn validate_claim_response(claimed: &ClaimedWork, intent: &ClaimIntent) -> Lifec
     } else {
         "sha256"
     };
-    if claimed.project_id != intent.offer.project_id
-        || claimed.package_id != intent.offer.package_id
-        || claimed.revision_id != intent.offer.revision_id
-        || claimed.execution.revision != intent.offer.revision
-        || claimed.package_version.get() != intent.offer.version.get().saturating_add(1)
+    if claimed.project_id != offer.project_id
+        || claimed.package_id != offer.package_id
+        || claimed.revision_id != offer.revision_id
+        || claimed.execution.revision != offer.revision
+        || claimed.package_version.get() != offer.version.get().saturating_add(1)
         || claimed.attempt_id.as_uuid().is_nil()
         || claimed.lease_id.as_uuid().is_nil()
         || claimed.granted_at >= claimed.expires_at
@@ -452,6 +485,7 @@ fn next_message_id(value: Uuid) -> Uuid {
 mod tests {
     use std::sync::Mutex;
 
+    use agentforge_application::PortError;
     use agentforge_domain::{
         AggregateVersion, FencingToken, GitObjectId, LeaseId, PackageRevision, ProtocolKey,
     };
@@ -538,6 +572,7 @@ mod tests {
         claimed: ClaimedWork,
         lease: Mutex<LeaseView>,
         claims: Mutex<u32>,
+        fail_next_claim: Mutex<bool>,
     }
 
     impl WorkerControlPlane for FakeControl {
@@ -552,6 +587,9 @@ mod tests {
         ) -> MvpFuture<'a, ClaimedWork> {
             let claimed = self.claimed.clone();
             *self.claims.lock().expect("claims lock") += 1;
+            if std::mem::take(&mut *self.fail_next_claim.lock().expect("failure lock")) {
+                return Box::pin(async { Err(MvpError::Port(PortError::Unavailable)) });
+            }
             Box::pin(async move { Ok(claimed) })
         }
 
@@ -582,6 +620,7 @@ mod tests {
             local_message_id: Uuid::from_bytes([12; 16]),
             lease_seconds: 60,
             max_lease_seconds: 600,
+            created_at: at(0),
         }
     }
 
@@ -593,6 +632,7 @@ mod tests {
             claimed: claimed(),
             lease: Mutex::new(lease(LeaseState::Active, at(60), at(0))),
             claims: Mutex::new(0),
+            fail_next_claim: Mutex::new(false),
         };
         (directory, journal, control)
     }
@@ -616,7 +656,35 @@ mod tests {
             Some(execution())
         );
         assert_eq!(*control.claims.lock().expect("claims"), 2);
+        assert!(journal.pending_claim_intents()?.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn remote_claim_failure_leaves_a_durable_intent_for_exact_restart_replay() {
+        let (directory, mut journal, control) = fixture();
+        *control.fail_next_claim.lock().expect("failure") = true;
+        let error = claim_offer(&control, &mut journal, identity(), &intent())
+            .await
+            .expect_err("simulated transport failure");
+        assert_eq!(error.code(), "AF_UNAVAILABLE");
+        let pending = journal.pending_claim_intents().expect("pending intent");
+        assert_eq!(pending.len(), 1);
+        drop(journal);
+
+        let mut reopened =
+            Journal::open(directory.path().join("worker.sqlite3")).expect("reopen journal");
+        let resumed = resume_claim_intent(&control, &mut reopened, &pending[0])
+            .await
+            .expect("resume exact intent");
+        assert_eq!(resumed.state.phase(), WorkerPhase::Granted);
+        assert!(
+            reopened
+                .pending_claim_intents()
+                .expect("intent completed")
+                .is_empty()
+        );
+        assert_eq!(*control.claims.lock().expect("claims"), 2);
     }
 
     #[tokio::test]
