@@ -665,9 +665,7 @@ cargo fmt --all -- --check / git diff --check                               PASS
 
 ## MVP-03 / Checkpoint P.4：Progress-first Fixture 与 Artifact CAS
 
-状态：实现完成，Worker 46 项测试与全工作区门禁通过。CI #96 的迁移、transactional UoW 步骤
-通过；MVP PostgreSQL 合同发现 Progress adapter 把两个不同 aggregate version 的事件误当成一个
-multi-event batch，修复随当前 checkpoint 重新验证。
+状态：完成；CI #98 / run `31360986472` 的远端 workspace 与真实 PostgreSQL 17 job 全绿。
 
 当前完成：
 
@@ -697,6 +695,8 @@ multi-event batch，修复随当前 checkpoint 重新验证。
   phase transition 与 `ReportProgress` 时，把两个各自拥有 aggregate version 的事件一次传给“同版本事件
   batch”接口。adapter 现按顺序执行两次 `append_events`，仍处于同一 Serializable transaction，receipt、
   outbox 与两条事件继续全有或全无。
+- CI #98 复验通过 migration、transactional UoW、MVP market/Lease/Progress 全链合同；Rust build、Clippy、
+  workspace tests 同样通过。P.4 的真实 PostgreSQL 发布证据至此闭合。
 
 定点证据：
 
@@ -718,3 +718,51 @@ cargo fmt --all -- --check / git diff --check                               PASS
 `RecordCandidate + VerificationRun::Queued`，也没有关闭 author Lease。下一纵切必须把已经 COMPLETE 的
 Artifact、最终 Attempt version、Candidate commit/tree 与作者证据绑定成不可变 Candidate，再交给独立验收；
 不能让 Worker 自行生成 Accepted Submission。
+
+## MVP-03 / Checkpoint P.5：原子 Candidate Handoff
+
+状态：application + PostgreSQL 实现完成，定点门禁与 PGlite 0001..0007 正反实跑通过；等待本检查点
+推送后的 GitHub Actions PostgreSQL 17 复验。
+
+当前完成：
+
+- application 新增 typed `RecordCandidateInput` / `RecordedCandidate` 与 `MvpControlPlane::record_candidate`；
+  外部作者只提交预留 Artifact ID、最终 Attempt CAS、当前 Lease/fencing 和受 AgentForge 命名空间约束的分支，不能替换
+  Artifact 已冻结的 Candidate ID、commit、tree、Package hash、Bundle 或 Author Evidence；
+- PostgreSQL adapter 保持 receipt-first，并按固定 Package → Attempt → Lease → COMPLETE Artifact 锁序重验
+  Project/Attempt/Lease/node/fencing、服务器到期时间、最终 `LOCAL_VERIFY` version 及全部 Artifact lineage；
+- 单个 Serializable transaction 内创建不可变 Candidate、`VerificationRun(QUEUED)` 与
+  `VerifyCandidate(PENDING)` obligation，同时 CAS `Attempt -> CANDIDATE`、`Package -> VERIFYING`、
+  `Lease -> RELEASED`，追加五条领域事件、五条 Outbox 消息与一条命令回执；任一写入失败全量回滚；
+- ACK-loss exact replay 在读取当前 Lease 前返回首次 `RecordedCandidate`；相同 actor/key 改 branch 返回
+  `AF_IDEMPOTENCY_KEY_REUSED`，新 key 在作者 Lease 已关闭后返回 `AF_LEASE_STALE`，不会创建第二条 lineage；
+- additive `0007_mvp_candidate_handoff.sql` 为 `VerificationRun.candidate_id` 加一对一约束，并安装
+  deferred commit trigger。任何 Candidate 若在提交点缺少匹配的 CANDIDATE Attempt、VERIFYING Package、
+  RELEASED Lease、QUEUED run 或 PENDING obligation，数据库直接拒绝整个事务；
+- Package loader 只把真正 ACTIVE 的 Lease 投影为 `active_lease_id/fencing_token`；进入 VERIFYING 后保留
+  active Attempt，但不会把已经 RELEASED 的作者 Lease误报为仍可写。
+
+定点证据：
+
+```text
+cargo check -p agentforge-application -p agentforge-storage-postgres \
+  -p agentforge-control-plane --all-targets --locked --offline              PASS
+cargo test -p agentforge-storage-postgres --all-features \
+  --locked --offline                                                        PASS (本机 PG 条件用例明确 skip)
+cargo clippy -p agentforge-application -p agentforge-storage-postgres \
+  -p agentforge-control-plane --all-targets --all-features \
+  --locked --offline -- -D warnings                                         PASS
+PGlite 0001..0007 + partial-handoff rollback + complete five-state handoff   PASS
+bash tests/contract/workspace_layout.sh                                      PASS
+cargo build --workspace --locked --all-targets --offline                     PASS
+cargo test --workspace --locked --offline                                    PASS
+cargo clippy --workspace --locked --all-targets --all-features \
+  --offline -- -D warnings                                                   PASS
+node --check crates/control-plane/assets/app.js                              PASS
+cargo fmt --all -- --check / git diff --check                               PASS
+```
+
+明确边界：P.5 只完成中心 application/PostgreSQL 权威事务，尚未暴露 RecordCandidate HTTP route，也尚未把
+Worker Journal 的 `HandingOffCandidate` 接到该命令。下一 checkpoint 必须先交付 wire/adapter，再新增 durable
+SQLite Candidate handoff intent 与 pending-first ACK-loss 恢复；独立 Verifier 仍是后续阶段，作者 Worker 绝不
+生成 Submission 或验收结论。

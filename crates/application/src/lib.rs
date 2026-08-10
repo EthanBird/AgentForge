@@ -17,8 +17,9 @@ pub use mvp::{
     CreateProjectInput, InitCandidateArtifactInput, LeaseReconciliationReport, LeaseView,
     ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane, MvpError, MvpFuture,
     MvpRemoteError, MvpResult, OfferView, PackageExecutionSnapshot, ProjectView,
-    PublishPackageInput, PublishedPackage, ReconcileExpiredLeasesQuery, ReleaseLeaseInput,
-    RenewLeaseInput, ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
+    PublishPackageInput, PublishedPackage, ReconcileExpiredLeasesQuery, RecordCandidateInput,
+    RecordedCandidate, ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
+    UploadCandidateArtifactChunkInput,
 };
 pub use ports::{
     AppendEventsReceipt, Clock, EventAppendPort, EventRecord, IdGenerator, Isolation, PortError,

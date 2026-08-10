@@ -10,8 +10,8 @@ use agentforge_domain::{
     ActorId, AggregateVersion, ArtifactRef, AttemptId, CandidateArtifactId, CandidateArtifactState,
     CandidateId, CommandId, CommandMetadata, CorrelationId, EventId, ExecutorId, FencingToken,
     GitObjectId, IdempotencyKey, LeaseId, NodeId, PackageId, PackageRevision, PackageRevisionId,
-    ProjectId, ProtocolKey, ServerInstant, Sha256Digest, attempt::AttemptState, lease::LeaseState,
-    work_package::WorkPackageState,
+    ProjectId, ProtocolKey, ServerInstant, Sha256Digest, VerificationRunId, attempt::AttemptState,
+    candidate::VerificationRunState, lease::LeaseState, work_package::WorkPackageState,
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
@@ -487,6 +487,46 @@ pub struct CompleteCandidateArtifactInput {
     pub bundle_uri: String,
 }
 
+/// Atomically seals one COMPLETE author Artifact into the immutable Candidate
+/// lineage and queues its independent verification run. The Candidate ID is
+/// the server-reserved ID already bound to `artifact_id`; callers cannot
+/// choose a replacement lineage at handoff time. `branch` is restricted to
+/// the server-owned AgentForge namespace and remains part of the signed
+/// lineage input.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordCandidateInput {
+    pub project_id: ProjectId,
+    pub attempt_id: AttemptId,
+    pub artifact_id: CandidateArtifactId,
+    pub lease_id: LeaseId,
+    pub node_id: NodeId,
+    pub fencing_token: FencingToken,
+    pub branch: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedCandidate {
+    pub project_id: ProjectId,
+    pub package_id: PackageId,
+    pub revision_id: PackageRevisionId,
+    pub attempt_id: AttemptId,
+    pub artifact_id: CandidateArtifactId,
+    pub candidate_id: CandidateId,
+    pub verification_run_id: VerificationRunId,
+    pub candidate_commit: GitObjectId,
+    pub tree_hash: GitObjectId,
+    pub branch: String,
+    pub verification_state: VerificationRunState,
+    pub sealed_at: ServerInstant,
+    pub candidate_version: AggregateVersion,
+    pub verification_run_version: AggregateVersion,
+    pub attempt_version: AggregateVersion,
+    pub package_version: AggregateVersion,
+    pub lease_version: AggregateVersion,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RenewLeaseInput {
@@ -582,6 +622,11 @@ pub trait MvpControlPlane: Send + Sync {
         &'a self,
         command: &'a MvpCommand<CompleteCandidateArtifactInput>,
     ) -> MvpFuture<'a, CandidateArtifactView>;
+
+    fn record_candidate<'a>(
+        &'a self,
+        command: &'a MvpCommand<RecordCandidateInput>,
+    ) -> MvpFuture<'a, RecordedCandidate>;
 
     fn renew_lease<'a>(
         &'a self,

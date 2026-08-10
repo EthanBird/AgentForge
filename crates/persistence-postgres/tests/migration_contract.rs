@@ -13,11 +13,34 @@ fn migration_manifest_and_repository_files_match() {
         "migrations/0004_m1_uow.sql",
         "migrations/0005_mvp_candidates.sql",
         "migrations/0006_mvp_attempt_progress.sql",
+        "migrations/0007_mvp_candidate_handoff.sql",
     ];
     assert_eq!(MIGRATIONS.len(), expected.len());
     for (migration, relative_path) in MIGRATIONS.iter().zip(expected) {
         let bytes = fs::read(root.join(relative_path)).expect("migration file exists");
         assert_eq!(bytes, migration.sql.as_bytes(), "embedded SQL drifted");
+    }
+}
+
+#[test]
+fn candidate_handoff_is_one_to_one_and_commit_atomic() {
+    let handoff = MIGRATIONS[6].sql;
+    for required in [
+        "verification_runs_one_per_candidate",
+        "obligations_one_verify_candidate_idx",
+        "CREATE CONSTRAINT TRIGGER candidate_handoff_is_atomic",
+        "DEFERRABLE INITIALLY DEFERRED",
+        "attempt.state = 'CANDIDATE'",
+        "package.state = 'VERIFYING'",
+        "author_lease.state = 'RELEASED'",
+        "run.state = 'QUEUED'",
+        "obligation.obligation_type = 'VERIFY_CANDIDATE'",
+        "obligation.payload ->> 'candidate_id' = NEW.id::text",
+    ] {
+        assert!(
+            handoff.contains(required),
+            "missing handoff guard: {required}"
+        );
     }
 }
 

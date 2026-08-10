@@ -497,8 +497,8 @@ mod tests {
         AttemptProgressStage, AttemptProgressView, CandidateArtifactChunkReceipt,
         CandidateArtifactView, ClaimedWork, CompleteCandidateArtifactInput,
         InitCandidateArtifactInput, LeaseReconciliationReport, MvpControlPlane, MvpFuture,
-        ProjectView, ReconcileExpiredLeasesQuery, ReportAttemptProgressInput,
-        UploadCandidateArtifactChunkInput,
+        ProjectView, ReconcileExpiredLeasesQuery, RecordCandidateInput, RecordedCandidate,
+        ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
     };
     use agentforge_domain::{
         CandidateArtifactState, CandidateId, ExecutorId, FencingToken, GitObjectId, NodeId,
@@ -641,6 +641,13 @@ mod tests {
                         + 2,
                 ))
             })
+        }
+
+        fn record_candidate<'a>(
+            &'a self,
+            _command: &'a MvpCommand<RecordCandidateInput>,
+        ) -> MvpFuture<'a, RecordedCandidate> {
+            unavailable()
         }
 
         fn renew_lease<'a>(

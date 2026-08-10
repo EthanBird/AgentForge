@@ -4,13 +4,14 @@ use agentforge_application::{
     AttemptProgressStage, AttemptProgressView, ClaimPackageInput, ClaimedWork,
     CompleteCandidateArtifactInput, CreateProjectInput, InitCandidateArtifactInput,
     ListOffersQuery, MvpCommand, MvpCommandContext, MvpControlPlane, PublishPackageInput,
-    ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput,
-    UploadCandidateArtifactChunkInput,
+    ReconcileExpiredLeasesQuery, RecordCandidateInput, RecordedCandidate, ReleaseLeaseInput,
+    RenewLeaseInput, ReportAttemptProgressInput, UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
     ActorId, AggregateVersion, CandidateArtifactState, CommandId, CorrelationId, ExecutorId,
     GitObjectId, IdempotencyKey, NodeId, PackageId, PackageRevision, PackageRevisionId, ProjectId,
-    ProtocolKey, Sha256Digest, attempt::AttemptState, lease::LeaseState,
+    ProtocolKey, Sha256Digest, attempt::AttemptState, candidate::VerificationRunState,
+    lease::LeaseState,
 };
 use agentforge_storage_postgres::{PostgresMvpControlPlane, migration};
 use anyhow::{Context, Result, anyhow};
@@ -61,7 +62,7 @@ async fn exercise_mvp(
     database_url: &str,
     schema: &str,
 ) -> Result<()> {
-    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(migration::migrate(admin).await?, vec![1, 2, 3, 4, 5, 6, 7]);
     let control = Arc::new(PostgresMvpControlPlane::new_local_no_tls(
         database_url,
         schema,
@@ -337,13 +338,22 @@ async fn exercise_mvp(
         third_claim_command.input.node_id,
     )
     .await?;
-    exercise_candidate_artifact(
+    let completed_artifact = exercise_candidate_artifact(
         admin,
         control.as_ref(),
         project_id,
         &third_claim,
         third_claim_command.input.node_id,
         local_verify.version,
+    )
+    .await?;
+    let recorded = exercise_record_candidate(
+        control.as_ref(),
+        project_id,
+        &third_claim,
+        third_claim_command.input.node_id,
+        local_verify.version,
+        &completed_artifact,
     )
     .await?;
 
@@ -361,25 +371,41 @@ async fn exercise_mvp(
                (SELECT count(*) FROM candidate_artifacts WHERE package_id=$1 AND state='COMPLETE'), \
                (SELECT count(*) FROM candidate_artifact_chunks WHERE artifact_id IN \
                     (SELECT id FROM candidate_artifacts WHERE package_id=$1)), \
-               (SELECT count(*) FROM attempt_progress WHERE attempt_id=$3)",
+               (SELECT count(*) FROM attempt_progress WHERE attempt_id=$3), \
+               (SELECT count(*) FROM candidates WHERE attempt_id=$3), \
+               (SELECT count(*) FROM verification_runs WHERE candidate_id=$4 AND state='QUEUED'), \
+               (SELECT count(*) FROM obligations WHERE subject_id=$5 \
+                    AND obligation_type='VERIFY_CANDIDATE' AND state='PENDING'), \
+               (SELECT state FROM work_packages WHERE id=$1), \
+               (SELECT state FROM attempts WHERE id=$3), \
+               (SELECT state FROM leases WHERE id=$6)",
             &[
                 package_id.as_uuid(),
                 project_id.as_uuid(),
                 third_claim.attempt_id.as_uuid(),
+                recorded.candidate_id.as_uuid(),
+                recorded.verification_run_id.as_uuid(),
+                third_claim.lease_id.as_uuid(),
             ],
         )
         .await?;
     assert_eq!(row.get::<_, i64>(0), 3);
     assert_eq!(row.get::<_, i64>(1), 3);
     assert_eq!(row.get::<_, i64>(2), 0);
-    assert_eq!(row.get::<_, i64>(3), 32);
-    assert_eq!(row.get::<_, i64>(4), 32);
+    assert_eq!(row.get::<_, i64>(3), 34);
+    assert_eq!(row.get::<_, i64>(4), 34);
     assert_eq!(row.get::<_, i64>(5), 17);
-    assert_eq!(row.get::<_, i64>(6), 3);
+    assert_eq!(row.get::<_, i64>(6), 2);
     assert_eq!(row.get::<_, i64>(7), 3);
     assert_eq!(row.get::<_, i64>(8), 1);
     assert_eq!(row.get::<_, i64>(9), 2);
     assert_eq!(row.get::<_, i64>(10), 4);
+    assert_eq!(row.get::<_, i64>(11), 1);
+    assert_eq!(row.get::<_, i64>(12), 1);
+    assert_eq!(row.get::<_, i64>(13), 1);
+    assert_eq!(row.get::<_, String>(14), "VERIFYING");
+    assert_eq!(row.get::<_, String>(15), "CANDIDATE");
+    assert_eq!(row.get::<_, String>(16), "RELEASED");
     Ok(())
 }
 
@@ -464,6 +490,11 @@ async fn exercise_attempt_progress(
     Ok(last.expect("the four-stage progress path produces a final view"))
 }
 
+struct CompletedArtifactFixture {
+    view: agentforge_application::CandidateArtifactView,
+    complete_command: MvpCommand<CompleteCandidateArtifactInput>,
+}
+
 async fn exercise_candidate_artifact(
     admin: &tokio_postgres::Client,
     control: &PostgresMvpControlPlane,
@@ -471,7 +502,7 @@ async fn exercise_candidate_artifact(
     claimed: &ClaimedWork,
     node_id: NodeId,
     attempt_version: AggregateVersion,
-) -> Result<()> {
+) -> Result<CompletedArtifactFixture> {
     let chunks = [
         b"candidate-bundle-part-one".to_vec(),
         b"candidate-bundle-part-two".to_vec(),
@@ -586,6 +617,10 @@ async fn exercise_candidate_artifact(
         completed.bundle.as_ref().map(|bundle| bundle.digest),
         Some(bundle_digest)
     );
+    assert_eq!(
+        control.complete_candidate_artifact(&complete).await?,
+        completed
+    );
 
     let mut reused = complete.clone();
     reused.input.bundle_uri = "artifact://candidate/changed".into();
@@ -613,43 +648,6 @@ async fn exercise_candidate_artifact(
         "AF_TRANSITION_INVALID"
     );
 
-    let release = MvpCommand {
-        context: context(
-            "candidate-author-lease-release",
-            Some(claimed.lease_version),
-        ),
-        input: ReleaseLeaseInput {
-            project_id,
-            lease_id: claimed.lease_id,
-            node_id,
-            fencing_token: claimed.fencing_token,
-        },
-    };
-    assert_eq!(
-        control.release_lease(&release).await?.state,
-        LeaseState::Released
-    );
-    assert_eq!(
-        control.complete_candidate_artifact(&complete).await?,
-        completed,
-        "ACK-loss replay must precede the now-closed author Lease guard"
-    );
-    let post_release_new_key = MvpCommand {
-        context: context(
-            "candidate-artifact-complete-after-release",
-            Some(completed.version),
-        ),
-        input: complete.input.clone(),
-    };
-    assert_eq!(
-        control
-            .complete_candidate_artifact(&post_release_new_key)
-            .await
-            .expect_err("a fresh author mutation cannot use a closed Lease")
-            .code(),
-        "AF_LEASE_STALE"
-    );
-
     let persisted = admin
         .query_one(
             "SELECT state,version,event_seq,bundle_digest,bundle_size_bytes \
@@ -668,7 +666,99 @@ async fn exercise_candidate_artifact(
         persisted.get::<_, i64>(4),
         i64::try_from(bundle_bytes.len())?
     );
-    Ok(())
+    Ok(CompletedArtifactFixture {
+        view: completed,
+        complete_command: complete,
+    })
+}
+
+async fn exercise_record_candidate(
+    control: &PostgresMvpControlPlane,
+    project_id: ProjectId,
+    claimed: &ClaimedWork,
+    node_id: NodeId,
+    attempt_version: AggregateVersion,
+    completed: &CompletedArtifactFixture,
+) -> Result<RecordedCandidate> {
+    let command = MvpCommand {
+        context: context("candidate-record", Some(attempt_version)),
+        input: RecordCandidateInput {
+            project_id,
+            attempt_id: claimed.attempt_id,
+            artifact_id: completed.view.artifact_id,
+            lease_id: claimed.lease_id,
+            node_id,
+            fencing_token: claimed.fencing_token,
+            branch: format!("refs/heads/agentforge/{}", completed.view.candidate_id),
+        },
+    };
+    let recorded = control.record_candidate(&command).await?;
+    assert_eq!(recorded.candidate_id, completed.view.candidate_id);
+    assert_eq!(recorded.artifact_id, completed.view.artifact_id);
+    assert_eq!(recorded.candidate_commit, completed.view.candidate_commit);
+    assert_eq!(recorded.tree_hash, completed.view.tree_hash);
+    assert_eq!(recorded.verification_state, VerificationRunState::Queued);
+    assert_eq!(recorded.candidate_version, AggregateVersion::new(1));
+    assert_eq!(recorded.verification_run_version, AggregateVersion::new(1));
+    assert_eq!(recorded.attempt_version.get(), attempt_version.get() + 1);
+    assert_eq!(
+        recorded.lease_version.get(),
+        claimed.lease_version.get() + 1
+    );
+    assert_eq!(control.record_candidate(&command).await?, recorded);
+
+    let mut changed = command.clone();
+    changed.input.branch.push_str("-changed");
+    assert_eq!(
+        control
+            .record_candidate(&changed)
+            .await
+            .expect_err("same Candidate key with changed branch must fail")
+            .code(),
+        "AF_IDEMPOTENCY_KEY_REUSED"
+    );
+    assert_eq!(
+        control.get_lease(project_id, claimed.lease_id).await?.state,
+        LeaseState::Released
+    );
+    assert_eq!(
+        control
+            .complete_candidate_artifact(&completed.complete_command)
+            .await?,
+        completed.view,
+        "Artifact ACK-loss replay must precede the closed author Lease guard"
+    );
+    let fresh_complete = MvpCommand {
+        context: context(
+            "candidate-artifact-complete-after-record",
+            Some(completed.view.version),
+        ),
+        input: completed.complete_command.input.clone(),
+    };
+    assert_eq!(
+        control
+            .complete_candidate_artifact(&fresh_complete)
+            .await
+            .expect_err("fresh Artifact mutation cannot use the closed author Lease")
+            .code(),
+        "AF_LEASE_STALE"
+    );
+    let fresh_record = MvpCommand {
+        context: context(
+            "candidate-record-after-handoff",
+            Some(recorded.attempt_version),
+        ),
+        input: command.input.clone(),
+    };
+    assert_eq!(
+        control
+            .record_candidate(&fresh_record)
+            .await
+            .expect_err("fresh Candidate mutation cannot reuse a closed author Lease")
+            .code(),
+        "AF_LEASE_STALE"
+    );
+    Ok(recorded)
 }
 
 fn complete_candidate_artifact_command(

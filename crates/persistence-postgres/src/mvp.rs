@@ -6,17 +6,22 @@ use agentforge_application::{
     CreateProjectInput, EventAppendPort, EventRecord, InitCandidateArtifactInput, Isolation,
     LeaseReconciliationReport, LeaseView, ListOffersQuery, MvpCommand, MvpControlPlane, MvpError,
     MvpFuture, MvpResult, OfferView, PackageExecutionSnapshot, ProjectView, PublishPackageInput,
-    PublishedPackage, ReconcileExpiredLeasesQuery, ReleaseLeaseInput, RenewLeaseInput,
-    ReportAttemptProgressInput, UnitOfWork, UnitOfWorkFactory, UploadCandidateArtifactChunkInput,
+    PublishedPackage, ReconcileExpiredLeasesQuery, RecordCandidateInput, RecordedCandidate,
+    ReleaseLeaseInput, RenewLeaseInput, ReportAttemptProgressInput, UnitOfWork, UnitOfWorkFactory,
+    UploadCandidateArtifactChunkInput,
 };
 use agentforge_domain::{
-    ActorId, AggregateId, AggregateVersion, ArtifactRef, Attempt, AttemptId, CandidateArtifact,
-    CandidateArtifactId, CandidateArtifactState, CandidateId, CommandId, CommandMetadata,
-    CommandReceipt, CorrelationId, DomainEventEnvelope, EventContext, EventId, FencingToken,
-    GitObjectId, IdempotencyKey, IdempotencyScope, Lease, LeaseId, PackageRevision,
-    PackageRevisionId, ProjectId, ProtocolKey, ServerInstant, Sha256Digest, WorkPackage,
+    ActorId, AggregateId, AggregateVersion, ArtifactRef, Attempt, AttemptId, Candidate,
+    CandidateArtifact, CandidateArtifactId, CandidateArtifactState, CandidateId, CommandId,
+    CommandMetadata, CommandReceipt, CorrelationId, DomainEventEnvelope, EventContext, EventId,
+    FencingToken, GitObjectId, IdempotencyKey, IdempotencyScope, Lease, LeaseId, PackageRevision,
+    PackageRevisionId, ProjectId, ProtocolKey, ServerInstant, Sha256Digest, VerificationRun,
+    VerificationRunId, WorkPackage,
     attempt::{AttemptCommand, AttemptState, NewAttempt, SemanticProgress, WakeCondition},
-    candidate::{CandidateArtifactCommand, CandidateArtifactSnapshot, ReserveCandidateArtifact},
+    candidate::{
+        CandidateArtifactCommand, CandidateArtifactSnapshot, QueueVerificationRun,
+        ReserveCandidateArtifact, SealCandidate, VerificationRunCommand, VerificationRunState,
+    },
     command::ReceiptDecision,
     lease::{GrantLease, LeaseCommand, LeaseState},
     work_package::{
@@ -803,7 +808,7 @@ impl PostgresMvpControlPlane {
             .await?;
             metadata.require_version(loaded.artifact.version())?;
             let now = uow.server_now().await?;
-            validate_artifact_authority(
+            validate_completed_artifact_authority(
                 &package,
                 &attempt,
                 &lease,
@@ -1005,6 +1010,238 @@ impl PostgresMvpControlPlane {
                 effect_digest(&json!({
                     "artifact_id": response.artifact_id,
                     "bundle_digest": response.expected_bundle_digest,
+                    "event_ids": event_ids,
+                }))?,
+            )
+            .await?;
+            Ok(response)
+        }
+        .await;
+        finish(uow, result).await
+    }
+
+    async fn record_candidate_inner(
+        &self,
+        command: &MvpCommand<RecordCandidateInput>,
+    ) -> MvpResult<RecordedCandidate> {
+        validate_record_candidate_input(&command.input)?;
+        let metadata = command.context.metadata(&command.input)?;
+        let scope = scope(command.input.project_id, "candidate.record", &metadata)?;
+        let mut uow = self.factory.begin(Isolation::Serializable).await?;
+        let result = async {
+            if let Some(response) = replay::<RecordedCandidate>(&mut uow, &scope, &metadata).await?
+            {
+                return Ok(response);
+            }
+
+            let locator = locate_candidate_artifact(&uow, command.input.artifact_id).await?;
+            if locator.attempt_id != command.input.attempt_id
+                || locator.lease_id != command.input.lease_id
+            {
+                return Err(agentforge_domain::DomainError::StaleLease.into());
+            }
+            let package =
+                load_package_for_update(&uow, command.input.project_id, locator.package_id).await?;
+            let attempt =
+                load_attempt_for_update(&uow, locator.package_id, locator.attempt_id).await?;
+            let lease = load_lease(&uow, command.input.project_id, locator.lease_id, true).await?;
+            let artifact = load_candidate_artifact(
+                &uow,
+                command.input.project_id,
+                command.input.artifact_id,
+                true,
+            )
+            .await?;
+            metadata.require_version(attempt.attempt.version)?;
+            let now = uow.server_now().await?;
+            validate_artifact_authority(
+                &package,
+                &attempt,
+                &lease,
+                &artifact.artifact,
+                command.input.lease_id,
+                command.input.node_id,
+                command.input.fencing_token,
+                now,
+            )?;
+
+            let candidate = Candidate::transition(
+                None,
+                &SealCandidate {
+                    id: artifact.artifact.reserved_candidate_id(),
+                    branch: command.input.branch.clone(),
+                    sealed_at: now,
+                },
+                &artifact.artifact,
+            )?;
+            let verification_run_id = VerificationRunId::from_uuid(Uuid::now_v7());
+            let verification = VerificationRun::transition(
+                None,
+                &VerificationRunCommand::Queue(QueueVerificationRun {
+                    id: verification_run_id,
+                    candidate_id: candidate.aggregate.record().id,
+                    candidate_commit: candidate.aggregate.record().candidate_commit.clone(),
+                    queued_at: now,
+                }),
+                &candidate.aggregate,
+            )?;
+            let attempt_transition =
+                attempt
+                    .attempt
+                    .transition(&AttemptCommand::RecordCandidate {
+                        expected_version: attempt.attempt.version,
+                        candidate_commit: candidate.aggregate.record().candidate_commit.clone(),
+                        hard_checks_passed: true,
+                    })?;
+            let package_transition =
+                package
+                    .package
+                    .transition(&WorkPackageCommand::RecordCandidate {
+                        expected_version: package.package.version,
+                        attempt_id: attempt.attempt.id,
+                        candidate_sealed: true,
+                    })?;
+            let lease_transition = Lease::transition(
+                Some(&lease.lease),
+                &LeaseCommand::ReleaseLease {
+                    expected_version: lease.lease.version,
+                    holder_node_id: command.input.node_id,
+                    fencing_token: command.input.fencing_token,
+                    now,
+                },
+            )?;
+
+            insert_candidate(&uow, command.input.project_id, &candidate.aggregate).await?;
+            insert_verification_run(&uow, command.input.project_id, &verification.aggregate, now)
+                .await?;
+            let obligation_id = insert_verify_candidate_obligation(
+                &uow,
+                command.input.project_id,
+                verification_run_id,
+                candidate.aggregate.record(),
+                now,
+            )
+            .await?;
+
+            let attempt_event_seq = next_event_seq(attempt.event_seq)?;
+            update_attempt_after_candidate(
+                &uow,
+                &attempt,
+                &attempt_transition.aggregate,
+                attempt_event_seq,
+                now,
+            )
+            .await?;
+            let package_event_seq = next_event_seq(package.event_seq)?;
+            update_package_after_candidate(
+                &uow,
+                &package,
+                &package_transition.aggregate,
+                package_event_seq,
+                now,
+            )
+            .await?;
+            let lease_event_seq = next_event_seq(lease.event_seq)?;
+            update_lease(
+                &uow,
+                &lease,
+                &lease_transition.aggregate,
+                lease_event_seq,
+                now,
+            )
+            .await?;
+
+            let events = [
+                build_event(
+                    command.input.project_id,
+                    AggregateId::Candidate(candidate.aggregate.record().id),
+                    candidate.aggregate.version(),
+                    1,
+                    &metadata,
+                    now,
+                    candidate.events[0].clone(),
+                )?,
+                build_event(
+                    command.input.project_id,
+                    AggregateId::VerificationRun(verification_run_id),
+                    verification.aggregate.version(),
+                    1,
+                    &metadata,
+                    now,
+                    verification.events[0].clone(),
+                )?,
+                build_event(
+                    command.input.project_id,
+                    AggregateId::Attempt(attempt.attempt.id),
+                    attempt_transition.aggregate.version,
+                    attempt_event_seq,
+                    &metadata,
+                    now,
+                    attempt_transition.events[0].clone(),
+                )?,
+                build_event(
+                    command.input.project_id,
+                    AggregateId::WorkPackage(package.package.id),
+                    package_transition.aggregate.version,
+                    package_event_seq,
+                    &metadata,
+                    now,
+                    package_transition.events[0].clone(),
+                )?,
+                build_event(
+                    command.input.project_id,
+                    AggregateId::Lease(lease.lease.id),
+                    lease_transition.aggregate.version,
+                    lease_event_seq,
+                    &metadata,
+                    now,
+                    lease_transition.events[0].clone(),
+                )?,
+            ];
+            let records = events
+                .iter()
+                .map(|event| event.record.clone())
+                .collect::<Vec<_>>();
+            uow.append_events(&records).await?;
+            let outbox = events
+                .iter()
+                .map(|event| event.outbox(now, candidate.aggregate.record().id.to_string()))
+                .collect::<Vec<_>>();
+            uow.enqueue_outbox(&outbox).await?;
+
+            let response = RecordedCandidate {
+                project_id: command.input.project_id,
+                package_id: candidate.aggregate.record().package_id,
+                revision_id: candidate.aggregate.record().revision_id,
+                attempt_id: candidate.aggregate.record().attempt_id,
+                artifact_id: candidate.aggregate.record().bundle_artifact_id,
+                candidate_id: candidate.aggregate.record().id,
+                verification_run_id,
+                candidate_commit: candidate.aggregate.record().candidate_commit.clone(),
+                tree_hash: candidate.aggregate.record().tree_hash.clone(),
+                branch: candidate.aggregate.record().branch.clone(),
+                verification_state: verification.aggregate.state(),
+                sealed_at: now,
+                candidate_version: candidate.aggregate.version(),
+                verification_run_version: verification.aggregate.version(),
+                attempt_version: attempt_transition.aggregate.version,
+                package_version: package_transition.aggregate.version,
+                lease_version: lease_transition.aggregate.version,
+            };
+            let event_ids = records
+                .iter()
+                .map(|record| record.event_id)
+                .collect::<Vec<_>>();
+            store_receipt(
+                &mut uow,
+                scope,
+                &metadata,
+                response.clone(),
+                response.attempt_version,
+                effect_digest(&json!({
+                    "candidate_id": response.candidate_id,
+                    "verification_run_id": response.verification_run_id,
+                    "obligation_id": obligation_id,
                     "event_ids": event_ids,
                 }))?,
             )
@@ -1425,6 +1662,13 @@ impl MvpControlPlane for PostgresMvpControlPlane {
         Box::pin(self.complete_candidate_artifact_inner(command))
     }
 
+    fn record_candidate<'a>(
+        &'a self,
+        command: &'a MvpCommand<RecordCandidateInput>,
+    ) -> MvpFuture<'a, RecordedCandidate> {
+        Box::pin(self.record_candidate_inner(command))
+    }
+
     fn renew_lease<'a>(
         &'a self,
         command: &'a MvpCommand<RenewLeaseInput>,
@@ -1705,6 +1949,32 @@ fn validate_complete_candidate_artifact(input: &CompleteCandidateArtifactInput) 
         return Err(agentforge_domain::DomainError::InvalidArgument {
             field: "candidate_artifact_complete".into(),
             reason: "resource identifiers or bundle URI are invalid".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_record_candidate_input(input: &RecordCandidateInput) -> MvpResult<()> {
+    let branch = input.branch.as_str();
+    if input.project_id.as_uuid().is_nil()
+        || input.attempt_id.as_uuid().is_nil()
+        || input.artifact_id.as_uuid().is_nil()
+        || input.lease_id.as_uuid().is_nil()
+        || input.node_id.as_uuid().is_nil()
+        || !branch.starts_with("refs/heads/agentforge/")
+        || branch.len() > 255
+        || branch.ends_with('/')
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains("@{")
+        || branch.bytes().any(|byte| {
+            !(byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(agentforge_domain::DomainError::InvalidArgument {
+            field: "candidate".into(),
+            reason: "resource identifiers or generated Candidate branch are invalid".into(),
         }
         .into());
     }
@@ -2091,6 +2361,39 @@ fn validate_artifact_authority(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_completed_artifact_authority(
+    package: &LoadedPackage,
+    attempt: &LoadedAttempt,
+    lease: &LoadedLease,
+    artifact: &CandidateArtifact,
+    lease_id: LeaseId,
+    node_id: agentforge_domain::NodeId,
+    fencing_token: FencingToken,
+    now: ServerInstant,
+) -> MvpResult<()> {
+    validate_author_lease(package, attempt, lease, node_id, fencing_token, now)?;
+    if artifact.package_id() != package.package.id
+        || artifact.revision_id() != package.package.selected_revision_id
+        || artifact.attempt_id() != attempt.attempt.id
+        || artifact.lease_id() != lease_id
+        || artifact.lease_id() != lease.lease.id
+        || artifact.fencing_token() != fencing_token
+        || artifact.package_hash() != package.execution.package_hash
+        || artifact.base_commit() != &package.execution.base_commit
+    {
+        return Err(agentforge_domain::DomainError::StaleLease.into());
+    }
+    if artifact.state() != CandidateArtifactState::Complete {
+        return Err(agentforge_domain::DomainError::CandidateArtifactNotComplete.into());
+    }
+    // `expires_at` is the upload reservation window. A COMPLETE Artifact is
+    // immutable and may be sealed after that window, provided the author Lease
+    // itself remains current; Candidate::transition and the DB trigger both
+    // rebind the exact completed bytes and authoritative Lease provenance.
+    Ok(())
+}
+
 async fn validate_existing_candidate_chunk(
     uow: &PostgresUnitOfWork,
     input: &UploadCandidateArtifactChunkInput,
@@ -2221,6 +2524,126 @@ fn candidate_artifact_view(
         updated_at: artifact.updated_at(),
         version: artifact.version(),
     }
+}
+
+async fn insert_candidate(
+    uow: &PostgresUnitOfWork,
+    project_id: ProjectId,
+    candidate: &Candidate,
+) -> MvpResult<()> {
+    let record = candidate.record();
+    let inserted = uow
+        .client()?
+        .execute(
+            "INSERT INTO candidates
+             (id,project_id,attempt_id,package_id,revision_id,package_hash,lease_id,
+              fencing_token,base_commit,candidate_commit,tree_hash,branch,
+              author_evidence_digest,bundle_artifact_id,bundle_protocol_key,bundle_uri,
+              bundle_digest,sealed_at,version,event_seq)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,1)",
+            &[
+                record.id.as_uuid(),
+                project_id.as_uuid(),
+                record.attempt_id.as_uuid(),
+                record.package_id.as_uuid(),
+                record.revision_id.as_uuid(),
+                &&record.package_hash.as_bytes()[..],
+                record.lease_id.as_uuid(),
+                &u64_to_i64(record.fencing_token.get())?,
+                &record.base_commit.as_str(),
+                &record.candidate_commit.as_str(),
+                &record.tree_hash.as_str(),
+                &record.branch,
+                &&record.author_evidence_digest.as_bytes()[..],
+                record.bundle_artifact_id.as_uuid(),
+                &record.bundle.artifact_id.as_str(),
+                &record.bundle.uri,
+                &&record.bundle.digest.as_bytes()[..],
+                &record.sealed_at.0,
+                &version_to_i64(candidate.version())?,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if inserted != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+async fn insert_verification_run(
+    uow: &PostgresUnitOfWork,
+    project_id: ProjectId,
+    run: &VerificationRun,
+    queued_at: ServerInstant,
+) -> MvpResult<()> {
+    if run.state() != VerificationRunState::Queued || run.version() != AggregateVersion::new(1) {
+        return Err(agentforge_application::PortError::Integrity.into());
+    }
+    let inserted = uow
+        .client()?
+        .execute(
+            "INSERT INTO verification_runs
+             (id,project_id,candidate_id,candidate_commit,state,queued_at,updated_at,version,event_seq)
+             SELECT $1,$2,candidate.id,candidate.candidate_commit,'QUEUED',$4,$4,$5,1
+               FROM candidates candidate
+              WHERE candidate.id=$3 AND candidate.project_id=$2",
+            &[
+                run.id().as_uuid(),
+                project_id.as_uuid(),
+                run.candidate_id().as_uuid(),
+                &queued_at.0,
+                &version_to_i64(run.version())?,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if inserted != 1 {
+        return Err(agentforge_application::PortError::Integrity.into());
+    }
+    Ok(())
+}
+
+async fn insert_verify_candidate_obligation(
+    uow: &PostgresUnitOfWork,
+    project_id: ProjectId,
+    verification_run_id: VerificationRunId,
+    candidate: &agentforge_domain::candidate::CandidateRecord,
+    due_at: ServerInstant,
+) -> MvpResult<Uuid> {
+    let obligation_id = Uuid::now_v7();
+    let payload = json!({
+        "candidate_id": candidate.id,
+        "verification_run_id": verification_run_id,
+        "attempt_id": candidate.attempt_id,
+        "artifact_id": candidate.bundle_artifact_id,
+        "candidate_commit": candidate.candidate_commit,
+        "bundle_digest": candidate.bundle.digest,
+    });
+    let fingerprint = effect_digest(&payload)?;
+    let inserted = uow
+        .client()?
+        .execute(
+            "INSERT INTO obligations
+             (id,project_id,subject_type,subject_id,obligation_type,state,due_at,
+              max_attempts,fingerprint,payload,version,created_at,updated_at)
+             VALUES ($1,$2,'VERIFICATION_RUN',$3,'VERIFY_CANDIDATE','PENDING',$4,
+                     10,$5,$6,1,$4,$4)",
+            &[
+                &obligation_id,
+                project_id.as_uuid(),
+                verification_run_id.as_uuid(),
+                &due_at.0,
+                &&fingerprint.as_bytes()[..],
+                &Json(&payload),
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if inserted != 1 {
+        return Err(agentforge_application::PortError::Integrity.into());
+    }
+    Ok(obligation_id)
 }
 
 fn parse_candidate_artifact_state(value: &str) -> MvpResult<CandidateArtifactState> {
@@ -2375,7 +2798,8 @@ async fn load_package_for_update(
         .query_opt(
             "SELECT w.selected_revision_id, r.revision, w.state, p.graph_version, \
                     w.priority, w.max_attempts, w.attempts_started, w.next_fencing_token, \
-                    w.active_attempt_id, a.lease_id, a.fencing_token, w.accepted_submission_id, \
+                    w.active_attempt_id, active_lease.id, active_lease.fencing_token, \
+                    w.accepted_submission_id, \
                     w.integrated_integration_id, w.integrated_commit, w.version, w.event_seq, \
                     r.base_commit, r.package_hash, r.git_object_format, r.canonical_document, \
                     r.input_snapshot, \
@@ -2393,6 +2817,8 @@ async fn load_package_for_update(
              JOIN projects p ON p.id = w.project_id \
              JOIN package_revisions r ON r.id = w.selected_revision_id AND r.package_id = w.id \
              LEFT JOIN attempts a ON a.id = w.active_attempt_id AND a.package_id = w.id \
+             LEFT JOIN leases active_lease ON active_lease.id = a.lease_id \
+                 AND active_lease.attempt_id = a.id AND active_lease.state = 'ACTIVE' \
              WHERE w.id = $1 AND w.project_id = $2 \
              FOR UPDATE OF w",
             &[package_id.as_uuid(), project_id.as_uuid()],
@@ -2687,6 +3113,86 @@ async fn update_attempt_after_progress(
                 &u64_to_i64(event_seq)?,
                 &previous_state,
                 &version_to_i64(loaded.attempt.version)?,
+                &u64_to_i64(loaded.event_seq)?,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+async fn update_attempt_after_candidate(
+    uow: &PostgresUnitOfWork,
+    loaded: &LoadedAttempt,
+    attempt: &Attempt,
+    event_seq: u64,
+    updated_at: ServerInstant,
+) -> MvpResult<()> {
+    let candidate_commit = attempt
+        .candidate_commit
+        .as_ref()
+        .ok_or(agentforge_application::PortError::Integrity)?;
+    let changed = uow
+        .client()?
+        .execute(
+            "UPDATE attempts
+             SET state='CANDIDATE',candidate_commit=$3,version=$4,event_seq=$5,updated_at=$6
+             WHERE id=$1 AND package_id=$2 AND state='LOCAL_VERIFY'
+               AND candidate_commit IS NULL AND version=$7 AND event_seq=$8",
+            &[
+                attempt.id.as_uuid(),
+                attempt.package_id.as_uuid(),
+                &candidate_commit.as_str(),
+                &version_to_i64(attempt.version)?,
+                &u64_to_i64(event_seq)?,
+                &updated_at.0,
+                &version_to_i64(loaded.attempt.version)?,
+                &u64_to_i64(loaded.event_seq)?,
+            ],
+        )
+        .await
+        .map_err(map_database_error)?;
+    if changed != 1 {
+        return Err(agentforge_application::PortError::Conflict.into());
+    }
+    Ok(())
+}
+
+async fn update_package_after_candidate(
+    uow: &PostgresUnitOfWork,
+    loaded: &LoadedPackage,
+    package: &WorkPackage,
+    event_seq: u64,
+    updated_at: ServerInstant,
+) -> MvpResult<()> {
+    if package.state != WorkPackageState::Verifying
+        || package.active_attempt_id != loaded.package.active_attempt_id
+        || package.active_lease_id.is_some()
+        || package.active_fencing_token.is_some()
+    {
+        return Err(agentforge_application::PortError::Integrity.into());
+    }
+    let active_attempt_id = package
+        .active_attempt_id
+        .ok_or(agentforge_application::PortError::Integrity)?;
+    let changed = uow
+        .client()?
+        .execute(
+            "UPDATE work_packages
+             SET state='VERIFYING',version=$3,event_seq=$4,updated_at=$5
+             WHERE id=$1 AND project_id=$2 AND state='ACTIVE'
+               AND active_attempt_id=$6 AND version=$7 AND event_seq=$8",
+            &[
+                package.id.as_uuid(),
+                package.project_id.as_uuid(),
+                &version_to_i64(package.version)?,
+                &u64_to_i64(event_seq)?,
+                &updated_at.0,
+                active_attempt_id.as_uuid(),
+                &version_to_i64(loaded.package.version)?,
                 &u64_to_i64(loaded.event_seq)?,
             ],
         )

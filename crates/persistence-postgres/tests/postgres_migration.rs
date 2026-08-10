@@ -266,7 +266,7 @@ async fn exercise_uow_upgrade(client: &mut Client) -> Result<()> {
 }
 
 async fn exercise_migrations(client: &mut Client) -> Result<()> {
-    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(migration::migrate(client).await?, vec![1, 2, 3, 4, 5, 6, 7]);
     assert!(migration::migrate(client).await?.is_empty());
 
     let installed: Vec<String> = client
@@ -322,7 +322,7 @@ async fn exercise_migrations(client: &mut Client) -> Result<()> {
         .into_iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
 
     let required_indexes: i64 = client
         .query_one(
@@ -358,6 +358,7 @@ async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
     let artifact = Uuid::now_v7();
     let candidate = Uuid::now_v7();
     let verification_run = Uuid::now_v7();
+    let verification_obligation = Uuid::now_v7();
     let executor = Uuid::now_v7();
     let node = Uuid::now_v7();
     let bundle_bytes = "decode('62756e646c652d6279746573','hex')";
@@ -391,6 +392,7 @@ async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
                clock_timestamp() + interval '30 minutes',
                clock_timestamp() + interval '1 hour');
             UPDATE attempts SET lease_id='{lease}' WHERE id='{attempt}';
+            UPDATE work_packages SET active_attempt_id='{attempt}' WHERE id='{package}';
 
             INSERT INTO candidate_artifacts
               (id, reserved_candidate_id, project_id, attempt_id, package_id, revision_id,
@@ -424,6 +426,7 @@ async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
                    version=3, event_seq=3,
                    updated_at=transaction_timestamp() - interval '20 seconds'
              WHERE id='{artifact}';
+            BEGIN;
             INSERT INTO candidates
               (id, project_id, attempt_id, package_id, revision_id, package_hash, lease_id,
                fencing_token, base_commit, candidate_commit, tree_hash, branch,
@@ -433,21 +436,44 @@ async fn exercise_candidate_first_contracts(client: &mut Client) -> Result<()> {
                    package_hash, lease_id, fencing_token, base_commit, candidate_commit,
                    tree_hash, 'refs/heads/agentforge/candidate-fixture',
                    author_evidence_digest, id, bundle_protocol_key, bundle_uri, bundle_digest,
-                   clock_timestamp() - interval '10 seconds', 1, 1
+                   transaction_timestamp(), 1, 1
               FROM candidate_artifacts WHERE id='{artifact}';
             INSERT INTO verification_runs
               (id, project_id, candidate_id, candidate_commit, state, queued_at, updated_at,
                version, event_seq)
             VALUES
               ('{verification_run}', '{project}', '{candidate}', repeat('b',40), 'QUEUED',
-               transaction_timestamp() - interval '5 seconds',
-               transaction_timestamp() - interval '5 seconds', 1, 1);
+               transaction_timestamp(), transaction_timestamp(), 1, 1);
+            INSERT INTO obligations
+              (id, project_id, subject_type, subject_id, obligation_type, state, due_at,
+               max_attempts, fingerprint, payload, version, created_at, updated_at)
+            VALUES
+              ('{verification_obligation}', '{project}', 'VERIFICATION_RUN',
+               '{verification_run}', 'VERIFY_CANDIDATE', 'PENDING', transaction_timestamp(),
+               10, decode(repeat('44',32),'hex'),
+               '{{"candidate_id":"{candidate}","verification_run_id":"{verification_run}",
+                  "attempt_id":"{attempt}","artifact_id":"{artifact}",
+                  "candidate_commit":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}', 1,
+               transaction_timestamp(), transaction_timestamp());
+            UPDATE attempts
+               SET state='CANDIDATE', candidate_commit=repeat('b',40), version=1, event_seq=1,
+                   updated_at=transaction_timestamp()
+             WHERE id='{attempt}';
+            UPDATE work_packages
+               SET state='VERIFYING', version=1, event_seq=1,
+                   updated_at=transaction_timestamp()
+             WHERE id='{package}';
+            UPDATE leases
+               SET state='RELEASED', version=1, event_seq=1,
+                   updated_at=transaction_timestamp()
+             WHERE id='{lease}';
             INSERT INTO aggregate_event_heads
               (project_id, aggregate_type, aggregate_id, aggregate_version, last_event_seq)
             VALUES
               ('{project}', 'CANDIDATE_ARTIFACT', '{artifact}', 3, 3),
               ('{project}', 'CANDIDATE', '{candidate}', 1, 1),
               ('{project}', 'VERIFICATION_RUN', '{verification_run}', 1, 1);
+            COMMIT;
             "#
         ))
         .await
